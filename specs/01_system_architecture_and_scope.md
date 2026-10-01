@@ -52,7 +52,7 @@ flowchart TD
     end
 
     subgraph Storage ["Dual-Memory Persistence"]
-        RelationalDB[("Relational DB: contacts, interactions, action_drafts")]
+        RelationalDB[("Relational DB: contacts, interactions, action_drafts, briefing_items")]
         VectorStore[("Vector Store: sqlite-vec / pgvector")]
     end
 
@@ -81,7 +81,7 @@ flowchart TD
 
     Scheduler -->|Every 30m / 8am Scan| Storage
     Storage -->|Candidate Matches| AlertTriage
-    AlertTriage -->|IMMEDIATE_DM| ProactiveSynthesizer
+    AlertTriage -->|DISPATCH_IMMEDIATE_DM| ProactiveSynthesizer
     ProactiveSynthesizer --> BlockKitUI
 ```
 
@@ -98,7 +98,7 @@ Clear boundaries ensure predictable execution and prevent cost overruns or permi
    - Event handling for `message.im` (1-on-1 private DMs) and `app_mention` (in-channel invocations).
    - Sub-3-second acknowledgment (`200 OK` or immediate Slack ack) with asynchronous event processing.
 2. **Dual-Memory Layer**:
-   - Relational tables: `workspaces`, `contacts`, `interactions`, and `action_drafts`.
+   - Relational tables: `workspaces`, `contacts`, `interactions`, `action_drafts`, and `briefing_items`.
    - Vector store: 384-dimensional dense vectors using local CPU embeddings (`bge-small-en-v1.5` or `all-MiniLM-L6-v2`) via `fastembed` or `sqlite-vec`/`pgvector`.
    - Local SQLite support for zero-config local development, with clean migration path to PostgreSQL + `pgvector`.
 3. **Passive Ingestion Pipeline**:
@@ -156,4 +156,4 @@ Before any milestone is signed off as complete, the following gates must be vali
 - [ ] **Gate 2 (Ingestion):** Noise filter rejects bots and short pings; SLM extracts valid JSON matching Pydantic schema; embeddings generated on CPU; stored in DB.
 - [ ] **Gate 3 (Conversational ReAct):** Querying "Who promised to send the revised budget?" accurately retrieves the interaction via vector/relational search and answers in-thread.
 - [ ] **Gate 4 (HITL Safety):** Asking "Follow up with Alex" stages a draft in `action_drafts` and emits a Block Kit card. Clicking `[Approve]` updates the block with a green checkmark and dispatches the action. Unapproved actions never execute.
-- [ ] **Gate 5 (Proactive Sweeper):** Mocking a commitment due in 2 hours triggers the deterministic scanner, invokes the SLM synthesizer, and posts a proactive DM to the user with action buttons.
+- [ ] **Gate 5 (Proactive Sweeper):** Mocking a commitment due in 2 hours triggers the deterministic scanner, passes the Jev alert triage gate, and only then invokes the SLM synthesizer and posts a proactive DM to the user with action buttons.

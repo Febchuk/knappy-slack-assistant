@@ -21,18 +21,19 @@ sequenceDiagram
     ReAct->>User: Render Block Kit card with [Approve & Send] & [Cancel]
     
     alt User clicks [Cancel]
-        User->>Router: Interaction payload (action_id: btn_cancel)
+        User->>Router: Interaction payload (action_id: btn_cancel_action)
         Router->>DB: UPDATE status = 'CANCELLED'
         Router->>User: chat.update -> ":x: Action cancelled."
     else User clicks [Approve & Send]
-        User->>Router: Interaction payload (action_id: btn_approve, value: draft_id)
+        User->>Router: Interaction payload (action_id: btn_approve_action, value: draft_id)
         Router->>Router: Verify clicker user_id == draft.user_id
-        Router->>DB: Atomic CAS (UPDATE status = 'APPROVED' WHERE status = 'PENDING')
+        Router->>DB: Atomic CAS (UPDATE status = 'APPROVED' WHERE status = 'PENDING'; executed_at stays null)
         alt Already executed or cancelled
             Router->>User: Ignore duplicate click (Idempotent)
         else First execution
             Router->>Worker: Dispatch verified payload
             Worker->>External: Execute API call
+            Worker->>DB: SET executed_at (status stays APPROVED; FAILED if the call errors)
             Router->>User: chat.update -> ":white_check_mark: Executed: Dispatched to Sarah."
         end
     end
@@ -44,13 +45,15 @@ sequenceDiagram
 
 ### 2.1 State Transitions
 ```text
-  [ PENDING ] ────────► [ CANCELLED ] (User clicked Cancel or Expired)
+  [ PENDING ] ──► [ CANCELLED ]  (User clicked Cancel)
        │
-       ▼ (User clicked Approve & Auth Verified)
-  [ APPROVED ] ───────► [ EXECUTED ] (API call succeeded)
+       ├────────► [ EXPIRED ]    (expires_at passed)
        │
-       ▼ (API call failed)
-  [ FAILED ]
+       ▼ (CAS wins; executed_at still null)
+  [ APPROVED ] ──► executed_at set (API succeeded; status stays APPROVED)
+       │
+       ▼
+  [ FAILED ]                     (API failed; draft is terminal)
 ```
 
 ### 2.2 Draft Data Contract
@@ -142,11 +145,12 @@ When an action is staged, Knappy delivers an interactive Block Kit message. If s
 2. **Atomic Compare-And-Swap (CAS)**:
    - To prevent double-execution from rapid multi-clicks or network retries, execution is guarded by:
    ```sql
-   UPDATE action_drafts 
-   SET status = 'APPROVED', executed_at = CURRENT_TIMESTAMP 
+   UPDATE action_drafts
+   SET status = 'APPROVED'
    WHERE id = :draft_id AND status = 'PENDING';
    ```
    - If the update returns 0 affected rows, the event is immediately discarded.
+   - `executed_at` is set only after the external call succeeds. If that call fails, status moves from `APPROVED` to `FAILED` and the draft is terminal.
 3. **In-Place Immutable Receipt**:
    - Immediately upon receiving the approval click, the interactive buttons are stripped using `client.chat_update()`, rendering an immutable receipt:
    ```json

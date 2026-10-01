@@ -18,9 +18,9 @@ flowchart TD
     
     Evaluate -->|Candidates Found| Triage["2. Jev Alert Triage Gate (System 1 Scoring, ~80ms)"]
     Triage --> TriageEval{"Interruptibility Decision?"}
-    TriageEval -->|SUPPRESS_LOW_VALUE| Sleep
-    TriageEval -->|BATCH_INTO_MORNING_DIGEST| Queue["Queue for Daily 8:00 AM Briefing"]
-    TriageEval -->|IMMEDIATE_DM| Aggregator["3. Context Aggregator (Fetch Contact & Interaction History)"]
+    TriageEval -->|SUPPRESS_NOISE| Sleep
+    TriageEval -->|QUEUE_MORNING_DIGEST| Queue["Queue for Daily 8:00 AM Briefing"]
+    TriageEval -->|DISPATCH_IMMEDIATE_DM| Aggregator["3. Context Aggregator (Fetch Contact & Interaction History)"]
     
     Aggregator --> Synthesizer["4. Proactive Synthesizer (Fast SLM)"]
     Synthesizer --> AsymmetricEgress["5. Slack Asymmetric Egress (chat.postMessage to User DM)"]
@@ -58,7 +58,7 @@ WHERE i.status = 'PENDING'
 ```
 
 ### 2.2 Network Cadence Scan
-Executed daily at 9:00 AM:
+Executed daily at 8:00 AM, on the same tick as the morning briefing:
 ```sql
 SELECT 
     id as contact_id,
@@ -166,8 +166,8 @@ class ProactiveAlertTriager:
 
 ### 3.1 Triage Rules & Routing Paths
 1. **Immediate Pings (`DISPATCH_IMMEDIATE_DM`):** High interrupt probability ($\ge 0.75$) and confidence ($\ge 0.65$). Proceeds directly to Stage 4 (SLM Synthesis) and Stage 5 (Asymmetric Slack DM).
-2. **Batched Digest (`QUEUE_MORNING_DIGEST`):** Non-urgent reminders ($> 6$ hours out) or moderate importance items are saved to the briefing table and delivered during the 8:00 AM briefing.
-3. **Suppressed Noise (`SUPPRESS_NOISE`):** Low-consequence reminders are dropped silently without pinging the user, updating `last_alerted_at = CURRENT_TIMESTAMP` to prevent scanner re-query churn.
+2. **Batched Digest (`QUEUE_MORNING_DIGEST`):** Non-urgent reminders ($> 6$ hours out) or moderate importance items are inserted into `briefing_items` with status `QUEUED` and delivered during the 8:00 AM briefing. After delivery, those rows are marked `DELIVERED`.
+3. **Suppressed Noise (`SUPPRESS_NOISE`):** Low-consequence reminders are dropped silently without pinging the user and without inserting a `briefing_items` row. Commitment candidates update `interactions.last_alerted_at = CURRENT_TIMESTAMP` to prevent scanner re-query churn.
 
 ---
 
@@ -267,9 +267,9 @@ If the user does not want to click a 1-click button but instead replies to the p
 
 | Test Case ID | Test Focus | Scenario | Expected Outcome |
 | :--- | :--- | :--- | :--- |
-| **TEST-PROACT-01** | Zero Trigger Cost | Run scheduler tick with 0 overdue items | DB query finishes in $< 10\text{ ms}$; 0 LLM calls made; 0 Slack messages sent. |
-| **TEST-PROACT-02** | High-Priority Alert Trigger | Commitment due in 2 hours with high counterparty importance | Jev returns `should_interrupt_user=True`, `delivery_strategy="IMMEDIATE_DM"`, `relevance_score >= 0.75`; bot posts proactive DM. |
-| **TEST-PROACT-03** | Alert Noise Suppression | Trivial reminder due in 11 hours | Jev returns `delivery_strategy="BATCH_INTO_MORNING_DIGEST"`; immediate DM is suppressed and batched. |
+| **TEST-PROACT-01** | Zero Trigger Cost | Run scheduler tick with 0 overdue items | DB query finishes in $< 5\text{ ms}$; 0 LLM calls made; 0 Slack messages sent. |
+| **TEST-PROACT-02** | High-Priority Alert Trigger | Commitment due in 2 hours with high counterparty importance | Triage returns `action="DISPATCH_IMMEDIATE_DM"`, `strategy="immediate_dm"`, `interrupt_probability >= 0.75`; bot posts proactive DM. |
+| **TEST-PROACT-03** | Alert Noise Suppression | Trivial reminder due in 11 hours | Triage returns `action="QUEUE_MORNING_DIGEST"`, `strategy="batch_into_morning_digest"`; a `briefing_items` row is inserted with status `QUEUED` and no immediate DM is sent. |
 | **TEST-PROACT-04** | Snooze Action | User clicks `[Snooze (24h)]` | `due_date` updated in DB $+24\text{ hours}$; message updated to confirm snooze. |
 | **TEST-PROACT-05** | Mark as Done | User clicks `[Mark as Done]` | Status in `interactions` updated to `'FULFILLED'`; message updated to confirmed complete. |
 | **TEST-PROACT-06** | Thread Handoff | User replies with text to proactive DM | ReAct agent loads proactive context and replies in thread with revised action card. |

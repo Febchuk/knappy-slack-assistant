@@ -141,7 +141,7 @@ class SystemOneRouter:
     - Score: Measures query complexity to distinguish simple lookups from multi-hop reasoning.
     - Noul: Detects mutating outbound actions that must pass to HITL gateway.
     """
-    INTENT_CONFIDENCE_THRESHOLD = 0.70
+    INTENT_CONFIDENCE_THRESHOLD = 0.90
     COMPLEXITY_CEILING = 1.0  # < 1.0 means simple single-step lookup
 
     def __init__(self, react_agent: Any):
@@ -250,7 +250,7 @@ class SystemOneRouter:
 
 | Test Case ID | Test Focus | Input Query | Expected Behavior |
 | :--- | :--- | :--- | :--- |
-| **TEST-REACT-01** | Fast-Path Intent Routing | `"What did I promise to send Alex?"` | Jev returns `route_type="DIRECT_TOOL_FAST_PATH"`, `target_tool="search_commitments"`, confidence $\ge 0.90$; bypasses ReAct loop in $< 400\text{ ms}$. |
+| **TEST-REACT-01** | Fast-Path Intent Routing | `"What did I promise to send Alex?"` | Intent confidence $\ge 0.90$ and complexity $< 1.0$; `search_commitments` is called and the ReAct loop is not; reply returns in $< 400\text{ ms}$. |
 | **TEST-REACT-02** | Multi-Hop ReAct Escalation | `"Find my last note with Alex and draft a follow-up email"` | Jev routes to `FULL_REACT_LOOP`; agent executes multi-step ReAct sequence. |
 | **TEST-REACT-03** | Observation Processing | Mock tool returns: `[{contact: "Alex", commitment: "Send budget by Thursday"}]` | Agent outputs: `"Alex from Acme Corp promised to send the revised budget by Thursday."` |
 | **TEST-REACT-04** | Missing Data Handling | Search tool returns empty list `[]` | Agent clearly communicates that no matching commitment was found; does not hallucinate. |

@@ -31,7 +31,7 @@ tests/
 | :--- | :--- | :--- | :--- | :--- |
 | **TEST-INFRA-01** | Slack App Credential Load | Spec 02 | Unit | Environment tokens loaded without error |
 | **TEST-INFRA-02** | Slack Event Acknowledgment | Spec 02 | Integration | Event ack returned in $< 500\text{ ms}$ |
-| **TEST-INFRA-03** | Dual-Memory Schema Init | Spec 02 | Integration | Tables created in SQLite and PostgreSQL |
+| **TEST-INFRA-03** | Dual-Memory Schema Init | Spec 02 | Integration | All 5 tables created in SQLite and PostgreSQL |
 | **TEST-INFRA-04** | Vector Cosine Retrieval | Spec 02 | Integration | Ingested vector retrieved with similarity $> 0.95$ |
 | **TEST-INFRA-05** | Cascading Relationship Clean | Spec 02 | Unit | Deleting contact deletes all linked interactions |
 | **TEST-INGEST-01** | Tier 0 Gate: Bot Message Filter | Spec 03 | Unit | Discards bot/webhook events in $< 2\text{ ms}$ |
@@ -42,7 +42,7 @@ tests/
 | **TEST-INGEST-06** | SLM Pydantic Schema Parsing | Spec 03 | Integration | Extracts valid `ExtractedInteraction` schema |
 | **TEST-INGEST-07** | Local CPU Embedding Gen | Spec 03 | Unit | Produces 384-dim vector in $< 20\text{ ms}$ on CPU |
 | **TEST-INGEST-08** | Atomic Upsert Transaction | Spec 03 | Integration | Single contact record upserted, interaction added |
-| **TEST-REACT-01** | Fast-Path Intent Routing | Spec 04 | Integration | High-confidence ($\ge 0.90$) query bypasses ReAct loop in $< 400\text{ ms}$ |
+| **TEST-REACT-01** | Fast-Path Intent Routing | Spec 04 | Integration | Confidence $\ge 0.90$ calls `search_commitments` and skips the ReAct loop in $< 400\text{ ms}$ |
 | **TEST-REACT-02** | Multi-Hop ReAct Escalation | Spec 04 | Integration | Complex/ambiguous query correctly escalates to multi-step ReAct loop |
 | **TEST-REACT-03** | Observation Synthesis | Spec 04 | Integration | Tool outputs synthesized into grounded answer |
 | **TEST-REACT-04** | Missing Data Honesty | Spec 04 | Integration | Clear negative answer when tool returns empty |
@@ -55,8 +55,8 @@ tests/
 | **TEST-HITL-04** | Double-Click Idempotency | Spec 05 | Unit | Atomic CAS ensures exactly one execution |
 | **TEST-HITL-05** | Cancellation Workflow | Spec 05 | Unit | Click on Cancel updates block and drops draft |
 | **TEST-PROACT-01** | Zero-Trigger Zero-Cost | Spec 06 | Unit | Clean DB scan terminates in $< 5\text{ ms}$, 0 LLM calls |
-| **TEST-PROACT-02** | High-Priority Alert Trigger | Spec 06 | Integration | Jev returns `IMMEDIATE_DM` ($\ge 0.75$), bot posts proactive DM |
-| **TEST-PROACT-03** | Alert Noise Suppression | Spec 06 | Integration | Low-urgency reminder batched or suppressed by Jev triage |
+| **TEST-PROACT-02** | High-Priority Alert Trigger | Spec 06 | Integration | Triage returns `action="DISPATCH_IMMEDIATE_DM"`, `interrupt_probability >= 0.75`; bot posts proactive DM |
+| **TEST-PROACT-03** | Alert Noise Suppression | Spec 06 | Integration | Triage returns `action="QUEUE_MORNING_DIGEST"`; row queued in `briefing_items`; no immediate DM |
 | **TEST-PROACT-04** | Proactive Snooze (24h) | Spec 06 | Unit | Increases `due_date` by 24h, disables prompt |
 | **TEST-PROACT-05** | Mark Commitment Done | Spec 06 | Unit | Updates status to FULFILLED |
 | **TEST-PROACT-06** | Proactive-to-ReAct Handoff | Spec 06 | Integration | Thread reply converts outbound ping to conversation |
@@ -85,7 +85,10 @@ python -m knappy.main
   2. Inspect database:
      ```sql
      SELECT * FROM contacts WHERE name = 'Alex';
-     SELECT commitment, due_date FROM interactions WHERE contact_name = 'Alex';
+     SELECT i.commitment, i.due_date
+     FROM interactions i
+     JOIN contacts c ON i.contact_id = c.id
+     WHERE c.name = 'Alex';
      ```
      Records exist with non-null embedding.
 
