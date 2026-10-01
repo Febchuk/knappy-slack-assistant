@@ -1,0 +1,24 @@
+display_information:
+  name: Knappy Assistant
+  description: Ambient relationship and executive assistant for Slack.
+  background_color: "#1A1D21"
+features:
+  bot_user:
+    display_name: Knappy
+    always_online: true
+oauth_config:
+  scopes:
+    bot:
+      - chat:write
+      - im:history
+      - im:read
+      - im:write
+      - app_mentions:read
+settings:
+  socket_mode_enabled: true
+  event_subscriptions:
+    bot_events:
+      - message.im
+      - app_mention
+  interactivity:
+    is_enabled: true
