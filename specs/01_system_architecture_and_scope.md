@@ -27,13 +27,15 @@ flowchart TD
     end
 
     subgraph PathA ["Path A: Sequential Pattern (ETL)"]
-        NoiseFilter["Heuristic & Regex Noise Filter"]
+        NoiseFilter["Two-Tier Ingestion Gate (Local + SystemOneGate Jev)"]
         SLMExtractor["SLM Entity & Commitment Extractor (Pydantic)"]
         LocalEmbedder["CPU Embedding Engine (bge-small-en-v1.5)"]
     end
 
-    subgraph PathB ["Path B: ReAct Pattern (Conversational Agent)"]
-        ReActLoop["ReAct Reasoning Loop (Thought-Action-Observation)"]
+    subgraph PathB ["Path B: Hybrid Routing & ReAct (Conversational Agent)"]
+        FastRouter["Fast Intent Router (Jev System 1, ~80ms)"]
+        DirectTool["Fast-Path Direct Tool Dispatch (< 200ms)"]
+        ReActLoop["ReAct Reasoning Loop (Complex / Multi-Hop)"]
         ToolRouter["Tool Call Registry"]
     end
 
@@ -45,6 +47,7 @@ flowchart TD
 
     subgraph PathD ["Path D: Proactive Monitor Pattern"]
         Scheduler["Deterministic Cron Sweeper (Zero LLM)"]
+        AlertTriage["Jev Alert Triage Gate (~80ms)"]
         ProactiveSynthesizer["Proactive Briefing Synthesizer"]
     end
 
@@ -61,7 +64,10 @@ flowchart TD
     SLMExtractor -->|Structured JSON| LocalEmbedder
     LocalEmbedder --> Storage
 
-    Router -->|User Query in DM/@bot| ReActLoop
+    Router -->|User Query in DM/@bot| FastRouter
+    FastRouter -->|High Confidence Direct Tool| DirectTool
+    DirectTool --> Storage
+    FastRouter -->|Complex Multi-Hop| ReActLoop
     ReActLoop <--> ToolRouter
     ToolRouter <--> Storage
     ToolRouter -->|Mutating Action Requested| DraftStage
@@ -74,7 +80,8 @@ flowchart TD
     ExecWorker -->|Immutable Receipt| BlockKitUI
 
     Scheduler -->|Every 30m / 8am Scan| Storage
-    Storage -->|Trigger Conditions Met| ProactiveSynthesizer
+    Storage -->|Candidate Matches| AlertTriage
+    AlertTriage -->|IMMEDIATE_DM| ProactiveSynthesizer
     ProactiveSynthesizer --> BlockKitUI
 ```
 
@@ -95,7 +102,7 @@ Clear boundaries ensure predictable execution and prevent cost overruns or permi
    - Vector store: 384-dimensional dense vectors using local CPU embeddings (`bge-small-en-v1.5` or `all-MiniLM-L6-v2`) via `fastembed` or `sqlite-vec`/`pgvector`.
    - Local SQLite support for zero-config local development, with clean migration path to PostgreSQL + `pgvector`.
 3. **Passive Ingestion Pipeline**:
-   - Zero-LLM regex pre-filter to drop bots, automated alerts, system messages, and trivial chats (< 4 tokens).
+   - Two-tier gate: Local structural filter (drops bots, subtypes, short tokens) + `SystemOneGate` (TypeSafe AI Jev with regex fallback) to reliably catch nuanced commitments and meeting notes without expensive autoregressive generation.
    - Structured JSON entity extraction using a lightweight model (`gpt-4o-mini` or equivalent SLM) enforced via Pydantic schemas.
    - Extraction targets: contact names, interaction summaries, explicit commitments, and due dates.
 4. **Conversational ReAct Agent**:

@@ -42,11 +42,11 @@ The specifications are organized modularly to enable incremental, verified imple
 | :--- | :--- | :--- | :--- |
 | [01_system_architecture_and_scope.md](./01_system_architecture_and_scope.md) | System Overview, Topology & Master Scope | Hybrid Agentic AI | Architectural blueprint, overall In/Out Scope matrix |
 | [02_slack_infrastructure_and_storage.md](./02_slack_infrastructure_and_storage.md) | Slack Socket Mode & Dual-Memory Layer | Relational + Vector Storage | Slack Bolt router, SQLite/PostgreSQL schemas (`sqlite-vec` / `pgvector`) |
-| [03_sequential_ingestion_pipeline.md](./03_sequential_ingestion_pipeline.md) | Passive Ingestion & Entity Extraction | Sequential Pattern (Zero LLM Orchestration) | Regex noise filter, Pydantic extraction model, local CPU embeddings |
-| [04_conversational_react_agent.md](./04_conversational_react_agent.md) | Conversational Reasoning & Tool Calling | ReAct Pattern (Thought-Action-Observation) | Dynamic tool registry, thread-isolated conversational loop |
-| [05_hitl_approval_gateways.md](./05_hitl_approval_gateways.md) | Human-in-the-Loop Execution Safety Gate | HITL Pattern (Two-Phase Commit) | Staged `action_drafts`, Slack Block Kit cards, HMAC user authorization |
-| [06_proactive_heartbeat_engine.md](./06_proactive_heartbeat_engine.md) | Scheduled Briefings & Deadline Monitors | Evaluator-Optimizer / Monitor Pattern | Zero-LLM deterministic SQL scanner, proactive DM generator, thread handoff |
-| [07_verification_plan_and_test_matrix.md](./07_verification_plan_and_test_matrix.md) | Master Test Harness & QA Validation | End-to-End Verification | Automated pytest fixtures, mock Slack harness, cost & latency benchmarks |
+| [03_sequential_ingestion_pipeline.md](./03_sequential_ingestion_pipeline.md) | Passive Ingestion & Entity Extraction | Two-Tier Sequential Gate | Local structural filter + TypeSafe AI Jev System 1 gate, Pydantic extraction, local CPU embeddings |
+| [04_conversational_react_agent.md](./04_conversational_react_agent.md) | Conversational Reasoning & Tool Calling | Hybrid Jev Routing + ReAct Loop | Sub-100ms Fast-Path Intent Router (Jev System 1), direct tool dispatch, and multi-hop ReAct loop |
+| [05_hitl_approval_gateways.md](./05_hitl_approval_gateways.md) | Human-in-the-Loop Execution Safety Gate | HITL Pattern (Two-Phase Commit) | Staged `action_drafts`, Slack Block Kit cards, user authorization check, atomic CAS idempotency |
+| [06_proactive_heartbeat_engine.md](./06_proactive_heartbeat_engine.md) | Scheduled Briefings & Deadline Monitors | Monitor Pattern + Jev Alert Triage | Zero-LLM deterministic SQL scanner, Jev alert triage gate (fatigue prevention), proactive DM generator |
+| [07_verification_plan_and_test_matrix.md](./07_verification_plan_and_test_matrix.md) | Master Test Harness & QA Validation | End-to-End Verification | Automated pytest fixtures, mock Slack harness, TypeSafe Jev fixtures, cost & latency benchmarks |
 
 ---
 
