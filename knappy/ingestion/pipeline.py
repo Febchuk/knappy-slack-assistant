@@ -59,6 +59,7 @@ class IngestionPipeline:
             due_date=to_sqlite_ts(extracted.due_date),
             embedding=embedding,
             last_interaction_ts=format_ts(),
+            owner_user_id=str(event.get("user") or ""),
         )
         return extracted
 

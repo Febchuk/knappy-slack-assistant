@@ -3,13 +3,15 @@
 from __future__ import annotations
 
 import json
+import logging
 from dataclasses import dataclass, field
 from typing import Any, Awaitable, Callable
 
 from knappy.agent.memory import ThreadMemory
-from knappy.agent.tools import ToolRegistry, format_commitment_results
+from knappy.agent.tools import ToolRegistry, format_commitment_results, format_history_results
 
 CompleteFn = Callable[[list[dict[str, Any]]], Awaitable["ModelTurn"]]
+logger = logging.getLogger("knappy")
 
 
 @dataclass
@@ -51,6 +53,7 @@ class ReActAgent:
             turn = await self.complete(messages)
             if not turn.tool_name:
                 return AgentReply(text=turn.text or "")
+            logger.info("tool %s", turn.tool_name)
             arguments = dict(turn.tool_args)
             if turn.tool_name == "stage_outbound_action":
                 arguments.setdefault("user_id", thread_context.get("user_id", ""))
@@ -65,5 +68,7 @@ class ReActAgent:
                 )
             if turn.tool_name == "search_commitments" and result == []:
                 return AgentReply(text=format_commitment_results([], query))
+            if turn.tool_name == "search_slack_history":
+                return AgentReply(text=format_history_results(result, query))
             messages.append({"role": "tool", "name": turn.tool_name, "content": json.dumps(result, default=str)})
         return AgentReply(text="I need a bit more detail before I can answer. Could you clarify what you want?")

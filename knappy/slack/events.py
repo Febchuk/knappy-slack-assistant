@@ -2,12 +2,14 @@
 
 from __future__ import annotations
 
+import logging
 import time
 from collections import OrderedDict
 from collections.abc import Awaitable, Callable
 from typing import Any
 
 Processor = Callable[[dict[str, Any]], Awaitable[None]]
+logger = logging.getLogger("knappy")
 
 
 class EventDeduplicator:
@@ -45,10 +47,13 @@ async def on_message(
     elapsed = time.perf_counter() - started
     if event.get("channel_type") not in (None, "im"):
         return elapsed
+    if _from_bot(event):
+        return elapsed
     key = event_key(event)
     if deduper is not None and key is not None and deduper.seen(key):
         return elapsed
     if processor is not None:
+        _log_received("message", event)
         await processor(event)
     return elapsed
 
@@ -64,8 +69,27 @@ async def on_app_mention(
     await ack()
     elapsed = time.perf_counter() - started
     key = event_key(event)
+    if _from_bot(event):
+        return elapsed
     if deduper is not None and key is not None and deduper.seen(key):
         return elapsed
     if processor is not None:
+        _log_received("app_mention", event)
         await processor(event)
     return elapsed
+
+
+def _from_bot(event: dict[str, Any]) -> bool:
+    return bool(event.get("bot_id") or event.get("subtype") == "bot_message")
+
+
+def _log_received(event_type: str, event: dict[str, Any]) -> None:
+    from knappy.runtime import strip_mentions
+
+    logger.info(
+        "event type=%s channel=%s user=%s text=%s",
+        event_type,
+        event.get("channel"),
+        event.get("user"),
+        strip_mentions(str(event.get("text") or "")),
+    )

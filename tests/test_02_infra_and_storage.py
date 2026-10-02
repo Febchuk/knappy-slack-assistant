@@ -2,11 +2,12 @@
 
 from __future__ import annotations
 
+import os
 import time
 
 import pytest
 
-from knappy.config import ConfigError, Settings
+from knappy.config import ConfigError, Settings, load_dotenv
 from knappy.db.repository import SqliteRepository
 from knappy.db.schema import EXPECTED_TABLES, POSTGRES_SCHEMA
 from knappy.db.vectors import cosine_distance
@@ -23,6 +24,19 @@ def test_infra_01_settings_load(monkeypatch: pytest.MonkeyPatch) -> None:
     assert settings.slack_app_token == "xapp-test"
     app = create_app(settings)
     assert app is not None
+
+
+def test_dotenv_strips_quotes_and_inline_comments(tmp_path, monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.delenv("KNAPPY_DATABASE_URL", raising=False)
+    monkeypatch.delenv("KNAPPY_WORKSPACE_ID", raising=False)
+    env_file = tmp_path / ".env"
+    env_file.write_text(
+        'KNAPPY_DATABASE_URL="sqlite:///knappy.db"\n'
+        "KNAPPY_WORKSPACE_ID=T123456789 # your Slack team id\n"
+    )
+    load_dotenv(env_file)
+    assert os.environ["KNAPPY_DATABASE_URL"] == "sqlite:///knappy.db"
+    assert os.environ["KNAPPY_WORKSPACE_ID"] == "T123456789"
 
 
 def test_infra_01_missing_tokens(monkeypatch: pytest.MonkeyPatch) -> None:

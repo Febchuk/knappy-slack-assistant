@@ -4,49 +4,58 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import os
 
-from knappy.db.repository import SqliteRepository
+from knappy.config import load_dotenv
+from knappy.db.factory import open_repository, sqlite_path
 from knappy.heartbeat.engine import HeartbeatEngine
 from knappy.heartbeat.triage import ProactiveAlertTriager
 from knappy.runtime import heuristic_triage
-
-
-def sqlite_path(database_url: str) -> str:
-    if database_url in {"sqlite:///:memory:", ":memory:"}:
-        return ":memory:"
-    prefix = "sqlite:///"
-    if database_url.startswith(prefix):
-        return database_url[len(prefix) :]
-    return database_url
+from knappy.slack.egress import build_say
 
 
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description="Run Knappy's proactive heartbeat")
     parser.add_argument("--run-now", action="store_true")
-    parser.add_argument("--database", default="sqlite:///knappy.db")
-    parser.add_argument("--workspace", default="default_ws")
+    parser.add_argument("--database", default=os.environ.get("KNAPPY_DATABASE_URL", "sqlite:///knappy.db"))
+    parser.add_argument("--workspace", default=os.environ.get("KNAPPY_WORKSPACE_ID", "default_ws"))
     parser.add_argument("--user", default="U_OWNER")
     return parser
 
 
+async def _slack_sender():
+    token = os.environ.get("SLACK_BOT_TOKEN")
+    if not token:
+        return None, None
+    from slack_sdk.web.async_client import AsyncWebClient
+
+    client = AsyncWebClient(token=token)
+    return build_say(client), client
+
+
 async def run_now(database: str, workspace_id: str, user_id: str) -> dict[str, int]:
-    repo = SqliteRepository(sqlite_path(database))
-    await repo.connect()
+    repo = await open_repository(database)
     await repo.init_schema()
     await repo.upsert_workspace(workspace_id, "Knappy", "local")
+    sender, client = await _slack_sender()
     engine = HeartbeatEngine(
         repo,
         ProactiveAlertTriager(heuristic_triage),
         workspace_id=workspace_id,
         user_id=user_id,
+        sender=sender,
     )
     try:
         return await engine.run_tick(include_cadence=True, deliver_digest=True)
     finally:
+        session = getattr(client, "session", None) if client is not None else None
+        if session is not None and not getattr(session, "closed", True):
+            await session.close()
         await repo.close()
 
 
 def main(argv: list[str] | None = None) -> int:
+    load_dotenv()
     args = build_parser().parse_args(argv)
     if not args.run_now:
         build_parser().print_help()

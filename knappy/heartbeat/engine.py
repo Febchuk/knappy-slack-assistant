@@ -78,13 +78,15 @@ class HeartbeatEngine:
                 counts["immediate"] += 1
             elif action == "QUEUE_MORNING_DIGEST":
                 if candidate.get("contact_id") not in queued_contacts:
+                    owner = candidate.get("owner_user_id") or self.user_id
                     await self.repo.enqueue_briefing(
                         workspace_id=self.workspace_id,
-                        user_id=self.user_id,
+                        user_id=owner,
                         kind=candidate["kind"],
                         summary=candidate.get("commitment") or candidate.get("summary") or candidate["contact_name"],
                         interaction_id=candidate.get("interaction_id"),
                         contact_id=candidate.get("contact_id"),
+                        owner_user_id=owner,
                     )
                     queued_contacts.add(candidate.get("contact_id"))
                 counts["queued"] += 1
@@ -102,19 +104,24 @@ class HeartbeatEngine:
             for item in items:
                 await self.repo.mark_briefing_delivered(item["id"])
             return len(items)
-        lines = [f"• {item['summary']}" for item in items]
-        await self.sender(
-            channel=self.user_id,
-            text="Morning briefing",
-            blocks=[
-                {
-                    "type": "section",
-                    "text": {"type": "mrkdwn", "text": "*Morning briefing*\n" + "\n".join(lines)},
-                }
-            ],
-        )
+        groups: dict[str, list[dict[str, Any]]] = {}
         for item in items:
-            await self.repo.mark_briefing_delivered(item["id"])
+            owner = item.get("owner_user_id") or item.get("user_id") or self.user_id
+            groups.setdefault(owner, []).append(item)
+        for owner, group in groups.items():
+            lines = [f"• {item['summary']}" for item in group]
+            await self.sender(
+                channel=owner,
+                text="Morning briefing",
+                blocks=[
+                    {
+                        "type": "section",
+                        "text": {"type": "mrkdwn", "text": "*Morning briefing*\n" + "\n".join(lines)},
+                    }
+                ],
+            )
+            for item in group:
+                await self.repo.mark_briefing_delivered(item["id"])
         return len(items)
 
     async def mark_done(self, interaction_id: str) -> None:
@@ -125,10 +132,11 @@ class HeartbeatEngine:
 
     async def _dispatch_immediate(self, candidate: dict[str, Any]) -> None:
         summary = await self.synthesize(candidate)
+        owner = candidate.get("owner_user_id") or self.user_id
         draft_id = await self.repo.create_draft(
             workspace_id=self.workspace_id,
-            user_id=self.user_id,
-            channel_id=self.user_id,
+            user_id=owner,
+            channel_id=owner,
             action_type="SEND_SLACK_DM",
             payload={
                 "action_type": "SEND_SLACK_DM",
@@ -146,7 +154,7 @@ class HeartbeatEngine:
             candidate.get("commitment") or summary,
         )
         if self.sender is not None:
-            await self.sender(channel=self.user_id, text=summary, blocks=blocks)
+            await self.sender(channel=owner, text=summary, blocks=blocks)
 
     def _commitment_candidate(self, row: dict[str, Any]) -> dict[str, Any]:
         return {

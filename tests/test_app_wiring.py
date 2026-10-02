@@ -312,13 +312,18 @@ async def test_socket_mode_serve(monkeypatch: pytest.MonkeyPatch, tmp_path) -> N
     monkeypatch.setenv("KNAPPY_WORKSPACE_ID", "T_SERVE")
 
     from slack_bolt.adapter.socket_mode.async_handler import AsyncSocketModeHandler
+    from slack_sdk.web.async_client import AsyncWebClient
 
     from knappy.main import _serve
 
     async def start_async(self):
         await self.client.close()
 
+    async def auth_test(self, *args, **kwargs):
+        return {"team_id": "T_FROM_SLACK"}
+
     monkeypatch.setattr(AsyncSocketModeHandler, "start_async", start_async)
+    monkeypatch.setattr(AsyncWebClient, "auth_test", auth_test)
     await _serve()
     settings = Settings.from_env()
     assert settings.database_url.endswith("knappy.db")

@@ -8,7 +8,8 @@ from typing import Any, Awaitable, Callable
 from knappy.agent.memory import ThreadMemory
 from knappy.agent.react import AgentReply, ModelTurn, ReActAgent
 from knappy.agent.router import IntentClassification, SystemOneRouter
-from knappy.agent.tools import ToolRegistry
+from knappy.agent.tools import ToolRegistry, current_owner
+from knappy.slack.egress import delivery_kwargs
 from knappy.db.repository import SqliteRepository
 from knappy.heartbeat.engine import HeartbeatEngine
 from knappy.heartbeat.triage import ProactiveAlertTriager
@@ -20,12 +21,33 @@ from knappy.ingestion.pipeline import IngestionPipeline, acknowledgement
 
 Say = Callable[..., Awaitable[None]]
 
+_MENTION = re.compile(r"<@[A-Z0-9]+(?:\|[^>]+)?>")
+
+
+def strip_mentions(text: str) -> str:
+    return re.sub(r"\s+", " ", _MENTION.sub(" ", text)).strip()
+
 
 async def heuristic_intent(query: str, thread_context: dict[str, Any]) -> IntentClassification:
-    text = query.lower()
+    text = strip_mentions(query).lower()
+    if re.search(r"\bwho are you\b|\bwhat are you\b|\bwhat can you do\b", text):
+        return IntentClassification("identity", 0.95, 0.1, 0.0)
+    if re.search(
+        r"\bwhat do i have\b|\bwhat should i\b|\bwhat do i need\b|\bon my plate\b|\bmy tasks\b|\bto-?do\b",
+        text,
+    ):
+        return IntentClassification("list_commitments", 0.95, 0.2, 0.0)
     if any(phrase in text for phrase in ("promise", "promised", "commitment", "what did i")):
         return IntentClassification("search_commitments", 0.95, 0.2, 0.05)
-    if re.search(r"\bfollow up\b|\bemail\b|\binvite\b|\bdraft\b", text):
+    if any(phrase in text for phrase in ("said", "say about", "in slack", "in the channel", "slack message")):
+        return IntentClassification("search_history", 0.95, 0.2, 0.0)
+    if re.search(r"\b(show me|show that|show it|show the draft)\b", text):
+        return IntentClassification("show_last", 0.95, 0.1, 0.0)
+    if re.search(r"\b(draft|template|write me|write a)\b", text) and not re.search(
+        r"\b(send|email|follow up|invite)\b", text
+    ):
+        return IntentClassification("compose", 0.95, 0.3, 0.0)
+    if re.search(r"\bfollow up\b|\bemail\b|\binvite\b", text):
         return IntentClassification("stage_action", 0.95, 1.5, 0.92)
     if text.startswith("who") or "contact" in text:
         return IntentClassification("query_contact", 0.95, 0.2, 0.0)
@@ -40,6 +62,8 @@ async def heuristic_complete(messages: list[dict[str, Any]]) -> ModelTurn:
     user = next(item["content"] for item in messages if item["role"] == "user")
     query = user.split("User:", 1)[-1].strip()
     lower = query.lower()
+    if any(phrase in lower for phrase in ("said", "say about", "in slack", "slack message")):
+        return ModelTurn(tool_name="search_slack_history", tool_args={"query": query})
     if "follow up" in lower:
         recipient = "them"
         for token in query.split():
@@ -97,12 +121,13 @@ class KnappyRuntime:
         executor: ActionExecutor | None = None,
         say: Say | None = None,
         sender: Say | None = None,
+        history: Any | None = None,
     ) -> None:
         self.repo = repo
         self.workspace_id = workspace_id
         self.say = say
         self.memory = ThreadMemory()
-        self.tools = ToolRegistry(repo, workspace_id)
+        self.tools = ToolRegistry(repo, workspace_id, history=history)
         self.agent = ReActAgent(self.tools, complete, self.memory)
         self.router = SystemOneRouter(self.tools, self.agent, classify)
         self.gate = CompositeSystemOneGate(JevSystemOneAdapter(), RegexFallbackAdapter())
@@ -120,8 +145,17 @@ class KnappyRuntime:
         self.heartbeat.user_id = user_id
 
     async def handle_event(self, event: dict[str, Any]) -> AgentReply | None:
-        text = event.get("text", "")
-        thread_ts = str(event.get("thread_ts") or event.get("ts") or event.get("channel") or "dm")
+        owner = str(event.get("user") or "")
+        token = current_owner.set(owner)
+        try:
+            return await self._handle_event(event)
+        finally:
+            current_owner.reset(token)
+
+    async def _handle_event(self, event: dict[str, Any]) -> AgentReply | None:
+        text = strip_mentions(event.get("text", ""))
+        event = {**event, "text": text}
+        thread_ts = _conversation_key(event)
         self.memory.append(thread_ts, "user", text)
         if text.strip().lower().startswith("note:"):
             extracted = await self.pipeline.run({**event, "workspace_id": self.workspace_id})
@@ -129,8 +163,7 @@ class KnappyRuntime:
                 return None
             reply = AgentReply(text=acknowledgement(extracted))
             self.memory.append(thread_ts, "assistant", reply.text)
-            if self.say is not None:
-                await self.say(text=reply.text, channel=event.get("channel"), thread_ts=thread_ts)
+            await self._post(event, reply)
             return reply
         if LocalStructuralFilter.should_evaluate(event) and not _is_user_query(text):
             passes, _decision = await self.gate.should_ingest(event)
@@ -140,18 +173,25 @@ class KnappyRuntime:
             "thread_ts": thread_ts,
             "user_id": event.get("user") or self.heartbeat.user_id,
             "channel_id": event.get("channel") or "",
-            "recent_messages": self.memory.history(thread_ts)[-2:],
+            "recent_messages": self.memory.history(thread_ts)[-6:],
         }
         reply = await self.router.route_and_execute(text, context)
         self.memory.append(thread_ts, "assistant", reply.text)
-        if self.say is not None:
-            await self.say(
-                text=reply.text,
-                blocks=reply.blocks,
-                channel=event.get("channel"),
-                thread_ts=thread_ts,
-            )
+        await self._post(event, reply)
         return reply
+
+    async def _post(self, event: dict[str, Any], reply: AgentReply) -> None:
+        if self.say is None:
+            return
+        await self.say(**delivery_kwargs(event, reply.text, reply.blocks))
+
+
+def _conversation_key(event: dict[str, Any]) -> str:
+    if event.get("thread_ts"):
+        return str(event["thread_ts"])
+    if event.get("channel"):
+        return str(event["channel"])
+    return str(event.get("ts") or "dm")
 
 
 def _is_user_query(text: str) -> bool:

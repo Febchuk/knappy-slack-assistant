@@ -82,7 +82,8 @@ CREATE TABLE IF NOT EXISTS contacts (
     reminder_cadence_days INTEGER DEFAULT 30,  -- Days before flagging relationship as dormant
     last_interaction_ts TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP,
     created_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP,
-    CONSTRAINT uq_workspace_contact_name UNIQUE(workspace_id, name)
+    owner_user_id TEXT NOT NULL,               -- Slack user Knappy is assisting
+    CONSTRAINT uq_workspace_contact_name UNIQUE(workspace_id, owner_user_id, name)
 );
 
 -- 3. Interactions Table
@@ -100,7 +101,8 @@ CREATE TABLE IF NOT EXISTS interactions (
     status TEXT NOT NULL DEFAULT 'PENDING' CHECK(status IN ('PENDING', 'FULFILLED', 'CANCELLED', 'EXPIRED')),
     embedding VECTOR(384),                     -- Generated via bge-small-en-v1.5
     last_alerted_at TIMESTAMP WITH TIME ZONE,  -- Last proactive alert; suppresses re-query churn
-    created_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP
+    created_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP,
+    owner_user_id TEXT NOT NULL                -- Slack user Knappy is assisting
 );
 
 -- 4. Action Drafts (HITL Staged Actions)
@@ -128,7 +130,8 @@ CREATE TABLE IF NOT EXISTS briefing_items (
     contact_id UUID REFERENCES contacts(id) ON DELETE CASCADE,
     summary TEXT NOT NULL,
     status TEXT NOT NULL DEFAULT 'QUEUED' CHECK(status IN ('QUEUED', 'DELIVERED', 'DISMISSED')),
-    created_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP
+    created_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP,
+    owner_user_id TEXT NOT NULL                -- Slack user who owns this briefing
 );
 
 -- Indexes for Fast Querying
@@ -163,7 +166,8 @@ CREATE TABLE IF NOT EXISTS contacts (
     reminder_cadence_days INTEGER DEFAULT 30,
     last_interaction_ts DATETIME DEFAULT CURRENT_TIMESTAMP,
     created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
-    UNIQUE(workspace_id, name)
+    owner_user_id TEXT NOT NULL,               -- Slack user Knappy is assisting
+    UNIQUE(workspace_id, owner_user_id, name)
 );
 
 CREATE TABLE IF NOT EXISTS interactions (
@@ -180,7 +184,8 @@ CREATE TABLE IF NOT EXISTS interactions (
     status TEXT NOT NULL DEFAULT 'PENDING' CHECK(status IN ('PENDING', 'FULFILLED', 'CANCELLED', 'EXPIRED')),
     embedding BLOB,                            -- Serialized float32[384] for sqlite-vec or numpy cosine
     last_alerted_at DATETIME,
-    created_at DATETIME DEFAULT CURRENT_TIMESTAMP
+    created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+    owner_user_id TEXT NOT NULL                -- Slack user Knappy is assisting
 );
 
 CREATE TABLE IF NOT EXISTS action_drafts (
@@ -206,7 +211,8 @@ CREATE TABLE IF NOT EXISTS briefing_items (
     contact_id TEXT REFERENCES contacts(id) ON DELETE CASCADE,
     summary TEXT NOT NULL,
     status TEXT NOT NULL DEFAULT 'QUEUED' CHECK(status IN ('QUEUED', 'DELIVERED', 'DISMISSED')),
-    created_at DATETIME DEFAULT CURRENT_TIMESTAMP
+    created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+    owner_user_id TEXT NOT NULL                -- Slack user who owns this briefing
 );
 
 CREATE INDEX IF NOT EXISTS idx_contacts_cadence ON contacts (workspace_id, last_interaction_ts);

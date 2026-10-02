@@ -13,6 +13,7 @@ dependencies = [
     "numpy>=1.26",
     "pydantic>=2",
     "aiohttp>=3.9",
+    "asyncpg>=0.29",
 ]
 
 [project.optional-dependencies]
