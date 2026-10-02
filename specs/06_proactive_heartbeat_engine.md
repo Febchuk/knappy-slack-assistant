@@ -1,5 +1,7 @@
 # Specification 06: Proactive Heartbeat Engine
 
+> **Amended by [Spec 16](./16_proactive_v2.md).** §4–§6 (synthesis, digest, thread continuity) are updated there, along with delivery bug fixes. The zero-LLM sweep (§2) and triage gate (§3) are unchanged.
+
 ## 1. Overview & Objectives
 
 Traditional conversational bots are purely reactive: they remain silent until a user explicitly sends a prompt. 

@@ -1,5 +1,38 @@
 # Specification 01: System Architecture and Master Scope
 
+## 0. Product Vision (amended — supersedes the framing in §1 and §3)
+
+**Knappy is a personal assistant that lives in Slack.** You can talk to it about anything. It remembers you — your preferences, people, projects, and past conversations — across threads and restarts. It does work for you: researches, reads what you send it, drafts, tracks what you owe people, and reaches out before things slip. Reference products are Instinct and Meta Muse; Pally is the first slice, not the ceiling. See [Spec 00](./00_gap_analysis.md) for the gap between this vision and the code.
+
+### 0.1 Operating Principles
+
+1. **Answer, don't refuse.** Any reasonable request gets a real attempt. "I can't answer general questions" is a defect.
+2. **Remember by default.** Every conversation is persisted. Durable facts are reconciled into memory in the background ([Spec 13](./13_memory_system.md)).
+3. **Reads are free, boundary-crossing writes are gated.** Searching memory, the web, files, and Slack history runs without asking. Anything that reaches another person or an external account goes through the HITL gate ([Spec 05](./05_hitl_approval_gateways.md)). Writing into the user's own DM with Knappy is not boundary-crossing.
+4. **One agent, real brain, cheap edges.** A single Gemini Flash tool-calling loop is the center ([Spec 11](./11_model_layer_gemini.md), [Spec 12](./12_agent_loop_v2.md)). Deterministic code handles what code can: SQL sweeps, dedupe, approvals, and explicit commands. No swarms.
+
+### 0.2 Capability Waves
+
+| Wave | Contents | Status |
+| :--- | :--- | :--- |
+| 1 | Brain, agent loop, memory, web search and fetch, files in and out, proactive fixes | Specs 11–17 |
+| 2 | Google Workspace: Gmail and Calendar, writes through HITL | To be specified |
+| 3 | Sandboxed browser with an action monitor | To be specified |
+
+### 0.3 Revised Targets
+
+| Metric | Target |
+| :--- | :--- |
+| Visible acknowledgement (placeholder or answer) | < 1.5 s |
+| Simple answer, no tools | < 4 s |
+| Tool-using answer (memory, web) | < 15 s, with the placeholder updated while working |
+| Monthly model cost, one active user | < $10 |
+| Unapproved boundary-crossing actions | 0 |
+
+Where §1–§5 below conflict with §0, §0 wins. In particular, §1's "relationship intelligence agent" framing, §3.1 item 4's fixed tool list, and §4's latency and cost targets are superseded.
+
+---
+
 ## 1. Executive Summary & Objective
 
 **Knappy Slack Assistant** is an ambient executive assistant and relationship intelligence agent operating natively within Slack. Modeled after Pally (YC S25) and architected according to Google Cloud's Agentic AI Design Patterns, Knappy provides:

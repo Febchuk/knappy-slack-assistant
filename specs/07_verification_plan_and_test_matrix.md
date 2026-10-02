@@ -1,5 +1,7 @@
 # Specification 07: Master Verification Plan and Test Matrix
 
+> **Amended by [Spec 17](./17_end_to_end_acceptance.md).** Wave 1 is done when Spec 17's journeys pass at the levels it defines. Rows here that assert heuristic wording are retired.
+
 ## 1. Overview & Objectives
 
 In **Spec-Driven Development (SDD)**, code is not considered complete until every functional requirement satisfies a deterministic verification procedure. 

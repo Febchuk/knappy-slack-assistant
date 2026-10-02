@@ -1,5 +1,7 @@
 # Specification 04: Conversational ReAct Agent
 
+> **Amended by [Spec 12](./12_agent_loop_v2.md).** §2, §4, and §5 are superseded: the model-driven loop is the default path, the intent router is reduced to deterministic shortcuts, and web research is in scope ([Spec 14](./14_web_research.md)). §3 tool contracts and the HITL staging boundary still hold.
+
 ## 1. Overview & Objectives
 
 The **Conversational Agent** provides an interactive intelligence assistant inside Slack DMs and `@bot` mentions.
@@ -251,7 +253,7 @@ class SystemOneRouter:
 | Test Case ID | Test Focus | Input Query | Expected Behavior |
 | :--- | :--- | :--- | :--- |
 | **TEST-REACT-01** | Fast-Path Intent Routing | `"What did I promise to send Alex?"` | Intent confidence $\ge 0.90$ and complexity $< 1.0$; `search_commitments` is called and the ReAct loop is not; reply returns in $< 400\text{ ms}$. |
-| **TEST-REACT-02** | Multi-Hop ReAct Escalation | `"Find my last note with Alex and draft a follow-up email"` | Jev routes to `FULL_REACT_LOOP`; agent executes multi-step ReAct sequence. |
+| **TEST-REACT-02** | Multi-Hop ReAct Escalation | `"Find my last note with Alex and draft a follow-up email"` | Confidence is below `0.90` or complexity is at least `1.0`; the agent runs a multi-step ReAct sequence. |
 | **TEST-REACT-03** | Observation Processing | Mock tool returns: `[{contact: "Alex", commitment: "Send budget by Thursday"}]` | Agent outputs: `"Alex from Acme Corp promised to send the revised budget by Thursday."` |
 | **TEST-REACT-04** | Missing Data Handling | Search tool returns empty list `[]` | Agent clearly communicates that no matching commitment was found; does not hallucinate. |
 | **TEST-REACT-05** | Action Staging Boundary | `"Follow up with Alex and ask for the deck"` | Agent invokes `stage_outbound_action()`; does NOT invoke any external messaging API directly. |
