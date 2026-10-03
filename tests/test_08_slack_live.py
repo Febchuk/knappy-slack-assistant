@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-from datetime import date, datetime, timedelta
 from pathlib import Path
 
 import pytest
@@ -10,15 +9,12 @@ import pytest
 from knappy.agent.tools import ToolRegistry, current_owner
 from knappy.db.factory import repository_class
 from knappy.db.postgres import PostgresRepository, _placeholders
-from knappy.db.repository import SqliteRepository, format_ts, utc_now
+from knappy.db.repository import SqliteRepository
 from knappy.db.schema import POSTGRES_SCHEMA
-from knappy.heartbeat.engine import HeartbeatEngine
-from knappy.heartbeat.schedule import cadence_due
-from knappy.heartbeat.triage import ProactiveAlertTriager
 from knappy.runtime import KnappyRuntime
 from knappy.slack.egress import build_say
 from knappy.slack.executor import SlackActionExecutor
-from fakes import FakeSlack, HeuristicModel, dm, heuristic_triage, mention
+from fakes import FakeSlack, HeuristicModel, dm, member, mention
 
 
 def _runtime(repo: SqliteRepository, client: FakeSlack) -> KnappyRuntime:
@@ -35,7 +31,7 @@ def _runtime(repo: SqliteRepository, client: FakeSlack) -> KnappyRuntime:
 
 @pytest.mark.asyncio
 async def test_egress_note_answer_card_and_single_send(repo: SqliteRepository) -> None:
-    client = FakeSlack()
+    client = FakeSlack(members=[member("UALEX", "Alex Kim")])
     runtime = _runtime(repo, client)
     await runtime.handle_event(
         dm("note: Met with Alex from Acme Corp, promised to send the revised budget by Thursday.", "1.0")
@@ -59,7 +55,7 @@ async def test_egress_note_answer_card_and_single_send(repo: SqliteRepository) -
 
     approved = await runtime.gateway.approve(staged.draft_id, "U1")
     again = await runtime.gateway.approve(staged.draft_id, "U1")
-    sends = [post for post in client.posts if post.get("channel") == "Alex"]
+    sends = [post for post in client.posts if post.get("channel") == "UALEX"]
     assert approved.executed is True
     assert again.status == "ignored"
     assert len(sends) == 1
@@ -116,38 +112,6 @@ async def test_history_answers_without_ingestion(repo: SqliteRepository) -> None
 
 
 @pytest.mark.asyncio
-async def test_reminder_dm_goes_to_owner(repo: SqliteRepository) -> None:
-    contact_id = await repo.upsert_contact("T_TEST", "Alex", owner_user_id="U_FRIEND", slack_user_id="U_ALEX")
-    due = format_ts(utc_now() + timedelta(hours=2))
-    await repo.insert_interaction(
-        workspace_id="T_TEST",
-        contact_id=contact_id,
-        source_type="NOTE_INGEST",
-        channel_id="D1",
-        raw_text="send the revised budget",
-        summary="send the revised budget",
-        commitment="send the revised budget",
-        due_date=due,
-        owner_user_id="U_FRIEND",
-    )
-    sent: list[dict] = []
-
-    async def sender(**kwargs):
-        sent.append(kwargs)
-
-    engine = HeartbeatEngine(
-        repo,
-        ProactiveAlertTriager(heuristic_triage),
-        workspace_id="T_TEST",
-        user_id="U_OTHER",
-        sender=sender,
-    )
-    counts = await engine.run_tick()
-    assert counts["immediate"] == 1
-    assert sent[0]["channel"] == "U_FRIEND"
-
-
-@pytest.mark.asyncio
 async def test_unconnected_action_fails(repo: SqliteRepository) -> None:
     client = FakeSlack()
     runtime = _runtime(repo, client)
@@ -182,13 +146,6 @@ def test_postgres_url_selects_postgres_repository() -> None:
     assert "UNIQUE(workspace_id, owner_user_id, name)" in POSTGRES_SCHEMA
 
 
-def test_cadence_runs_once_at_eight() -> None:
-    morning = datetime(2026, 10, 2, 8, 5)
-    assert cadence_due(morning, None) is True
-    assert cadence_due(morning, date(2026, 10, 2)) is False
-    assert cadence_due(datetime(2026, 10, 2, 9, 0), None) is False
-
-
 def test_dockerfile_starts_one_worker() -> None:
     text = Path("Dockerfile").read_text()
     assert 'CMD ["python", "-m", "knappy.main"]' in text
@@ -197,3 +154,4 @@ def test_dockerfile_starts_one_worker() -> None:
     assert "groups:history" in manifest
     assert "reactions:write" in manifest
     assert "users:read" in manifest
+    assert "users:read.email" in manifest

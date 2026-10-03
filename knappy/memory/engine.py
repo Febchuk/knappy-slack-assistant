@@ -232,14 +232,17 @@ class MemoryEngine:
             )
             await self.store.rebuild_profile(owner, now)
         logger.info(
-            "memory forget owner=%s records=%d derived_forgotten=%d repassed=%d retracted=%d",
-            owner, len(targets), len(derived_forgotten), len(updated), len(cascade.retracted),
+            "memory forget owner=%s records=%d derived_forgotten=%d repassed=%d retracted=%d cancelled=%d",
+            owner, len(targets), len(derived_forgotten), len(updated), len(cascade.retracted), len(cascade.cancelled),
         )
-        return {
+        result = {
             "forgotten": [titles[record_id] for record_id in targets],
             "also_forgotten": derived_forgotten,
             "also_updated": updated,
         }
+        if cascade.cancelled:
+            result["cancelled_commitments"] = cascade.cancelled
+        return result
 
     async def _forget_targets(self, owner: str, query_or_id: str) -> list[str]:
         """Matching active records, plus superseded versions that still say it ("forget that I used to eat meat")."""

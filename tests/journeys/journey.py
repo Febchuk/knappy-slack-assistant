@@ -5,10 +5,9 @@ from __future__ import annotations
 import itertools
 import json
 from dataclasses import dataclass, field
-from datetime import date, datetime, timedelta, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any
-from zoneinfo import ZoneInfo
 
 import httpx
 
@@ -84,14 +83,12 @@ class Journey:
         model: Model,
         clock: FakeClock,
         slack: FakeSlack | None = None,
-        server_tz: str = "UTC",
         fetcher: WebFetcher | None = None,
     ) -> None:
         self.model = model
         self.fetcher = fetcher
         self.clock = clock
         self.slack = slack or FakeSlack(tz="UTC")
-        self.server_zone = ZoneInfo(server_tz)
         self.settings = Settings(
             slack_bot_token="xoxb-journey",
             slack_app_token="xapp-journey",
@@ -107,7 +104,6 @@ class Journey:
         self.app = FakeApp()
         self._ts = itertools.count(1)
         self._heartbeat_at: datetime | None = None
-        self._last_digest: date | None = None
 
     async def start(self) -> Journey:
         downloader = SlackDownloader(self.settings.slack_bot_token, transport=httpx.MockTransport(self._file_server))
@@ -125,7 +121,6 @@ class Journey:
         """Close the runtime and its database, then reopen from the same file as `python -m knappy.main` would."""
         await self.close()
         self._heartbeat_at = None
-        self._last_digest = None
         await self.start()
 
     async def close(self) -> None:
@@ -187,7 +182,7 @@ class Journey:
         runtime = self._running
         now = self.clock()
         if self._heartbeat_at is None or now - self._heartbeat_at >= HEARTBEAT_EVERY:
-            self._last_digest = await heartbeat_tick(runtime.heartbeat, now.astimezone(self.server_zone), self._last_digest)
+            await heartbeat_tick(runtime.heartbeat)
             self._heartbeat_at = now
         await runtime.memory_engine.tick()
 

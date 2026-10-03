@@ -786,3 +786,30 @@ async def test_search_conversations_does_not_find_the_message_being_answered(rep
 
     found = tool_results(model.requests[-1].contents)[0].result
     assert [hit["text"] for hit in found] == ["the budget is due Friday"]
+
+
+async def test_forgetting_the_source_of_a_reconciled_commitment_cancels_it(repo: SqliteRepository) -> None:
+    def promise(payload):
+        events, ops = [], []
+        for turn in user_turns(payload):
+            if "contract" in turn["text"].lower():
+                events.append(event("commitment_made", "Promised to review Alex's contract", [turn["id"]]))
+                ops.append(op("create", events=[0], record_id="person:alex", type="person", title="Alex",
+                              body="- Sent the user a contract to review"))
+                ops.append(op("commitment_add", events=[0], title="Review Alex's contract", person="Alex"))
+        return {"events": events, "ops": ops}
+
+    clock = FakeClock(START)
+    script = {"remind me to send sam": ("add_commitment", {"commitment": "send the slides", "person": "Sam"})}
+    runtime, _model, _client = runtime_for(repo, script=script, reconcile=promise, clock=clock)
+    await runtime.handle_event(dm("I'll review Alex's contract this week", "1.0"))
+    await runtime.handle_event(dm("remind me to send Sam the slides", "2.0"))
+    clock.advance(minutes=21)
+    await runtime.memory_engine.tick()
+    result = await runtime.memory_engine.forget("U1", "person:alex")
+
+    assert result["cancelled_commitments"] == ["Review Alex's contract"]
+    assert await rows(repo, "SELECT commitment, status FROM interactions ORDER BY commitment") == [
+        {"commitment": "Review Alex's contract", "status": "CANCELLED"},
+        {"commitment": "send the slides", "status": "PENDING"},
+    ], "a commitment from another source stays"

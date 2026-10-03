@@ -6,7 +6,7 @@ import asyncio
 import logging
 import os
 from collections.abc import Callable
-from datetime import date, datetime
+from datetime import datetime
 from typing import Any
 
 from slack_bolt.adapter.socket_mode.async_handler import AsyncSocketModeHandler
@@ -16,7 +16,6 @@ from knappy.db.factory import open_repository
 from knappy.db.repository import utc_now
 from knappy.files.service import SlackDownloader
 from knappy.files.store import DocumentStore
-from knappy.heartbeat.schedule import cadence_due
 from knappy.ingestion.embed import semantic
 from knappy.llm.client import GeminiClient, ModelIds
 from knappy.llm.types import Model
@@ -43,21 +42,21 @@ async def _workspace_id(client) -> str:
     return team_id or fallback
 
 
-async def heartbeat_tick(engine, now: datetime, last_digest: date | None) -> date | None:
-    """One heartbeat pass. Returns the date the morning digest last ran."""
-    include = cadence_due(now, last_digest)
+HEARTBEAT_EVERY_S = 15 * 60
+
+
+async def heartbeat_tick(engine) -> None:
+    """One heartbeat pass. Each owner's brief runs at 08:00 in their own timezone (Spec 16 PRO-BUG-3)."""
     try:
-        await engine.run_tick(include_cadence=include, deliver_digest=include)
+        await engine.run_tick()
     except Exception:
         logging.getLogger("knappy").exception("heartbeat failed")
-    return now.date() if include else last_digest
 
 
 async def _heartbeat_loop(engine) -> None:
-    last_digest = None
     while True:
-        last_digest = await heartbeat_tick(engine, datetime.now(), last_digest)
-        await asyncio.sleep(30 * 60)
+        await heartbeat_tick(engine)
+        await asyncio.sleep(HEARTBEAT_EVERY_S)
 
 
 async def _memory_loop(engine) -> None:

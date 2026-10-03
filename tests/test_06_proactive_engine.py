@@ -1,27 +1,30 @@
-"""Spec 06: deterministic heartbeat, triage, and proactive actions."""
+"""Spec 06: the zero-cost sweep, triage routing, and the card buttons. Spec 16 behavior lives in test_16_proactive.py."""
 
 from __future__ import annotations
 
 import time
-from datetime import timedelta
+from datetime import datetime, timedelta, timezone
 
 import pytest
 
-from knappy.config import ConfigError
-
+from fakes import FakeClock, FakeSlack, dm, knappy_runtime, memory_structured, seed_commitment
 from knappy.agent.session import Turn
-from knappy.db.repository import SqliteRepository, format_ts, utc_now
-from knappy.heartbeat.engine import HeartbeatEngine
+from knappy.config import ConfigError
+from knappy.db.repository import SqliteRepository
 from knappy.heartbeat.triage import ProactiveAlertTriager
 from knappy.llm.fake import FakeModel
 from knappy.llm.types import ModelTurn, UserMessage
-from knappy.runtime import KnappyRuntime
 from knappy.scheduler import main as scheduler_main
-from fakes import dm
+
+# Tuesday 15:00 UTC: daytime for an owner in UTC, outside the brief window.
+NOW = datetime(2026, 10, 6, 15, 0, tzinfo=timezone.utc)
 
 
-def _decision(strategy: str, interrupt: float, confidence: float = 0.9, consequence: float = 1.0):
+def decide(strategy: str, interrupt: float, confidence: float = 0.9, consequence: float = 1.0):
+    calls: list[dict] = []
+
     async def classify(candidate):
+        calls.append(candidate)
         return {
             "interrupt_probability": interrupt,
             "strategy": strategy,
@@ -29,161 +32,90 @@ def _decision(strategy: str, interrupt: float, confidence: float = 0.9, conseque
             "consequence_score": consequence,
         }
 
-    return classify
+    return ProactiveAlertTriager(classify), calls
 
 
-async def _due(repo: SqliteRepository, hours: int, commitment: str = "send the revised budget") -> str:
-    contact_id = await repo.upsert_contact("T_TEST", "Alex", company="Acme", slack_user_id="U_ALEX")
-    due = format_ts(utc_now() + timedelta(hours=hours))
-    return await repo.insert_interaction(
-        workspace_id="T_TEST",
-        contact_id=contact_id,
-        source_type="NOTE_INGEST",
-        channel_id="D1",
-        raw_text=commitment,
-        summary=commitment,
-        commitment=commitment,
-        due_date=due,
-        embedding=[1.0] + [0.0] * 383,
-    )
+async def utc_runtime(repo: SqliteRepository, slack: FakeSlack, triager: ProactiveAlertTriager | None = None):
+    runtime = knappy_runtime(repo, slack, FakeClock(NOW))
+    await runtime.store.set_timezone("U1", "UTC")
+    if triager is not None:
+        runtime.heartbeat.triager = triager
+    return runtime
 
 
-@pytest.mark.asyncio
 async def test_proact_01_zero_trigger(repo: SqliteRepository) -> None:
-    calls = {"n": 0}
-
-    async def classify(candidate):
-        calls["n"] += 1
-        return {}
-
-    engine = HeartbeatEngine(
-        repo,
-        ProactiveAlertTriager(classify),
-        workspace_id="T_TEST",
-        user_id="U1",
-    )
+    slack = FakeSlack()
+    triager, calls = decide("immediate_dm", 0.9)
+    runtime = await utc_runtime(repo, slack, triager)
     started = time.perf_counter()
-    counts = await engine.run_tick()
-    assert time.perf_counter() - started < 0.005
-    assert counts["scanned"] == 0
-    assert calls["n"] == 0
+    ticks = await runtime.heartbeat.run_tick()
+    elapsed = time.perf_counter() - started
+
+    assert [(tick.owner, tick.candidates, tick.outcome) for tick in ticks] == [("U1", 0, "silent")]
+    assert elapsed < 0.05
+    assert calls == [] and runtime.loop.model.structured_requests == [] and slack.posts == []
 
 
-@pytest.mark.asyncio
 async def test_proact_02_immediate_dm(repo: SqliteRepository) -> None:
-    await _due(repo, hours=2)
-    sent: list[dict] = []
+    await seed_commitment(repo, "send the revised budget", due=NOW + timedelta(hours=2))
+    slack = FakeSlack()
+    runtime = await utc_runtime(repo, slack, decide("immediate_dm", 0.91)[0])
+    [tick] = await runtime.heartbeat.run_tick()
 
-    async def sender(**kwargs):
-        sent.append(kwargs)
-
-    engine = HeartbeatEngine(
-        repo,
-        ProactiveAlertTriager(_decision("immediate_dm", 0.91)),
-        workspace_id="T_TEST",
-        user_id="U1",
-        sender=sender,
-    )
-    counts = await engine.run_tick()
-    assert counts["immediate"] == 1
-    assert sent
-    action_ids = [item["action_id"] for item in sent[0]["blocks"][1]["elements"]]
-    assert "btn_approve_proactive_action" in action_ids
+    assert tick.outcome == "sent"
+    assert [post["channel"] for post in slack.posts] == ["DU1"]
+    action_ids = [e["action_id"] for b in slack.posts[0]["blocks"] if b["type"] == "actions" for e in b["elements"]]
+    assert action_ids == ["btn_approve_proactive_action", "btn_edit_draft", "btn_resolve_commitment", "btn_snooze_commitment"]
 
 
-@pytest.mark.asyncio
 async def test_proact_03_batches_low_urgency(repo: SqliteRepository) -> None:
-    await _due(repo, hours=11)
-    sent: list[dict] = []
-
-    async def sender(**kwargs):
-        sent.append(kwargs)
-
-    engine = HeartbeatEngine(
-        repo,
-        ProactiveAlertTriager(_decision("batch_into_morning_digest", 0.5)),
-        workspace_id="T_TEST",
-        user_id="U1",
-        sender=sender,
-    )
-    counts = await engine.run_tick()
+    await seed_commitment(repo, "send the revised budget", due=NOW + timedelta(hours=11))
+    slack = FakeSlack()
+    runtime = await utc_runtime(repo, slack, decide("batch_into_morning_digest", 0.5)[0])
+    [tick] = await runtime.heartbeat.run_tick()
     queued = await repo.list_queued_briefings("T_TEST")
-    assert counts["queued"] == 1
-    assert len(queued) == 1
-    assert queued[0]["status"] == "QUEUED"
-    assert sent == []
+
+    assert tick.outcome == "queued"
+    assert [(item["status"], item["owner_user_id"]) for item in queued] == [("QUEUED", "U1")]
+    assert slack.posts == []
 
 
-@pytest.mark.asyncio
 async def test_proact_04_snooze(repo: SqliteRepository) -> None:
-    interaction_id = await _due(repo, hours=2)
+    interaction_id = await seed_commitment(repo, "send the revised budget", due=NOW + timedelta(hours=2))
+    runtime = await utc_runtime(repo, FakeSlack())
     before = await repo.get_interaction(interaction_id)
-    engine = HeartbeatEngine(
-        repo,
-        ProactiveAlertTriager(_decision("suppress_low_value", 0.1, 0.9, 0.1)),
-        workspace_id="T_TEST",
-        user_id="U1",
-    )
-    updated = await engine.snooze(interaction_id)
+    updated = await runtime.heartbeat.snooze(interaction_id)
     after = await repo.get_interaction(interaction_id)
-    assert updated is not None
-    assert after["due_date"] > before["due_date"]
+
+    assert updated == after["due_date"] == "2026-10-07 17:00:00"
+    assert before["due_date"] == "2026-10-06 17:00:00"
 
 
-@pytest.mark.asyncio
 async def test_proact_05_mark_done(repo: SqliteRepository) -> None:
-    interaction_id = await _due(repo, hours=2)
-    engine = HeartbeatEngine(
-        repo,
-        ProactiveAlertTriager(_decision("suppress_low_value", 0.1, 0.9, 0.1)),
-        workspace_id="T_TEST",
-        user_id="U1",
-    )
-    await engine.mark_done(interaction_id)
-    row = await repo.get_interaction(interaction_id)
-    assert row["status"] == "FULFILLED"
+    interaction_id = await seed_commitment(repo, "send the revised budget", due=NOW + timedelta(hours=2))
+    runtime = await utc_runtime(repo, FakeSlack())
+    await runtime.heartbeat.mark_done(interaction_id)
+
+    assert (await repo.get_interaction(interaction_id))["status"] == "FULFILLED"
 
 
-@pytest.mark.asyncio
 async def test_contactless_commitment_reminds_owner_without_a_draft(repo: SqliteRepository) -> None:
-    await repo.insert_interaction(
-        workspace_id="T_TEST",
-        contact_id=None,
-        source_type="DIRECT_DM",
-        channel_id="D1",
-        raw_text="renew passport",
-        summary="renew passport",
-        commitment="renew passport",
-        due_date=format_ts(utc_now() + timedelta(hours=2)),
-        owner_user_id="U1",
-    )
-    sent: list[dict] = []
-
-    async def sender(**kwargs):
-        sent.append(kwargs)
-
-    engine = HeartbeatEngine(
-        repo,
-        ProactiveAlertTriager(_decision("immediate_dm", 0.91)),
-        workspace_id="T_TEST",
-        user_id="U_FALLBACK",
-        sender=sender,
-    )
-    counts = await engine.run_tick()
+    await seed_commitment(repo, "renew passport", due=NOW + timedelta(hours=2), contact=None)
+    slack = FakeSlack()
+    runtime = await utc_runtime(repo, slack, decide("immediate_dm", 0.91)[0])
+    await runtime.heartbeat.run_tick()
     drafts = await (await repo.connection.execute("SELECT COUNT(*) AS n FROM action_drafts")).fetchone()
-    assert counts["immediate"] == 1
-    assert sent[0]["channel"] == "U1"
-    assert [element["action_id"] for element in sent[0]["blocks"][1]["elements"]] == [
-        "btn_resolve_commitment",
-        "btn_snooze_commitment",
-    ]
+
+    assert [post["channel"] for post in slack.posts] == ["DU1"]
+    action_ids = [e["action_id"] for b in slack.posts[0]["blocks"] if b["type"] == "actions" for e in b["elements"]]
+    assert action_ids == ["btn_resolve_commitment", "btn_snooze_commitment"]
     assert drafts["n"] == 0
 
 
 @pytest.mark.asyncio
 async def test_proact_06_thread_handoff(repo: SqliteRepository) -> None:
-    model = FakeModel([ModelTurn(text="I updated the draft.")])
-    runtime = KnappyRuntime(repo, workspace_id="T_TEST", model=model)
+    model = FakeModel([ModelTurn(text="I updated the draft.")], structured=memory_structured())
+    runtime = knappy_runtime(repo, FakeSlack(), FakeClock(NOW), model=model)
     await runtime.conversations.append(
         "U1", "thread:D1:thread-1", Turn("assistant", "You promised Alex: send the revised budget")
     )
@@ -204,10 +136,12 @@ def test_scheduler_run_now_requires_gemini_key(tmp_path, monkeypatch) -> None:
         scheduler_main(["--run-now", "--database", f"sqlite:///{tmp_path / 'knappy.db'}"])
 
 
-def test_scheduler_run_now(tmp_path, monkeypatch) -> None:
+def test_scheduler_run_now(tmp_path, monkeypatch, capsys) -> None:
     monkeypatch.setenv("GEMINI_API_KEY", "test-key")
+    monkeypatch.delenv("SLACK_BOT_TOKEN", raising=False)
+    monkeypatch.setattr("knappy.scheduler.load_dotenv", lambda: None)
     database = tmp_path / "knappy.db"
-    code = scheduler_main(
-        ["--run-now", "--database", f"sqlite:///{database}", "--workspace", "T_TEST", "--user", "U1"]
-    )
+    code = scheduler_main(["--run-now", "--database", f"sqlite:///{database}", "--workspace", "T_TEST"])
+
     assert code == 0
+    assert "no owners" in capsys.readouterr().out

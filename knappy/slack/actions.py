@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from knappy.hitl.blocks import settle_item
 from knappy.runtime import KnappyRuntime
 
 
@@ -40,6 +41,9 @@ def register_actions(app, runtime: KnappyRuntime) -> None:
     async def approve_proactive(ack, body, client):
         await ack()
         result = await runtime.gateway.approve(_action_value(body), _user_id(body))
+        if result.replacement_blocks:
+            note = result.replacement_blocks[0]["text"]["text"]
+            result.replacement_blocks = settle_item(_shown(body), _action_value(body), note) or result.replacement_blocks
         await _apply(client, body, result)
 
     @app.action("btn_cancel_action")
@@ -65,26 +69,26 @@ def register_actions(app, runtime: KnappyRuntime) -> None:
     async def resolve(ack, body, client):
         await ack()
         await runtime.heartbeat.mark_done(_action_value(body))
-        channel = body.get("channel", {}).get("id")
-        message_ts = body.get("message", {}).get("ts")
-        if channel and message_ts:
-            await client.chat_update(
-                channel=channel,
-                ts=message_ts,
-                text="Marked complete",
-                blocks=[{"type": "section", "text": {"type": "mrkdwn", "text": ":white_check_mark: Marked complete."}}],
-            )
+        await _settle(client, body, ":white_check_mark: Marked complete.", "Marked complete")
 
     @app.action("btn_snooze_commitment")
     async def snooze(ack, body, client):
         await ack()
         await runtime.heartbeat.snooze(_action_value(body))
-        channel = body.get("channel", {}).get("id")
-        message_ts = body.get("message", {}).get("ts")
-        if channel and message_ts:
-            await client.chat_update(
-                channel=channel,
-                ts=message_ts,
-                text="Snoozed",
-                blocks=[{"type": "section", "text": {"type": "mrkdwn", "text": ":zzz: Snoozed for 24 hours."}}],
-            )
+        await _settle(client, body, ":zzz: Snoozed for 24 hours.", "Snoozed")
+
+
+def _shown(body: dict) -> list[dict]:
+    return (body.get("message") or {}).get("blocks") or []
+
+
+async def _settle(client, body: dict, note: str, text: str) -> None:
+    """Resolve one item in place; a brief keeps its other items. Without the message's blocks, replace it."""
+    channel = body.get("channel", {}).get("id")
+    message_ts = body.get("message", {}).get("ts")
+    if not (channel and message_ts):
+        return
+    blocks = settle_item(_shown(body), _action_value(body), note)
+    if blocks is None:
+        blocks = [{"type": "section", "text": {"type": "mrkdwn", "text": note}}]
+    await client.chat_update(channel=channel, ts=message_ts, text=text, blocks=blocks)

@@ -5,14 +5,19 @@ Run with `pytest -m live_model tests/journeys`. Needs GEMINI_API_KEY (read from 
 
 from __future__ import annotations
 
+import json
 import re
+from datetime import datetime, timedelta, timezone
+from zoneinfo import ZoneInfo
 
 import pytest
 from pydantic import BaseModel
 
-from fakes import pdf_with
+from fakes import FakeSlack, pdf_with
 from journey import FakeFile, Journey, placeholder_replaced
+from knappy.heartbeat.brief import Item
 from knappy.llm.types import Model
+from knappy.slack.users import Recipient
 
 pytestmark = pytest.mark.live_model
 
@@ -206,3 +211,68 @@ async def test_file_04_image_description_live(journey, live_model) -> None:
     assert "40" in stored["text"], stored["text"]
     assert "40" in reply.reply["text"], reply.reply["text"]
 
+
+
+async def test_brief_writer_live(journey, live_model) -> None:
+    """Spec 16 §3: one agent-tier call writes a short brief, and separate messages to people in the user's voice."""
+    j: Journey = await journey(live_model)
+    now = datetime(2026, 10, 7, 12, 0, tzinfo=timezone.utc)
+    zone = ZoneInfo("America/New_York")
+    store = j.runtime.store
+    async with j.repo.transaction():
+        await store.create_record(
+            "U1", record_id="preference:style", type="preference", title="Writing style",
+            body="- Prefers terse, lowercase Slack messages with no exclamation marks", source="remember", now=now, sources=[],
+        )
+        await store.create_record(
+            "U1", record_id="episode_daily:2026-10-06", type="episode_daily", title="Day of 2026-10-06",
+            body="- Started planning the Q3 offsite\n- Waiting on Priya's headcount numbers", source="reconciler", now=now,
+            sources=[],
+        )
+        await store.rebuild_profile("U1", now)
+    items = [
+        Item(kind="COMMITMENT", owner="U1", interaction_id="c1", contact_name="Alex", commitment="send Alex the Q3 deck",
+             due=now + timedelta(hours=2), recipient=Recipient("Alex", "UALEX")),
+        Item(kind="COMMITMENT", owner="U1", interaction_id="c2", commitment="renew passport", due=now - timedelta(days=1)),
+        Item(kind="CADENCE", owner="U1", contact_id="k1", contact_name="Sam", days_quiet=45, recipient=Recipient("Sam", "USAM")),
+    ]
+    written = await j.runtime.heartbeat.writer.write("U1", "brief", items, now, zone)
+
+    assert len(written.text.split()) < 150, written.text
+    assert "deck" in written.text.lower() and "passport" in written.text.lower(), written.text
+    assert set(written.messages) == {0, 2}, written.messages
+    await expect(live_model, "A morning brief for the user that lists what is due today and overdue, and who to follow up "
+                 "with. It may mention the offsite or Priya as carryover. It does not invent tasks.", written.text)
+    for index, name in ((0, "Alex"), (2, "Sam")):
+        await expect(live_model, f"A Slack message written by the user, in the first person, addressed to {name}, ready to "
+                     "send. It is not a reminder to the user and does not mention an assistant or a promise.",
+                     written.messages[index])
+
+
+async def test_j11_proactive_live(journey, live_model) -> None:
+    j: Journey = await journey(live_model, at=datetime(2026, 10, 6, 10, 0, tzinfo=timezone.utc),
+                               slack=FakeSlack(tz="America/New_York"))
+    await j.dm("U1", "hi")
+    contact = await j.repo.upsert_contact("T_JOURNEY", "Alex", slack_user_id="UALEX", owner_user_id="U1")
+    await j.repo.insert_interaction(
+        workspace_id="T_JOURNEY", contact_id=contact, source_type="DIRECT_DM", channel_id="DU1",
+        raw_text="send Alex the deck", summary="send Alex the deck", commitment="send Alex the deck",
+        due_date="2026-10-07 14:00:00", owner_user_id="U1",
+    )
+    overnight = await j.advance(hours=25, minutes=30)
+    brief = await j.advance(minutes=30)
+
+    assert overnight.posts == [] and [post["channel"] for post in brief.posts] == ["DU1"]
+    text = brief.posts[0]["text"]
+    assert "deck" in text.lower() and len(text.split()) < 150, text
+    [draft] = await j.rows("SELECT id, payload FROM action_drafts")
+    staged = json.loads(draft["payload"])
+    assert staged["recipient_identifier"] == "UALEX" and "promised" not in staged["staged_content"].lower()
+    await expect(live_model, "A message to Alex, written as the user, about the deck. Not a reminder addressed to the user.",
+                 staged["staged_content"])
+
+    reply = await j.dm("U1", "actually tell him I need until Monday", thread=brief.post_ts[0])
+    assert any(use.args.get("recipient", "").lower().startswith("alex") for use in reply.called("stage_outbound_action")), \
+        [use.name for use in reply.tools]
+    assert len(await j.rows("SELECT id FROM interactions WHERE commitment IS NOT NULL")) == 1, "no second commitment"
+    assert [post for post in j.slack.posts if post["channel"] == "UALEX"] == [], "nothing sent without approval"

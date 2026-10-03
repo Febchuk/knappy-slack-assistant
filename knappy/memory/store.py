@@ -126,6 +126,8 @@ class Cascade:
 
     forgotten: list[str] = field(default_factory=list)
     retracted: list[str] = field(default_factory=list)
+    # Open commitments the reconciler made from retracted events, with nothing else standing behind them.
+    cancelled: list[str] = field(default_factory=list)
     repass: dict[str, list[str]] = field(default_factory=dict)
     surviving: dict[str, list[tuple[str, str]]] = field(default_factory=dict)
 
@@ -738,6 +740,7 @@ class MemoryStore:
                 dead_events.add(event["id"])
                 summaries[event["id"]] = event["summary"]
 
+        cascade.cancelled = await self._cancel_unsourced_commitments(owner, cascade.retracted)
         changed: set[str] = set()
         frontier = set(dead_events) | dead_records
         while frontier:
@@ -773,6 +776,28 @@ class MemoryStore:
                     await forget(record_id)
                     settled = False
         return cascade
+
+    async def _cancel_unsourced_commitments(self, owner: str, retracted: list[str]) -> list[str]:
+        """Cancel open commitments whose every commitment_made event was retracted. Returns what they said."""
+        if not retracted:
+            return []
+        marks = ", ".join("?" for _ in retracted)
+        rows = await self._all(
+            f"""
+            SELECT DISTINCT CAST(i.id AS TEXT) AS id, i.commitment FROM interactions i
+            JOIN memory_events made ON made.commitment_id = CAST(i.id AS TEXT)
+            WHERE i.workspace_id = ? AND i.owner_user_id = ? AND i.status = 'PENDING'
+              AND made.kind = 'commitment_made' AND made.id IN ({marks})
+              AND NOT EXISTS (
+                  SELECT 1 FROM memory_events e
+                  WHERE e.commitment_id = CAST(i.id AS TEXT) AND e.kind = 'commitment_made' AND e.status = 'ACTIVE'
+              )
+            """,
+            (self.workspace_id, owner, *retracted),
+        )
+        for row in rows:
+            await self._run("UPDATE interactions SET status = 'CANCELLED' WHERE CAST(id AS TEXT) = ?", (row["id"],))
+        return [row["commitment"] for row in rows]
 
     async def _drop_documents(self, owner: str, record_id: str) -> None:
         """A forgotten document record takes its stored text and chunks with it (Spec 15 §2.2)."""
@@ -847,7 +872,10 @@ class MemoryStore:
 
     async def profile(self, owner: str) -> dict[str, Any] | None:
         return await self._one(
-            "SELECT body, timezone, generated_at, nightly_on FROM user_profile WHERE workspace_id = ? AND owner_user_id = ?",
+            """
+            SELECT body, timezone, generated_at, nightly_on, brief_on, nudges_on, nudges_sent
+            FROM user_profile WHERE workspace_id = ? AND owner_user_id = ?
+            """,
             (self.workspace_id, owner),
         )
 
@@ -874,6 +902,28 @@ class MemoryStore:
             "UPDATE user_profile SET nightly_on = ? WHERE workspace_id = ? AND owner_user_id = ?",
             (day, self.workspace_id, owner),
         )
+
+    async def set_brief_on(self, owner: str, day: str) -> None:
+        """The owner-local date whose morning brief was decided, sent or deliberately not (Spec 16 §3)."""
+        async with self.repo.transaction():
+            await self._ensure_profile(owner)
+            await self._run(
+                "UPDATE user_profile SET brief_on = ? WHERE workspace_id = ? AND owner_user_id = ?",
+                (day, self.workspace_id, owner),
+            )
+
+    async def count_nudge(self, owner: str, day: str) -> None:
+        """One more unprompted immediate DM on the owner-local `day` (Spec 16 §3.1 caps these)."""
+        async with self.repo.transaction():
+            await self._ensure_profile(owner)
+            await self._run(
+                """
+                UPDATE user_profile
+                SET nudges_sent = CASE WHEN nudges_on = ? THEN nudges_sent + 1 ELSE 1 END, nudges_on = ?
+                WHERE workspace_id = ? AND owner_user_id = ?
+                """,
+                (day, day, self.workspace_id, owner),
+            )
 
     async def rebuild_profile(self, owner: str, now: datetime) -> str:
         """Compile the one-pager (Spec 13 §4.1) from active records. Deterministic, so forget is honored at once."""

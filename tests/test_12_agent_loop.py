@@ -143,7 +143,7 @@ async def test_loop_05_staged_dm_posts_card_and_sends_nothing(repo: SqliteReposi
                     "recipient": "Alex",
                     "summary": "Ask for the deck",
                     "staged_content": "Could you send the deck?",
-                    "recipient_identifier": "U_ALEX",
+                    "recipient_identifier": "UALEX",
                     "user_id": "U_ATTACKER",
                 },
             )

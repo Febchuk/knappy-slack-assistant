@@ -14,6 +14,7 @@ from knappy.hitl.blocks import approval_blocks
 from knappy.ingestion.embed import generate_embedding
 from knappy.llm.types import Model, Recency, ToolSpec
 from knappy.memory.types import RecordType, SavableType
+from knappy.slack.users import RecipientResolver, UserDirectory
 from knappy.web import WebFetcher
 
 if TYPE_CHECKING:
@@ -60,10 +61,12 @@ class StageOutboundActionArgs(BaseModel):
     action_type: Literal["SEND_SLACK_DM", "SHARE_FILE"] = Field(
         ..., description="SEND_SLACK_DM for a message; SHARE_FILE to send one of the user's documents"
     )
-    recipient: str = Field(..., description="Display name of the person to message")
+    recipient: str = Field(..., description="Name of the person to message, or their <@U...> mention")
     summary: str = Field(..., description="One line describing the action, shown on the approval card")
     staged_content: str = Field(..., description="The exact message text to send after approval; for SHARE_FILE, the note with the file")
-    recipient_identifier: str | None = Field(default=None, description="Slack user id, if known")
+    recipient_identifier: str | None = Field(
+        default=None, description="Their Slack user id (from a <@U...> mention) or email, if known; never guess one"
+    )
     document_id: str | None = Field(default=None, description="Required for SHARE_FILE: the document to send")
 
 
@@ -85,6 +88,13 @@ class CompleteCommitmentArgs(BaseModel):
     commitment_id: str = Field(..., description="Id from the open commitments list or search_commitments")
     status: Literal["FULFILLED", "CANCELLED"] = Field(
         default="FULFILLED", description="FULFILLED when done, CANCELLED when no longer needed"
+    )
+
+
+class RescheduleCommitmentArgs(BaseModel):
+    commitment_id: str = Field(..., description="Id from the open commitments list or search_commitments")
+    due: AwareDatetime = Field(
+        ..., description="The new deadline, ISO 8601 with the user's UTC offset, e.g. 2026-10-12T09:00:00-04:00"
     )
 
 
@@ -158,6 +168,11 @@ TOOL_SPECS: dict[str, ToolSpec] = {
         ToolSpec("add_commitment", "Record something the user will do, or asked to be reminded about.", AddCommitmentArgs),
         ToolSpec("complete_commitment", "Mark one of the user's commitments done or cancelled.", CompleteCommitmentArgs),
         ToolSpec(
+            "reschedule_commitment",
+            "Move an existing commitment's deadline. Use it instead of add_commitment when a date changes.",
+            RescheduleCommitmentArgs,
+        ),
+        ToolSpec(
             "remember",
             "Save a lasting fact, preference, or correction about the user now. To correct a record, pass its id as about.",
             RememberArgs,
@@ -208,6 +223,7 @@ TOOL_STATUS: dict[str, str] = {
     "search_slack_history": "searching Slack",
     "add_commitment": "saving that",
     "complete_commitment": "updating your commitments",
+    "reschedule_commitment": "updating your commitments",
     "remember": "remembering that",
     "forget": "forgetting that",
     "memory_search": "checking what I know",
@@ -223,13 +239,25 @@ TOOL_STATUS: dict[str, str] = {
 
 @dataclass(frozen=True)
 class StagedDraft:
-    """A draft awaiting approval. The card goes to Slack; the model only sees the summary."""
+    """A draft awaiting approval. The card goes to Slack; the model only sees the summary.
 
-    draft_id: str
+    Without a draft_id the recipient could not be found, so the card shows the text with no send button.
+    """
+
+    draft_id: str | None
     recipient: str
     blocks: list[dict[str, Any]]
+    problem: str | None = None
 
-    def for_model(self) -> dict[str, str]:
+    def for_model(self) -> dict[str, str | None]:
+        if self.draft_id is None:
+            return {
+                "draft_id": None,
+                "status": (
+                    f"Not staged: {self.problem}. The user sees the text but cannot send it. "
+                    f"Ask them to @-mention {self.recipient} so you can draft it again."
+                ),
+            }
         return {"draft_id": self.draft_id, "status": f"Drafted for {self.recipient}. Waiting for the user's approval; not sent."}
 
 
@@ -243,9 +271,11 @@ class ToolRegistry:
         searcher: Model | None = None,
         fetcher: WebFetcher | None = None,
         files: FileService | None = None,
+        recipients: RecipientResolver | None = None,
     ) -> None:
         self.repo = repo
         self.files = files
+        self.recipients = recipients or RecipientResolver(repo, workspace_id, UserDirectory(history))
         self.workspace_id = workspace_id
         self.history = history
         self.memory = memory
@@ -313,31 +343,38 @@ class ToolRegistry:
         document_id: str | None = None,
     ) -> StagedDraft | dict[str, str]:
         thread = _thread()
+        owner = self._owner() or ""
         metadata: dict[str, str] = {}
         file_name = None
         if action_type == "SHARE_FILE":
-            document = await self.files.documents.get(self._owner() or "", document_id) if self.files and document_id else None
+            document = await self.files.documents.get(owner, document_id) if self.files and document_id else None
             if document is None:
                 return {"error": f"No document with id {document_id}. Find it with list_files."}
-            metadata["document_id"] = document.id
+            metadata = {"document_id": document.id, "file_name": document.name}
             file_name = document.name
+        content = staged_content or summary
+        who = await self.recipients.resolve(owner, recipient, slack_id=recipient_identifier)
+        if who.user_id is None:
+            blocks = approval_blocks(None, who.name, content, file_name, problem=who.problem)
+            return StagedDraft(None, who.name, blocks, who.problem)
         staged = {
             "action_type": action_type,
-            "recipient_identifier": recipient_identifier or recipient,
-            "recipient_name": recipient,
+            "recipient_identifier": who.user_id,
+            "recipient_name": who.name,
             "preview_summary": summary,
-            "staged_content": staged_content or summary,
+            "staged_content": content,
             "metadata": metadata,
         }
         draft_id = await self.repo.create_draft(
             workspace_id=self.workspace_id,
-            user_id=self._owner() or "",
+            user_id=owner,
             channel_id=thread.channel_id,
             thread_ts=thread.thread_ts,
             action_type=action_type,
             payload=staged,
         )
-        return StagedDraft(draft_id, recipient, approval_blocks(draft_id, recipient, staged["staged_content"], file_name))
+        blocks = approval_blocks(draft_id, who.name, content, file_name, recipient_id=who.user_id)
+        return StagedDraft(draft_id, who.name, blocks)
 
     async def add_commitment(
         self,
@@ -376,6 +413,19 @@ class ToolRegistry:
             return {"error": f"No commitment with id {commitment_id}"}
         await self.repo.update_interaction_status(commitment_id, status)
         return {"id": commitment_id, "commitment": row["commitment"], "status": status}
+
+    async def reschedule_commitment(self, commitment_id: str, due: datetime) -> dict[str, Any]:
+        row = await self.repo.get_interaction(commitment_id)
+        if (
+            row is None
+            or row["workspace_id"] != self.workspace_id
+            or row["owner_user_id"] != (self._owner() or "")
+            or not row.get("commitment")
+            or row["status"] != "PENDING"
+        ):
+            return {"error": f"No open commitment with id {commitment_id}"}
+        await self.repo.reschedule_commitment(commitment_id, due)
+        return {"id": commitment_id, "commitment": row["commitment"], "due_utc": format_ts(due)}
 
     async def search_slack_history(
         self,

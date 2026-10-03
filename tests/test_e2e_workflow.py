@@ -6,7 +6,7 @@ import pytest
 
 from knappy.db.repository import SqliteRepository
 from knappy.runtime import KnappyRuntime
-from fakes import HeuristicModel
+from fakes import FakeSlack, HeuristicModel, member
 
 
 class Recorder:
@@ -20,8 +20,8 @@ class Recorder:
 @pytest.mark.asyncio
 async def test_note_recall_and_approval(repo: SqliteRepository) -> None:
     recorder = Recorder()
-    runtime = KnappyRuntime(repo, workspace_id="T_TEST", model=HeuristicModel(), executor=recorder)
-    runtime.bind_user("U1")
+    slack = FakeSlack(members=[member("UALEX", "Alex Kim")])
+    runtime = KnappyRuntime(repo, workspace_id="T_TEST", model=HeuristicModel(), executor=recorder, slack=slack)
 
     logged = await runtime.handle_event(
         {
@@ -67,4 +67,4 @@ async def test_note_recall_and_approval(repo: SqliteRepository) -> None:
     assert approved.executed is True
     assert ":white_check_mark:" in approved.replacement_blocks[0]["text"]["text"]
     assert again.status == "ignored"
-    assert len(recorder.calls) == 1
+    assert [call["payload"]["recipient_identifier"] for call in recorder.calls] == ["UALEX"]

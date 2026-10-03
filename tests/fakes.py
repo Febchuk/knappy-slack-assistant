@@ -6,13 +6,15 @@ import inspect
 import json
 import re
 from collections.abc import Awaitable, Callable
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from typing import Any
 
 from pydantic import BaseModel
 
+from knappy.heartbeat.brief import ContactMessage, ProactiveDraft
 from knappy.heartbeat.triage import TriageJudgment
 from knappy.ingestion.extract import ExtractedInteraction
+from knappy.llm.fake import FakeModel
 from knappy.llm.types import (
     Message,
     ModelTurn,
@@ -218,6 +220,7 @@ class FakeSlack:
         messages: list[dict] | None = None,
         tz: str = "America/New_York",
         ephemeral_error: BaseException | None = None,
+        members: list[dict] | None = None,
     ) -> None:
         self.posts: list[dict] = []
         self.updates: list[dict] = []
@@ -229,6 +232,9 @@ class FakeSlack:
         self.users_info_calls = 0
         self.modals: list[dict] = []
         self.uploads: list[dict] = []
+        # The workspace directory: users.list members, each optionally with profile.email.
+        self.members = members or []
+        self.directory_calls: list[str] = []
 
     async def chat_postMessage(self, **kwargs):
         self.posts.append(kwargs)
@@ -263,6 +269,17 @@ class FakeSlack:
     async def users_info(self, *, user):
         self.users_info_calls += 1
         return {"ok": True, "user": {"id": user, "tz": self.tz}}
+
+    async def users_list(self, *, limit=200, cursor=None):
+        self.directory_calls.append("users.list")
+        return {"ok": True, "members": self.members, "response_metadata": {"next_cursor": ""}}
+
+    async def users_lookupByEmail(self, *, email):
+        self.directory_calls.append(f"users.lookupByEmail {email}")
+        for member in self.members:
+            if (member.get("profile") or {}).get("email") == email:
+                return {"ok": True, "user": member}
+        raise RuntimeError("users_not_found")
 
     async def conversations_history(self, *, channel, limit=20):
         return {"messages": self.messages}
@@ -399,12 +416,27 @@ def memory_structured(reconcile: Reconcile | None = None):
             return RepassDraft(body="\n".join(kept))
         if schema is TriageJudgment:
             return TriageJudgment.model_validate(await heuristic_triage(json.loads(text)))
+        if schema is ProactiveDraft:
+            return proactive_draft(system, json.loads(text))
         if schema is DocumentDigest:
             name, _, body = text.partition("\n\n")
             return DocumentDigest(summary=" ".join(body.split())[:300], key_terms=[name.removeprefix("File name: ")])
         raise AssertionError(f"memory_structured has no answer for {schema.__name__}")
 
     return respond
+
+
+def proactive_draft(system: str, payload: dict[str, Any]) -> ProactiveDraft:
+    """The brief or nudge lists each item's summary; each recipient gets a short note that reads as the user."""
+    items = payload["items"]
+    lead = "*Brief*\n" if "morning brief" in system else ""
+    return ProactiveDraft(
+        text=lead + "\n".join(f"• {item['summary']}" for item in items),
+        messages=[
+            ContactMessage(item=item["item"], text=f"Hi {item['recipient']}, quick update on {item.get('commitment') or 'things'}.")
+            for item in items if item.get("recipient")
+        ],
+    )
 
 
 def event(kind: str, summary: str, turns: list[str], score: float = 0.9, occurred_at: str = "2026-10-03T12:00:00Z") -> dict:
@@ -417,3 +449,46 @@ def op(kind: str, *, events: list[int], score: float = 0.9, reason: str = "test"
 
 def user_turns(payload: dict[str, Any]) -> list[dict[str, Any]]:
     return [turn for turn in payload["turns"] if turn["role"] == "user"]
+
+
+def member(user_id: str, real_name: str, *, display_name: str = "", email: str | None = None) -> dict:
+    """A users.list member as Slack returns it."""
+    profile = {"real_name": real_name, "display_name": display_name, **({"email": email} if email else {})}
+    return {"id": user_id, "name": real_name.lower().replace(" ", "."), "real_name": real_name, "profile": profile}
+
+
+def knappy_runtime(repo, slack: FakeSlack, clock: FakeClock, model=None, **kwargs):
+    """A runtime wired to fake Slack the way open_runtime wires the real one: replies, proactive DMs, and approvals."""
+    from knappy.runtime import KnappyRuntime
+    from knappy.slack.egress import build_say
+    from knappy.slack.executor import SlackActionExecutor
+
+    say = build_say(slack)
+    return KnappyRuntime(
+        repo, workspace_id="T_TEST", model=model or FakeModel(agent(), structured=memory_structured()), say=say,
+        sender=say, executor=SlackActionExecutor(slack), slack=slack, clock=clock, **kwargs,
+    )
+
+
+async def seed_commitment(
+    repo,
+    text: str,
+    *,
+    due: datetime | None,
+    owner: str = "U1",
+    contact: str | None = "Alex",
+    slack_user_id: str | None = "UALEX",
+    email: str | None = None,
+) -> str:
+    """A pending commitment, as add_commitment or the reconciler would store it."""
+    contact_id = None
+    if contact:
+        contact_id = await repo.upsert_contact(
+            "T_TEST", contact, slack_user_id=slack_user_id, email=email, owner_user_id=owner,
+            last_interaction_ts=(due or datetime(2026, 10, 1)).strftime("%Y-%m-%d %H:%M:%S"),
+        )
+    return await repo.insert_interaction(
+        workspace_id="T_TEST", contact_id=contact_id, source_type="DIRECT_DM", channel_id=f"D{owner}",
+        raw_text=text, summary=text, commitment=text,
+        due_date=due.astimezone(timezone.utc).strftime("%Y-%m-%d %H:%M:%S") if due else None, owner_user_id=owner,
+    )

@@ -1,196 +1,279 @@
-"""Deterministic scanner plus triage, then optional synthesis and DM."""
+"""The proactive heartbeat (Specs 06 and 16): a zero-LLM sweep, triage, the silence rules, then a brief or a nudge.
+
+Every tick, per owner and in the owner's timezone:
+- 08:00-12:00 local, once a day: the morning brief, if there is anything to say.
+- Otherwise each due item is triaged. Immediate items become a DM unless it is quiet hours or the owner
+  already had two today; those, and digest items, wait for the next brief.
+No model is called unless an item qualifies. Every tick logs its outcome per owner: sent, queued, or silent.
+"""
 
 from __future__ import annotations
 
-from datetime import datetime, timezone
-from typing import Any, Awaitable, Callable
+import logging
+from collections.abc import Awaitable, Callable
+from dataclasses import dataclass
+from datetime import datetime, time, timedelta
+from typing import Any, Literal, Protocol
+from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
-from knappy.db.repository import SqliteRepository, format_ts, utc_now
+from knappy.agent.session import Turn
+from knappy.db.repository import format_ts
+from knappy.heartbeat.brief import Item, Kind, ProactiveWriter
 from knappy.heartbeat.triage import ProactiveAlertTriager
-from knappy.hitl.blocks import proactive_blocks
+from knappy.hitl.blocks import ProactiveCard, proactive_blocks
+from knappy.memory.store import MemoryStore
+from knappy.slack.users import RecipientResolver
 
-PROACTIVE_SYSTEM_PROMPT = """
-You are an executive relationship assistant reaching out proactively to the user via Slack.
-Be direct, helpful, and concise. Never use fluff or robotic pleasantries.
+logger = logging.getLogger("knappy")
 
-Instructions:
-1. Explain clearly why you are surfacing this now (e.g. deadline approaching in 4 hours, haven't spoken in 30 days).
-2. Propose a concrete action draft that the user can execute in one click.
-""".strip()
+BRIEF_HOUR = 8
+BRIEF_UNTIL_HOUR = 12
+QUIET_FROM_HOUR = 21
+NUDGES_PER_DAY = 2
+URGENT_CONSEQUENCE = 2.0
+BRIEF_ITEMS = 10
+DORMANT_PER_BRIEF = 3
 
-Sender = Callable[..., Awaitable[None]]
-Synthesizer = Callable[[dict[str, Any]], Awaitable[str]]
-
-
-def hours_until(due_date: str, now: datetime | None = None) -> float:
-    due = datetime.strptime(due_date, "%Y-%m-%d %H:%M:%S").replace(tzinfo=timezone.utc)
-    return (due - (now or datetime.now(timezone.utc))).total_seconds() / 3600
+Route = Literal["send", "queue", "drop"]
 
 
-def default_synthesis(candidate: dict[str, Any]) -> str:
-    name = candidate.get("contact_name") or "someone"
-    if candidate.get("check_due") and candidate.get("on_no_progress"):
-        waiting = f" (waiting on {candidate['waiting_on']})" if candidate.get("waiting_on") else ""
-        return f"No progress on {candidate['commitment']}{waiting}. Suggested next step: {candidate['on_no_progress']}"
-    if candidate.get("commitment"):
-        return f"Deadline approaching for {name}: {candidate['commitment']}"
-    days = candidate.get("days_since_last_contact")
-    return f"You have not spoken with {name} in {days} days."
+class ProactiveChannel(Protocol):
+    """Where proactive messages go: the owner's DM."""
+
+    async def open(self, owner: str) -> str: ...
+
+    async def post(self, channel: str, text: str, blocks: list[dict[str, Any]]) -> str | None: ...
+
+
+@dataclass
+class OwnerTick:
+    owner: str
+    candidates: int = 0
+    sent: int = 0
+    queued: int = 0
+    failed: bool = False
+
+    @property
+    def outcome(self) -> str:
+        if self.failed:
+            return "failed"
+        return "sent" if self.sent else "queued" if self.queued else "silent"
+
+
+def quiet_hours(local: datetime) -> bool:
+    return local.hour >= QUIET_FROM_HOUR or local.hour < BRIEF_HOUR
+
+
+def next_brief(local: datetime) -> datetime:
+    day = local.date() if local.hour < BRIEF_HOUR else local.date() + timedelta(days=1)
+    return datetime.combine(day, time(BRIEF_HOUR), local.tzinfo)
+
+
+def route(decision: dict[str, Any], item: Item, local: datetime, nudges_today: int) -> Route:
+    """Spec 16 §3.1. Immediate DMs are rare, and at night only for serious items due before the morning brief."""
+    action = decision["action"]
+    if action == "SUPPRESS_NOISE":
+        return "drop"
+    if action != "DISPATCH_IMMEDIATE_DM":
+        return "queue"
+    if quiet_hours(local):
+        urgent = decision["consequence_score"] >= URGENT_CONSEQUENCE
+        # Already overdue can wait for the brief; only a deadline that lands before it is worth waking for.
+        if not (urgent and item.due is not None and local < item.due < next_brief(local)):
+            return "queue"
+    if nudges_today >= NUDGES_PER_DAY:
+        return "queue"
+    return "send"
 
 
 class HeartbeatEngine:
     def __init__(
         self,
-        repo: SqliteRepository,
+        store: MemoryStore,
         triager: ProactiveAlertTriager,
         *,
-        workspace_id: str,
-        user_id: str,
-        sender: Sender | None = None,
-        synthesize: Synthesizer | None = None,
-        clock: Callable[[], datetime] = utc_now,
+        writer: ProactiveWriter,
+        recipients: RecipientResolver,
+        timezone: Callable[[str], Awaitable[str]],
+        channel: ProactiveChannel | None = None,
     ) -> None:
-        self.repo = repo
+        self.store = store
+        self.repo = store.repo
+        self.workspace_id = store.workspace_id
+        self.clock = store.clock
         self.triager = triager
-        self.workspace_id = workspace_id
-        self.user_id = user_id
-        self.sender = sender
-        self.synthesize = synthesize or _async_default
-        self.clock = clock
-        self.classifier_calls = 0
+        self.writer = writer
+        self.recipients = recipients
+        self.timezone = timezone
+        self.channel = channel
 
-    async def run_tick(self, *, include_cadence: bool = False, deliver_digest: bool = False) -> dict[str, int]:
-        counts = {"scanned": 0, "immediate": 0, "queued": 0, "suppressed": 0, "digests": 0}
-        commitments = await self.repo.scan_due_commitments(self.workspace_id, now=self.clock())
-        candidates = [self._commitment_candidate(row) for row in commitments]
-        if include_cadence:
-            for row in await self.repo.scan_dormant_contacts(self.workspace_id):
-                candidates.append(self._cadence_candidate(row))
-        counts["scanned"] = len(candidates)
-        if not candidates and not deliver_digest:
-            return counts
-        queued_keys = {
-            _briefing_key(item)
-            for item in await self.repo.list_queued_briefings(self.workspace_id)
-        }
-        for candidate in candidates:
-            self.classifier_calls += 1
-            decision = await self.triager.triage_candidate(candidate)
-            action = decision["action"]
-            if action == "DISPATCH_IMMEDIATE_DM":
-                await self._dispatch_immediate(candidate)
-                counts["immediate"] += 1
-            elif action == "QUEUE_MORNING_DIGEST":
-                if _briefing_key(candidate) not in queued_keys:
-                    owner = candidate.get("owner_user_id") or self.user_id
-                    await self.repo.enqueue_briefing(
-                        workspace_id=self.workspace_id,
-                        user_id=owner,
-                        kind=candidate["kind"],
-                        summary=candidate.get("commitment") or candidate.get("summary") or candidate["contact_name"],
-                        interaction_id=candidate.get("interaction_id"),
-                        contact_id=candidate.get("contact_id"),
-                        owner_user_id=owner,
-                    )
-                    queued_keys.add(_briefing_key(candidate))
-                counts["queued"] += 1
-            else:
-                counts["suppressed"] += 1
-            if candidate.get("interaction_id"):
-                await self.repo.mark_alerted(candidate["interaction_id"])
-        if deliver_digest:
-            counts["digests"] = await self.deliver_digest()
-        return counts
-
-    async def deliver_digest(self) -> int:
-        items = await self.repo.list_queued_briefings(self.workspace_id)
-        if not items or self.sender is None:
-            for item in items:
-                await self.repo.mark_briefing_delivered(item["id"])
-            return len(items)
-        groups: dict[str, list[dict[str, Any]]] = {}
-        for item in items:
-            owner = item.get("owner_user_id") or item.get("user_id") or self.user_id
-            groups.setdefault(owner, []).append(item)
-        for owner, group in groups.items():
-            lines = [f"• {item['summary']}" for item in group]
-            await self.sender(
-                channel=owner,
-                text="Morning briefing",
-                blocks=[
-                    {
-                        "type": "section",
-                        "text": {"type": "mrkdwn", "text": "*Morning briefing*\n" + "\n".join(lines)},
-                    }
-                ],
+    async def run_tick(self) -> list[OwnerTick]:
+        now = self.clock()
+        due: dict[str, list[Item]] = {}
+        for row in await self.repo.scan_due_commitments(self.workspace_id, now):
+            if not row.get("owner_user_id"):
+                logger.warning("heartbeat skipped commitment=%s: it has no owner", row["interaction_id"])
+                continue
+            due.setdefault(row["owner_user_id"], []).append(Item.from_row(row, now))
+        ticks = []
+        for owner in sorted(set(due) | set(await self.repo.proactive_owners(self.workspace_id))):
+            tick = OwnerTick(owner, len(due.get(owner, [])))
+            try:
+                await self._tick_owner(tick, due.get(owner, []), now)
+            except Exception:
+                tick.failed = True
+                logger.exception("heartbeat failed owner=%s", owner)
+            logger.info(
+                "heartbeat tick owner=%s candidates=%d sent=%d queued=%d outcome=%s",
+                owner, tick.candidates, tick.sent, tick.queued, tick.outcome,
             )
-            for item in group:
-                await self.repo.mark_briefing_delivered(item["id"])
-        return len(items)
+            ticks.append(tick)
+        return ticks
 
     async def mark_done(self, interaction_id: str) -> None:
         await self.repo.update_interaction_status(interaction_id, "FULFILLED")
 
     async def snooze(self, interaction_id: str) -> str | None:
-        return await self.repo.snooze_interaction(interaction_id, hours=24)
+        return await self.repo.snooze_interaction(interaction_id, self.clock(), hours=24)
 
-    async def _dispatch_immediate(self, candidate: dict[str, Any]) -> None:
-        summary = await self.synthesize(candidate)
-        owner = candidate.get("owner_user_id") or self.user_id
-        contact_name = candidate.get("contact_name")
+    async def _tick_owner(self, tick: OwnerTick, items: list[Item], now: datetime) -> None:
+        owner = tick.owner
+        zone = await self._zone(owner)
+        local = now.astimezone(zone)
+        profile = await self.store.profile(owner) or {}
+        today = local.date().isoformat()
+        if BRIEF_HOUR <= local.hour < BRIEF_UNTIL_HOUR and profile.get("brief_on") != today:
+            await self._brief(tick, now, zone)
+            return
+        if not items:
+            return
+        nudges = int(profile.get("nudges_sent") or 0) if profile.get("nudges_on") == today else 0
+        queued = {str(row["interaction_id"] or row["contact_id"]) for row in await self.repo.queued_items(self.workspace_id, owner)}
+        for item in items:
+            decision = await self.triager.triage_candidate(item.triage_view(now))
+            choice = route(decision, item, local, nudges)
+            if choice == "send":
+                await self._deliver(owner, "nudge", [item], now, zone)
+                await self.store.count_nudge(owner, today)
+                nudges += 1
+                tick.sent += 1
+            elif choice == "queue":
+                if item.key not in queued:
+                    await self.repo.enqueue_briefing(
+                        workspace_id=self.workspace_id, user_id=owner, kind=item.kind, summary=item.line(now, zone),
+                        interaction_id=item.interaction_id, contact_id=item.contact_id, owner_user_id=owner,
+                    )
+                    queued.add(item.key)
+                tick.queued += 1
+            if item.interaction_id:
+                await self.repo.mark_alerted(item.interaction_id, now)
+
+    async def _brief(self, tick: OwnerTick, now: datetime, zone: ZoneInfo) -> None:
+        """Spec 16 §3: queued items, what is due today or overdue, check-ins, and quiet contacts. Nothing on an empty day."""
+        owner = tick.owner
+        local = now.astimezone(zone)
+        items: list[Item] = []
+        for row in await self.repo.queued_items(self.workspace_id, owner):
+            if row["interaction_id"] and row["interaction_status"] != "PENDING":
+                await self.repo.dismiss_briefing(row["briefing_id"])
+                continue
+            if row["snoozed_until"] and row["snoozed_until"] > format_ts(now):
+                continue
+            items.append(Item.from_row(row, now))
+        listed = {item.key for item in items}
+        end_of_day = datetime.combine(local.date() + timedelta(days=1), time(0), zone)
+        for row in await self.repo.scan_due_commitments(self.workspace_id, now, until=end_of_day, owner_user_id=owner):
+            if str(row["interaction_id"]) not in listed:
+                items.append(Item.from_row(row, now))
+        for row in await self.repo.scan_dormant_contacts(self.workspace_id, now, owner, limit=DORMANT_PER_BRIEF):
+            contact = Item.from_row(row, now)
+            await self.repo.mark_contact_alerted(contact.contact_id or "", now)
+            if contact.key in listed:
+                continue
+            decision = await self.triager.triage_candidate(contact.triage_view(now))
+            if decision["action"] != "SUPPRESS_NOISE":
+                items.append(contact)
+        # The rest stay queued or unsurfaced for tomorrow; a brief is short.
+        items = items[:BRIEF_ITEMS]
+        tick.candidates = len(items)
+        if items:
+            await self._deliver(owner, "brief", items, now, zone)
+            for item in items:
+                if item.briefing_id:
+                    await self.repo.mark_briefing_delivered(item.briefing_id)
+                if item.interaction_id:
+                    await self.repo.mark_alerted(item.interaction_id, now)
+            tick.sent = 1
+        await self.store.set_brief_on(owner, local.date().isoformat())
+
+    async def _deliver(self, owner: str, kind: Kind, items: list[Item], now: datetime, zone: ZoneInfo) -> None:
+        """Write, stage any drafts to other people behind approval, post to the owner's DM, and log it as a turn."""
+        for item in items:
+            if item.person:
+                item.recipient = await self.recipients.resolve(owner, item.person)
+        written = await self.writer.write(owner, kind, items, now, zone)
+        if self.channel is None:
+            logger.info("heartbeat has no Slack channel; %s for owner=%s not posted", kind, owner)
+            return
+        dm = await self.channel.open(owner)
+        cards = [await self._card(owner, dm, item, written.messages.get(index), now, zone) for index, item in enumerate(items)]
+        cards = [card for card in cards if card is not None]
+        ts = await self.channel.post(dm, written.text, proactive_blocks(written.text, cards))
+        if ts:
+            await self.store.append(owner, f"thread:{dm}:{ts}", Turn("assistant", _transcript(written.text, cards)), slack_ts=ts)
+
+    async def _card(
+        self, owner: str, dm: str, item: Item, message: str | None, now: datetime, zone: ZoneInfo
+    ) -> ProactiveCard | None:
+        recipient = item.recipient
+        if not item.interaction_id and not recipient:
+            return None
         draft_id = None
-        if contact_name:
+        if recipient and recipient.user_id and message:
             draft_id = await self.repo.create_draft(
                 workspace_id=self.workspace_id,
                 user_id=owner,
-                channel_id=owner,
+                channel_id=dm,
                 action_type="SEND_SLACK_DM",
                 payload={
                     "action_type": "SEND_SLACK_DM",
-                    "recipient_identifier": candidate.get("slack_user_id") or contact_name,
-                    "recipient_name": contact_name,
-                    "preview_summary": summary,
-                    "staged_content": summary,
-                    "metadata": {},
+                    "recipient_identifier": recipient.user_id,
+                    "recipient_name": recipient.name,
+                    "preview_summary": item.line(now, zone),
+                    "staged_content": message,
+                    "metadata": {"interaction_id": item.interaction_id or ""},
                 },
             )
-        blocks = proactive_blocks(
-            draft_id,
-            candidate.get("interaction_id") or "",
-            contact_name,
-            candidate.get("commitment") or summary,
+        return ProactiveCard(
+            label=item.line(now, zone),
+            interaction_id=item.interaction_id,
+            recipient=recipient.name if recipient else None,
+            recipient_id=recipient.user_id if recipient else None,
+            draft_id=draft_id,
+            message=message if draft_id else None,
+            problem=recipient.problem if recipient else None,
         )
-        if self.sender is not None:
-            await self.sender(channel=owner, text=summary, blocks=blocks)
 
-    def _commitment_candidate(self, row: dict[str, Any]) -> dict[str, Any]:
-        now = self.clock()
-        candidate = {**row, "kind": "COMMITMENT", "summary": row.get("commitment"), "check_due": bool(row.get("check_due"))}
-        if row.get("due_date"):
-            candidate["hours_until_due"] = hours_until(row["due_date"], now)
-        if candidate["check_due"]:
-            candidate["hours_until_check"] = hours_until(row["next_check_at"], now)
-        return candidate
-
-    def _cadence_candidate(self, row: dict[str, Any]) -> dict[str, Any]:
-        last = datetime.strptime(row["last_interaction_ts"], "%Y-%m-%d %H:%M:%S").replace(tzinfo=timezone.utc)
-        days = (datetime.now(timezone.utc) - last).days
-        return {
-            **row,
-            "kind": "CADENCE",
-            "days_since_last_contact": days,
-            "summary": f"No contact with {row['contact_name']} in {days} days",
-        }
+    async def _zone(self, owner: str) -> ZoneInfo:
+        profile = await self.store.profile(owner)
+        name = (profile or {}).get("timezone")
+        if not name:
+            name = await self.timezone(owner)
+            await self.store.set_timezone(owner, name)
+        try:
+            return ZoneInfo(name)
+        except (ZoneInfoNotFoundError, ValueError):
+            return ZoneInfo("UTC")
 
 
-def _briefing_key(item: dict[str, Any]) -> str | None:
-    """One briefing per contact; commitments without a contact are each their own item."""
-    return item.get("contact_id") or item.get("interaction_id")
-
-
-async def _async_default(candidate: dict[str, Any]) -> str:
-    return default_synthesis(candidate)
-
-
-def digest_timestamp() -> str:
-    return format_ts()
+def _transcript(text: str, cards: list[ProactiveCard]) -> str:
+    """What the thread's agent sees as this message: the text, each item's commitment id, and any staged draft."""
+    lines = [text]
+    for card in cards:
+        ref = f" (commitment id {card.interaction_id})" if card.interaction_id else ""
+        lines.append(f"- {card.label}{ref}")
+        if card.draft_id:
+            lines.append(f"  Draft to {card.recipient}, waiting for approval: {card.message}")
+        elif card.recipient:
+            lines.append(f"  Nothing drafted to {card.recipient}{': ' + card.problem if card.problem else ''}.")
+    return "\n".join(lines)

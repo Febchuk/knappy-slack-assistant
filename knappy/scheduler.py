@@ -6,32 +6,23 @@ import argparse
 import asyncio
 import os
 
+from slack_sdk.web.async_client import AsyncWebClient
+
 from knappy.config import DEFAULT_MODEL_AGENT, DEFAULT_MODEL_LIGHT, ConfigError, load_dotenv
-from knappy.db.factory import open_repository, sqlite_path
-from knappy.heartbeat.engine import HeartbeatEngine
-from knappy.heartbeat.triage import ProactiveAlertTriager, model_triage
+from knappy.db.factory import open_repository
+from knappy.heartbeat.engine import OwnerTick
 from knappy.llm.client import GeminiClient, ModelIds
-from knappy.runtime import usage_recorder
+from knappy.runtime import KnappyRuntime, usage_recorder
 from knappy.slack.egress import build_say
+from knappy.slack.executor import SlackActionExecutor
 
 
 def build_parser() -> argparse.ArgumentParser:
-    parser = argparse.ArgumentParser(description="Run Knappy's proactive heartbeat")
+    parser = argparse.ArgumentParser(description="Run one pass of Knappy's proactive heartbeat")
     parser.add_argument("--run-now", action="store_true")
     parser.add_argument("--database", default=os.environ.get("KNAPPY_DATABASE_URL", "sqlite:///knappy.db"))
     parser.add_argument("--workspace", default=os.environ.get("KNAPPY_WORKSPACE_ID", "default_ws"))
-    parser.add_argument("--user", default="U_OWNER")
     return parser
-
-
-async def _slack_sender():
-    token = os.environ.get("SLACK_BOT_TOKEN")
-    if not token:
-        return None, None
-    from slack_sdk.web.async_client import AsyncWebClient
-
-    client = AsyncWebClient(token=token)
-    return build_say(client), client
 
 
 def _gemini_key() -> str:
@@ -41,28 +32,29 @@ def _gemini_key() -> str:
     return key
 
 
-async def run_now(database: str, workspace_id: str, user_id: str) -> dict[str, int]:
+async def run_now(database: str, workspace_id: str) -> list[OwnerTick]:
+    """One heartbeat pass for every owner, posting through Slack when SLACK_BOT_TOKEN is set."""
     api_key = _gemini_key()
     repo = await open_repository(database)
     await repo.init_schema()
     await repo.upsert_workspace(workspace_id, "Knappy", "local")
-    sender, client = await _slack_sender()
-    engine = HeartbeatEngine(
-        repo,
-        ProactiveAlertTriager(model_triage(GeminiClient(
-            api_key,
-            ModelIds(
-                agent=os.environ.get("KNAPPY_MODEL_AGENT") or DEFAULT_MODEL_AGENT,
-                light=os.environ.get("KNAPPY_MODEL_LIGHT") or DEFAULT_MODEL_LIGHT,
-            ),
-            on_usage=usage_recorder(repo, workspace_id),
-        ))),
-        workspace_id=workspace_id,
-        user_id=user_id,
-        sender=sender,
+    token = os.environ.get("SLACK_BOT_TOKEN")
+    client = AsyncWebClient(token=token) if token else None
+    model = GeminiClient(
+        api_key,
+        ModelIds(
+            agent=os.environ.get("KNAPPY_MODEL_AGENT") or DEFAULT_MODEL_AGENT,
+            light=os.environ.get("KNAPPY_MODEL_LIGHT") or DEFAULT_MODEL_LIGHT,
+        ),
+        on_usage=usage_recorder(repo, workspace_id),
+    )
+    say = build_say(client) if client is not None else None
+    runtime = KnappyRuntime(
+        repo, workspace_id=workspace_id, model=model, say=say, sender=say, slack=client,
+        executor=SlackActionExecutor(client) if client is not None else None,
     )
     try:
-        return await engine.run_tick(include_cadence=True, deliver_digest=True)
+        return await runtime.heartbeat.run_tick()
     finally:
         session = getattr(client, "session", None) if client is not None else None
         if session is not None and not getattr(session, "closed", True):
@@ -76,11 +68,8 @@ def main(argv: list[str] | None = None) -> int:
     if not args.run_now:
         build_parser().print_help()
         return 0
-    counts = asyncio.run(run_now(args.database, args.workspace, args.user))
-    print(
-        "Knappy heartbeat "
-        f"scanned={counts['scanned']} immediate={counts['immediate']} queued={counts['queued']}"
-    )
+    ticks = asyncio.run(run_now(args.database, args.workspace))
+    print("Knappy heartbeat " + (" ".join(f"{tick.owner}={tick.outcome}" for tick in ticks) or "no owners"))
     return 0
 
 

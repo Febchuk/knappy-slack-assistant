@@ -16,8 +16,9 @@ from knappy.agent.prompt import OPEN_LOOP_LIMIT, MemoryProvider, build_system_pr
 from knappy.agent.session import ConversationLocks, ConversationLog, Turn, as_messages, conversation_key
 from knappy.agent.tools import SlackThread, ToolRegistry, current_owner, current_thread, current_turn
 from knappy.db.repository import SqliteRepository, utc_now
-from knappy.files.service import FileService, Shared, SlackDownloader
+from knappy.files.service import FileService, Shared, SlackDownloader, open_dm
 from knappy.files.store import DocumentStore
+from knappy.heartbeat.brief import ProactiveWriter
 from knappy.heartbeat.engine import HeartbeatEngine
 from knappy.heartbeat.triage import ProactiveAlertTriager, model_triage
 from knappy.hitl.gateway import ActionExecutor, ApprovalGateway
@@ -28,7 +29,7 @@ from knappy.llm.client import OnUsage
 from knappy.llm.types import Model, Tier, ToolResult, Usage
 from knappy.memory import MemoryConfig, MemoryEngine, MemoryStore
 from knappy.slack.egress import Reply, SlackEgress, open_reply
-from knappy.slack.users import UserDirectory
+from knappy.slack.users import RecipientResolver, UserDirectory
 from knappy.web import WebFetcher
 
 logger = logging.getLogger("knappy")
@@ -76,27 +77,26 @@ class KnappyRuntime:
         self.conversations: ConversationLog = self.store
         self.locks = ConversationLocks()
         self.users = UserDirectory(slack)
+        self.recipients = RecipientResolver(repo, workspace_id, self.users)
         self.documents = DocumentStore(repo, workspace_id)
         self.files = FileService(self.documents, self.store, model, downloader, slack)
         self.tools = ToolRegistry(
             repo, workspace_id, history=slack, memory=self.memory_engine, searcher=model, fetcher=fetcher,
-            files=self.files,
+            files=self.files, recipients=self.recipients,
         )
         self.loop = AgentLoop(self.tools, model)
         gate = CompositeSystemOneGate(JevSystemOneAdapter(), RegexFallbackAdapter())
         self.pipeline = IngestionPipeline(repo, gate, SlmExtractor(model), workspace_id)
         self.gateway = ApprovalGateway(repo, executor or _RefusingExecutor())
+        poster = sender or say
         self.heartbeat = HeartbeatEngine(
-            repo,
+            self.store,
             ProactiveAlertTriager(model_triage(model)),
-            workspace_id=workspace_id,
-            user_id="user",
-            sender=sender,
-            clock=clock,
+            writer=ProactiveWriter(model, self.store, over_budget=self._over_budget),
+            recipients=self.recipients,
+            timezone=self.users.timezone,
+            channel=DirectMessages(slack, poster) if slack is not None and poster is not None else None,
         )
-
-    def bind_user(self, user_id: str) -> None:
-        self.heartbeat.user_id = user_id
 
     async def handle_event(self, event: dict[str, Any]) -> AgentReply:
         """Answer one Slack message. Never raises: failures become an apology with a log reference."""
@@ -181,6 +181,20 @@ def _tool_turn(result: ToolResult, turn_id: str) -> str:
     return json.dumps(
         {"tool": result.call.name, "args": result.call.args, "turn": turn_id, "result": output[:2000]}, default=str
     )
+
+
+class DirectMessages:
+    """Proactive messages go to the owner's DM, opened first so the thread key matches their replies."""
+
+    def __init__(self, client: Any, egress: SlackEgress) -> None:
+        self.client = client
+        self.egress = egress
+
+    async def open(self, owner: str) -> str:
+        return await open_dm(self.client, owner)
+
+    async def post(self, channel: str, text: str, blocks: list[dict[str, Any]]) -> str | None:
+        return await self.egress(text=text, channel=channel, blocks=blocks)
 
 
 class _RefusingExecutor:

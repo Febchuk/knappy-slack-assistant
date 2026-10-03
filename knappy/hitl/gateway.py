@@ -2,11 +2,14 @@
 
 from __future__ import annotations
 
+import logging
 from dataclasses import dataclass, field
 from typing import Any, Protocol
 
 from knappy.db.repository import SqliteRepository
 from knappy.hitl.blocks import cancelled_blocks, edit_modal, failed_blocks, receipt_blocks
+
+logger = logging.getLogger("knappy")
 
 UNAUTHORIZED = "Unauthorized: Only the creator of this request can approve it."
 
@@ -39,22 +42,27 @@ class ApprovalGateway:
             return HitlResult(ok=False, status="PENDING", ephemeral=UNAUTHORIZED)
         if not await self.repo.cas_approve(draft_id):
             return HitlResult(ok=False, status="ignored")
+        payload = draft["payload"]
+        described = {
+            "action_type": draft.get("action_type"),
+            "file_name": (payload.get("metadata") or {}).get("file_name"),
+        }
         try:
             await self.executor.execute(draft)
         except Exception:
+            logger.exception("approved draft failed draft=%s action=%s", draft_id, draft.get("action_type"))
             await self.repo.mark_failed(draft_id)
             return HitlResult(
                 ok=False,
                 status="FAILED",
-                replacement_blocks=failed_blocks(draft["payload"]["recipient_name"]),
+                replacement_blocks=failed_blocks(payload["recipient_name"], **described),
             )
         await self.repo.mark_executed(draft_id)
-        recipient = draft["payload"]["recipient_name"]
         return HitlResult(
             ok=True,
             status="APPROVED",
             executed=True,
-            replacement_blocks=receipt_blocks(user_id, recipient),
+            replacement_blocks=receipt_blocks(user_id, payload["recipient_name"], **described),
         )
 
     async def cancel(self, draft_id: str, user_id: str) -> HitlResult:

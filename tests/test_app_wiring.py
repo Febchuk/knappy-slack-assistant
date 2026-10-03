@@ -179,54 +179,6 @@ async def test_gateway_edit_and_missing(repo: SqliteRepository) -> None:
 
 
 @pytest.mark.asyncio
-async def test_digest_and_cadence(repo: SqliteRepository) -> None:
-    from knappy.heartbeat.engine import HeartbeatEngine
-    from knappy.heartbeat.triage import ProactiveAlertTriager
-
-    await repo.upsert_contact(
-        "T_TEST",
-        "Old Friend",
-        reminder_cadence_days=30,
-        last_interaction_ts="2020-01-01 00:00:00",
-    )
-    sent: list[dict] = []
-
-    async def sender(**kwargs):
-        sent.append(kwargs)
-
-    async def classify(candidate):
-        return {
-            "interrupt_probability": 0.2,
-            "strategy": "suppress_low_value",
-            "strategy_confidence": 0.9,
-            "consequence_score": 0.1,
-        }
-
-    engine = HeartbeatEngine(
-        repo,
-        ProactiveAlertTriager(classify),
-        workspace_id="T_TEST",
-        user_id="U1",
-        sender=sender,
-    )
-    counts = await engine.run_tick(include_cadence=True, deliver_digest=True)
-    assert counts["scanned"] == 1
-    assert counts["suppressed"] == 1
-
-    friend = await repo.find_contacts("T_TEST", name="Old Friend")
-    await repo.enqueue_briefing(
-        workspace_id="T_TEST",
-        user_id="U1",
-        kind="CADENCE",
-        summary="Check in with Old Friend",
-        contact_id=friend[0]["id"],
-    )
-    delivered = await engine.deliver_digest()
-    assert delivered == 1
-    assert sent
-
-
-@pytest.mark.asyncio
 async def test_socket_mode_serve(monkeypatch: pytest.MonkeyPatch, tmp_path) -> None:
     monkeypatch.setenv("SLACK_BOT_TOKEN", "xoxb-test")
     monkeypatch.setenv("SLACK_APP_TOKEN", "xapp-test")

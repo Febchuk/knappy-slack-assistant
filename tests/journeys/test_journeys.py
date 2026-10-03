@@ -14,7 +14,7 @@ from datetime import datetime, timedelta, timezone
 import httpx
 import pytest
 
-from fakes import FakeSlack, agent, event, memory_structured, op, pdf_with, user_turns
+from fakes import FakeSlack, agent, event, member, memory_structured, op, pdf_with, user_turns
 from journey import FakeFile, dm_channel, placeholder_replaced
 from knappy.agent.prompt import IDENTITY
 from knappy.llm.fake import FakeModel, GenerateRequest
@@ -327,7 +327,6 @@ async def test_j10_act_only_after_approval(journey) -> None:
     assert draft["status"] == "APPROVED" and draft["executed_at"]
 
 
-@pytest.mark.xfail(strict=True, reason="spec 16")
 async def test_j11_morning_brief(journey) -> None:
     model = scripted(reconcile=lambda payload: ReconcileResult())
     j = await journey(model, at=datetime(2026, 10, 6, 10, 0, tzinfo=timezone.utc), slack=FakeSlack(tz="America/New_York"))
@@ -339,19 +338,23 @@ async def test_j11_morning_brief(journey) -> None:
         due_date="2026-10-07 14:00:00", owner_user_id="U1",
     )
     # 08:00 in New York on Oct 7 is 12:00 UTC; the commitment is due two hours later.
-    brief = await j.advance(hours=26)
+    overnight = await j.advance(hours=25, minutes=30)
+    brief = await j.advance(minutes=30)
 
-    to_owner = [post for post in brief.posts if post["channel"] in ("U1", dm_channel("U1"))]
-    assert len(to_owner) == 1, "one morning brief"
-    draft = (await j.rows("SELECT id, payload FROM action_drafts"))[0]
+    assert overnight.posts == [], "nothing before 08:00 New York, though it was due within 12 hours from 02:00 UTC"
+    assert [post["channel"] for post in brief.posts] == [dm_channel("U1")], "one morning brief"
+    [draft] = await j.rows("SELECT id, payload FROM action_drafts")
+    staged = json.loads(draft["payload"])
+    assert staged["recipient_identifier"] == "UALEX"
     await j.click("U1", "btn_approve_proactive_action", draft["id"])
     sent = [post["text"] for post in j.slack.posts if post["channel"] == "UALEX"]
-    assert len(sent) == 1 and "Alex" in sent[0] and "you promised" not in sent[0].lower()
+    assert sent == [staged["staged_content"]] and "Alex" in sent[0]
+    assert "you promised" not in sent[0].lower() and sent[0] not in brief.posts[0]["text"], "a message to Alex, not the reminder"
 
     thread_ts = brief.post_ts[0]
     await j.dm("U1", "actually tell him I need until Monday", thread=thread_ts)
     prompt = model.requests[-1]
-    assert any("deck" in (getattr(item, "text", None) or "") for item in prompt.contents), "the brief is in context"
+    assert isinstance(prompt.contents[0], ModelTurn) and "send Alex the deck" in prompt.contents[0].text, "the brief is the previous turn"
 
 
 async def test_j12_owners_are_isolated(journey) -> None:
@@ -553,7 +556,6 @@ async def test_j16_quiet_week(journey) -> None:
     assert (week.posts, week.updates, week.ephemerals) == ([], [], []), "zero unprompted Slack posts all week"
 
 
-@pytest.mark.xfail(strict=True, reason="spec 16")
 async def test_j16_every_quiet_tick_is_logged_silent(journey, caplog: pytest.LogCaptureFixture) -> None:
     j = await journey(scripted())
     await j.dm("U1", "haha that meeting was wild")
@@ -577,19 +579,28 @@ def chase_alex(payload: dict) -> dict:
 
 
 async def test_j17_follow_through(journey) -> None:
-    j = await journey(scripted(reconcile=chase_alex))
+    slack = FakeSlack(tz="UTC", members=[member("UALEX", "Alex Kim"), member("USAM", "Sam Lee")])
+    j = await journey(scripted(reconcile=chase_alex), slack=slack)
     await j.dm("U1", "I asked Alex for the contract. If he hasn't sent it by Thursday, help me chase him.")
     quiet = await j.advance(days=3)
     assert quiet.posts == [], "nothing before Thursday"
 
     nudge = await j.advance(hours=12)
 
-    assert [post["channel"] for post in nudge.posts] == ["U1"], "one DM to the owner"
-    draft = (await j.rows("SELECT id, user_id, status, payload FROM action_drafts"))[0]
+    assert [post["channel"] for post in nudge.posts] == [dm_channel("U1")], "one DM to the owner"
+    [draft] = await j.rows("SELECT id, user_id, status, payload FROM action_drafts")
+    payload = json.loads(draft["payload"])
     assert (draft["user_id"], draft["status"]) == ("U1", "PENDING")
-    assert json.loads(draft["payload"])["recipient_name"] == "Alex"
-    assert "btn_approve_proactive_action" in json.dumps(nudge.posts[0]["blocks"]) and draft["id"] in json.dumps(nudge.posts)
-    assert "chase to Alex" in nudge.posts[0]["text"]
+    assert (payload["recipient_name"], payload["recipient_identifier"]) == ("Alex", "UALEX"), "resolved to a Slack id"
+    card = json.dumps(nudge.posts[0]["blocks"])
+    assert "btn_approve_proactive_action" in card and draft["id"] in card and payload["staged_content"] in card
+    assert "chase to Alex" in nudge.posts[0]["text"], "the user's own follow-through instruction is shown"
     assert [post for post in j.slack.posts if post["channel"] not in ("U1", dm_channel("U1"))] == [], "nothing sent to Alex"
+
     later = await j.advance(hours=12)
-    assert later.posts == [], "not repeated"
+    assert later.posts == [], "not repeated, not even in the next morning's brief"
+
+    sent = await j.click("U1", "btn_approve_proactive_action", draft["id"])
+    to_alex = [post["text"] for post in sent.to("UALEX")]
+    assert to_alex == [payload["staged_content"]], "Alex gets the chase drafted for him"
+    assert nudge.posts[0]["text"] not in to_alex[0] and "asked me to" not in to_alex[0], "not the reminder to the user"

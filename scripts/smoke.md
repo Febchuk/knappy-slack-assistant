@@ -51,12 +51,26 @@ Needs the `files:read` and `files:write` scopes from `slack/manifest.yml`. Reins
 | 3 | Click **Approve & Send** as the owner. | The card becomes a receipt. The second user receives exactly one DM with the drafted text. |
 | 4 | Click the button again quickly, or retry from another client. | Still exactly one DM to the second user. |
 
-Known risk: nothing resolves a display name to a Slack user id yet, so a draft addressed to a bare name fails on approval ("Couldn't send"). Mention the second user as `@name` in step 2 so the model sees their id, and note in the results whether a plain name worked.
+Step 2 uses a plain name on purpose. Knappy resolves it at staging time: a mention, the contact's stored Slack id, `users.lookupByEmail` with the contact's email, then a unique match in the workspace directory. The card names the person as `Name (@handle)`; check it is the right person. If the name matches nobody or several people, the card shows the text with no send button and says why. Email lookup needs the `users:read.email` scope: reinstall the app after updating `slack/manifest.yml`.
+
+Result: ____
+
+## J-11 Proactive brief and follow-up
+
+Use a scratch database. Your Slack profile's timezone decides when the brief comes.
+
+| Step | Do | Expect |
+| :--- | :--- | :--- |
+| 1 | DM `I told <second user's name> I'd send the deck by 10am tomorrow`. | Knappy records the commitment. |
+| 2 | Leave Knappy running overnight, or rerun the next morning after 08:00 your time with `python -m knappy.scheduler --run-now`. | Nothing arrives between 21:00 and 08:00. One brief arrives after 08:00 your time, listing the deck, with a drafted message to the second user and Send, Edit, Mark as Done, and Snooze buttons. The log shows one `heartbeat tick owner=... outcome=sent` and `outcome=silent` on the other ticks. |
+| 3 | Read the draft. | It is written to the second user in your voice, not the reminder to you. |
+| 4 | Reply in the brief's thread: `actually tell them I need until Monday`. | Knappy answers in the thread with a new draft card, using the brief as context. No second commitment appears in `what do I owe people?`. |
+| 5 | Click **Send** on the original draft, or the new one. | The second user gets exactly that text. The brief's other items keep their buttons. |
 
 Result: ____
 
 ## Results
 
-| Date | Commit | Model ids | J-01 | J-02 | J-07 | J-10 | Who ran it | Notes |
-| :--- | :--- | :--- | :--- | :--- | :--- | :--- | :--- | :--- |
-| | | | | | | | | |
+| Date | Commit | Model ids | J-01 | J-02 | J-07 | J-10 | J-11 | Who ran it | Notes |
+| :--- | :--- | :--- | :--- | :--- | :--- | :--- | :--- | :--- | :--- |
+| | | | | | | | | | |

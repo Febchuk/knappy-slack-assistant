@@ -17,6 +17,16 @@ from knappy.db.schema import EXPECTED_TABLES, SQLITE_ACTION_DRAFTS, SQLITE_SCHEM
 from knappy.db.vectors import cosine_distance, pack_embedding
 
 
+# Columns added after a table first shipped. SQLite gains them here; Postgres through ALTER ... IF NOT EXISTS.
+ADDED_COLUMNS = {
+    "interactions": (
+        ("next_check_at", "DATETIME"), ("on_no_progress", "TEXT"), ("waiting_on", "TEXT"), ("snoozed_until", "DATETIME"),
+    ),
+    "contacts": (("last_alerted_at", "DATETIME"),),
+    "user_profile": (("brief_on", "TEXT"), ("nudges_on", "TEXT"), ("nudges_sent", "INTEGER NOT NULL DEFAULT 0")),
+}
+
+
 def utc_now() -> datetime:
     return datetime.now(timezone.utc).replace(microsecond=0)
 
@@ -124,7 +134,7 @@ class SqliteRepository:
         await self.connection.executescript(SQLITE_SCHEMA)
         await self.connection.execute("PRAGMA foreign_keys = ON")
         await self._migrate_owner_user_id()
-        await self._migrate_commitment_scratchpad()
+        await self._migrate_added_columns()
         await self._migrate_action_types()
         await self.connection.commit()
 
@@ -219,6 +229,10 @@ class SqliteRepository:
             params.append(company)
         sql = f"SELECT * FROM contacts WHERE {' AND '.join(clauses)} ORDER BY name"
         return await self._all(sql, tuple(params))
+
+    async def set_contact_slack_id(self, contact_id: str, slack_user_id: str) -> None:
+        await self.connection.execute("UPDATE contacts SET slack_user_id = ? WHERE id = ?", (slack_user_id, contact_id))
+        await self.connection.commit()
 
     async def delete_contact(self, contact_id: str) -> None:
         await self.connection.execute("DELETE FROM contacts WHERE id = ?", (contact_id,))
@@ -431,46 +445,63 @@ class SqliteRepository:
         )
         await self.connection.commit()
 
-    async def snooze_interaction(self, interaction_id: str, hours: int = 24) -> str | None:
+    async def snooze_interaction(self, interaction_id: str, now: datetime, hours: int = 24) -> str | None:
+        """Push the deadline back and keep the item out of sight until the snooze ends."""
         row = await self.get_interaction(interaction_id)
         if row is None or not row.get("due_date"):
             return None
-        current = datetime.strptime(row["due_date"], "%Y-%m-%d %H:%M:%S")
+        current = _as_utc(row["due_date"])
         updated = format_ts(current + timedelta(hours=hours))
         await self.connection.execute(
-            "UPDATE interactions SET due_date = ?, last_alerted_at = ? WHERE id = ?",
-            (updated, format_ts(), interaction_id),
+            "UPDATE interactions SET due_date = ?, snoozed_until = ?, last_alerted_at = ? WHERE id = ?",
+            (updated, format_ts(now + timedelta(hours=hours)), format_ts(now), interaction_id),
         )
         await self.connection.commit()
         return updated
 
-    async def mark_alerted(self, interaction_id: str) -> None:
+    async def reschedule_commitment(self, interaction_id: str, due: datetime) -> None:
+        """A new deadline is a state change, so the commitment may be surfaced again."""
         await self.connection.execute(
-            "UPDATE interactions SET last_alerted_at = ? WHERE id = ?",
-            (format_ts(), interaction_id),
+            "UPDATE interactions SET due_date = ?, last_alerted_at = NULL, snoozed_until = NULL WHERE id = ?",
+            (format_ts(due), interaction_id),
         )
         await self.connection.commit()
 
+    async def mark_alerted(self, interaction_id: str, now: datetime) -> None:
+        await self.connection.execute(
+            "UPDATE interactions SET last_alerted_at = ? WHERE id = ?",
+            (format_ts(now), interaction_id),
+        )
+        await self.connection.commit()
+
+    async def mark_contact_alerted(self, contact_id: str, now: datetime) -> None:
+        await self.connection.execute("UPDATE contacts SET last_alerted_at = ? WHERE id = ?", (format_ts(now), contact_id))
+        await self.connection.commit()
+
     async def scan_due_commitments(
-        self, workspace_id: str, within_hours: int = 12, now: datetime | None = None
+        self,
+        workspace_id: str,
+        now: datetime,
+        *,
+        until: datetime | None = None,
+        owner_user_id: str | None = None,
     ) -> list[dict[str, Any]]:
-        """Pending commitments due soon, plus scratchpad check-ins (Spec 13 §2) that saw no progress."""
-        if self.dialect == "postgres":
-            due_sql = "i.due_date <= NOW() + (? * INTERVAL '1 hour')"
-            alert_sql = "i.last_alerted_at < NOW() - INTERVAL '24 hours'"
-            due_param: Any = within_hours
-        else:
-            due_sql = "i.due_date <= datetime('now', ?)"
-            alert_sql = "i.last_alerted_at < datetime('now', '-24 hours')"
-            due_param = f"+{within_hours} hours"
-        check_sql = """
-            i.next_check_at IS NOT NULL AND i.next_check_at <= ?
+        """Pending commitments due by `until` (default 12 hours out) or overdue, plus check-ins (Spec 13 §2) that saw no progress.
+
+        Spec 16 §3.1 no repeats: once surfaced, a commitment stays quiet until its next_check_at passes,
+        a snooze ends, or a new deadline clears last_alerted_at.
+        """
+        check_at = "CAST(i.next_check_at AS TIMESTAMPTZ)" if self.dialect == "postgres" else "i.next_check_at"
+        check_sql = f"""
+            i.next_check_at IS NOT NULL AND {check_at} <= ?
             AND NOT EXISTS (
                 SELECT 1 FROM memory_events e
                 WHERE e.commitment_id = CAST(i.id AS TEXT)
                   AND e.kind = 'commitment_progress' AND e.status = 'ACTIVE'
             )
         """
+        current = format_ts(now)
+        owner_sql = "AND i.owner_user_id = ?" if owner_user_id is not None else ""
         return await self._all(
             f"""
             SELECT
@@ -478,6 +509,7 @@ class SqliteRepository:
                 c.name AS contact_name,
                 c.company AS company,
                 c.slack_user_id,
+                c.email,
                 i.owner_user_id,
                 i.id AS interaction_id,
                 i.commitment,
@@ -489,20 +521,39 @@ class SqliteRepository:
                 CASE WHEN {check_sql} THEN 1 ELSE 0 END AS check_due
             FROM interactions i
             LEFT JOIN contacts c ON i.contact_id = c.id
-            WHERE i.workspace_id = ?
+            WHERE i.workspace_id = ? {owner_sql}
               AND i.status = 'PENDING'
               AND i.commitment IS NOT NULL
-              AND ((i.due_date IS NOT NULL AND {due_sql}) OR ({check_sql}))
-              AND (i.last_alerted_at IS NULL OR {alert_sql})
+              AND ((i.due_date IS NOT NULL AND i.due_date <= ?) OR ({check_sql}))
+              AND (i.snoozed_until IS NULL OR i.snoozed_until <= ?)
+              AND (
+                  i.last_alerted_at IS NULL
+                  OR (i.next_check_at IS NOT NULL AND {check_at} <= ? AND i.last_alerted_at < {check_at})
+                  OR (i.snoozed_until IS NOT NULL AND i.last_alerted_at < i.snoozed_until)
+              )
+            ORDER BY i.due_date
             """,
-            (format_ts(now), workspace_id, due_param, format_ts(now)),
+            (
+                current,
+                workspace_id,
+                *((owner_user_id,) if owner_user_id is not None else ()),
+                format_ts(until or now + timedelta(hours=12)),
+                current,
+                current,
+                current,
+            ),
         )
 
-    async def scan_dormant_contacts(self, workspace_id: str) -> list[dict[str, Any]]:
+    async def scan_dormant_contacts(
+        self, workspace_id: str, now: datetime, owner_user_id: str | None = None, *, limit: int = 100
+    ) -> list[dict[str, Any]]:
+        """Contacts past their cadence, at most once per cadence period."""
         if self.dialect == "postgres":
-            stale = "last_interaction_ts <= NOW() - (reminder_cadence_days * INTERVAL '1 day')"
+            cutoff = "CAST(? AS TIMESTAMPTZ) - (reminder_cadence_days * INTERVAL '1 day')"
         else:
-            stale = "last_interaction_ts <= datetime('now', '-' || reminder_cadence_days || ' days')"
+            cutoff = "datetime(?, '-' || reminder_cadence_days || ' days')"
+        owner_sql = "AND owner_user_id = ?" if owner_user_id is not None else ""
+        current = format_ts(now)
         return await self._all(
             f"""
             SELECT
@@ -510,16 +561,34 @@ class SqliteRepository:
                 name AS contact_name,
                 company,
                 slack_user_id,
+                email,
                 owner_user_id,
                 reminder_cadence_days,
                 last_interaction_ts
             FROM contacts
-            WHERE workspace_id = ?
+            WHERE workspace_id = ? {owner_sql}
               AND reminder_cadence_days IS NOT NULL
-              AND {stale}
+              AND last_interaction_ts <= {cutoff}
+              AND (last_alerted_at IS NULL OR last_alerted_at <= {cutoff})
+            ORDER BY last_interaction_ts
+            LIMIT ?
             """,
-            (workspace_id,),
+            (workspace_id, *((owner_user_id,) if owner_user_id is not None else ()), current, current, limit),
         )
+
+    async def proactive_owners(self, workspace_id: str) -> list[str]:
+        """Everyone the heartbeat looks after: anyone with a profile, a conversation, open work, or contacts."""
+        rows = await self._all(
+            """
+            SELECT owner_user_id FROM user_profile WHERE workspace_id = ?
+            UNION SELECT owner_user_id FROM conversation_turns WHERE workspace_id = ?
+            UNION SELECT owner_user_id FROM interactions WHERE workspace_id = ? AND status = 'PENDING'
+            UNION SELECT owner_user_id FROM briefing_items WHERE workspace_id = ? AND status = 'QUEUED'
+            UNION SELECT owner_user_id FROM contacts WHERE workspace_id = ?
+            """,
+            (workspace_id,) * 5,
+        )
+        return sorted(row["owner_user_id"] for row in rows if row["owner_user_id"])
 
     async def create_draft(
         self,
@@ -659,6 +728,42 @@ class SqliteRepository:
             (workspace_id,),
         )
 
+    async def queued_items(self, workspace_id: str, owner_user_id: str) -> list[dict[str, Any]]:
+        """One owner's queued briefing items, with the commitment and contact they point at."""
+        return await self._all(
+            """
+            SELECT
+                b.id AS briefing_id,
+                b.kind,
+                b.summary,
+                b.interaction_id,
+                i.status AS interaction_status,
+                i.snoozed_until,
+                i.commitment,
+                i.due_date,
+                i.next_check_at,
+                i.on_no_progress,
+                i.waiting_on,
+                c.id AS contact_id,
+                c.name AS contact_name,
+                c.company,
+                c.slack_user_id,
+                c.email,
+                c.last_interaction_ts,
+                b.owner_user_id
+            FROM briefing_items b
+            LEFT JOIN interactions i ON i.id = b.interaction_id
+            LEFT JOIN contacts c ON c.id = COALESCE(b.contact_id, i.contact_id)
+            WHERE b.workspace_id = ? AND b.owner_user_id = ? AND b.status = 'QUEUED'
+            ORDER BY b.created_at
+            """,
+            (workspace_id, owner_user_id),
+        )
+
+    async def dismiss_briefing(self, item_id: str) -> None:
+        await self.connection.execute("UPDATE briefing_items SET status = 'DISMISSED' WHERE id = ?", (item_id,))
+        await self.connection.commit()
+
     async def mark_briefing_delivered(self, item_id: str) -> None:
         await self.connection.execute(
             "UPDATE briefing_items SET status = 'DELIVERED' WHERE id = ?",
@@ -703,12 +808,13 @@ class SqliteRepository:
             return "[" + ",".join(format(float(value), ".8g") for value in embedding) + "]"
         return pack_embedding(embedding)
 
-    async def _migrate_commitment_scratchpad(self) -> None:
-        cursor = await self.connection.execute("PRAGMA table_info(interactions)")
-        columns = {row["name"] for row in await cursor.fetchall()}
-        for column, kind in (("next_check_at", "DATETIME"), ("on_no_progress", "TEXT"), ("waiting_on", "TEXT")):
-            if column not in columns:
-                await self.connection.execute(f"ALTER TABLE interactions ADD COLUMN {column} {kind}")
+    async def _migrate_added_columns(self) -> None:
+        for table, wanted in ADDED_COLUMNS.items():
+            cursor = await self.connection.execute(f"PRAGMA table_info({table})")
+            columns = {row["name"] for row in await cursor.fetchall()}
+            for column, kind in wanted:
+                if column not in columns:
+                    await self.connection.execute(f"ALTER TABLE {table} ADD COLUMN {column} {kind}")
 
     async def _migrate_action_types(self) -> None:
         """Databases created before SHARE_FILE carry the old CHECK constraint; rebuild the table to widen it."""
@@ -831,6 +937,13 @@ class SqliteRepository:
         cursor = await self.connection.execute(sql, params)
         rows = await cursor.fetchall()
         return [_public_row(row) for row in rows]
+
+
+def _as_utc(value: Any) -> datetime:
+    """A stored timestamp: text from SQLite, a datetime from Postgres."""
+    if isinstance(value, datetime):
+        return value if value.tzinfo else value.replace(tzinfo=timezone.utc)
+    return datetime.strptime(str(value)[:19], "%Y-%m-%d %H:%M:%S").replace(tzinfo=timezone.utc)
 
 
 def unpack_public(blob: bytes) -> list[float]:

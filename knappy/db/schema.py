@@ -319,6 +319,8 @@ CREATE INDEX IF NOT EXISTS idx_briefing_items_queued ON briefing_items (workspac
 ALTER TABLE interactions ADD COLUMN IF NOT EXISTS next_check_at TEXT;
 ALTER TABLE interactions ADD COLUMN IF NOT EXISTS on_no_progress TEXT;
 ALTER TABLE interactions ADD COLUMN IF NOT EXISTS waiting_on TEXT;
+ALTER TABLE interactions ADD COLUMN IF NOT EXISTS snoozed_until TIMESTAMP WITH TIME ZONE;
+ALTER TABLE contacts ADD COLUMN IF NOT EXISTS last_alerted_at TIMESTAMP WITH TIME ZONE;
 
 CREATE TABLE IF NOT EXISTS conversation_turns (
     seq BIGSERIAL PRIMARY KEY,
@@ -374,6 +376,9 @@ CREATE TABLE IF NOT EXISTS user_profile (
     nightly_on TEXT,
     PRIMARY KEY (workspace_id, owner_user_id)
 );
+ALTER TABLE user_profile ADD COLUMN IF NOT EXISTS brief_on TEXT;
+ALTER TABLE user_profile ADD COLUMN IF NOT EXISTS nudges_on TEXT;
+ALTER TABLE user_profile ADD COLUMN IF NOT EXISTS nudges_sent INTEGER NOT NULL DEFAULT 0;
 
 CREATE TABLE IF NOT EXISTS conversation_recaps (
     owner_user_id TEXT NOT NULL,
