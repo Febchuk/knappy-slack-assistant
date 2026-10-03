@@ -68,6 +68,17 @@ CREATE TABLE IF NOT EXISTS briefing_items (
     owner_user_id TEXT NOT NULL DEFAULT ''
 );
 
+CREATE TABLE IF NOT EXISTS model_usage (
+    workspace_id TEXT NOT NULL,
+    owner_user_id TEXT NOT NULL,
+    day TEXT NOT NULL,
+    calls INTEGER NOT NULL DEFAULT 0,
+    input_tokens INTEGER NOT NULL DEFAULT 0,
+    output_tokens INTEGER NOT NULL DEFAULT 0,
+    cost_usd REAL NOT NULL DEFAULT 0,
+    PRIMARY KEY (workspace_id, owner_user_id, day)
+);
+
 CREATE INDEX IF NOT EXISTS idx_contacts_cadence ON contacts (workspace_id, last_interaction_ts);
 CREATE INDEX IF NOT EXISTS idx_interactions_due ON interactions (status, due_date) WHERE status = 'PENDING';
 CREATE INDEX IF NOT EXISTS idx_interactions_contact ON interactions (contact_id);
@@ -146,6 +157,17 @@ CREATE TABLE IF NOT EXISTS briefing_items (
     owner_user_id TEXT NOT NULL DEFAULT ''
 );
 
+CREATE TABLE IF NOT EXISTS model_usage (
+    workspace_id TEXT NOT NULL,
+    owner_user_id TEXT NOT NULL,
+    day TEXT NOT NULL,
+    calls INTEGER NOT NULL DEFAULT 0,
+    input_tokens INTEGER NOT NULL DEFAULT 0,
+    output_tokens INTEGER NOT NULL DEFAULT 0,
+    cost_usd DOUBLE PRECISION NOT NULL DEFAULT 0,
+    PRIMARY KEY (workspace_id, owner_user_id, day)
+);
+
 CREATE INDEX IF NOT EXISTS idx_contacts_cadence ON contacts (workspace_id, last_interaction_ts);
 CREATE INDEX IF NOT EXISTS idx_interactions_due ON interactions (status, due_date) WHERE status = 'PENDING';
 CREATE INDEX IF NOT EXISTS idx_interactions_contact ON interactions (contact_id);
@@ -155,5 +177,5 @@ CREATE INDEX IF NOT EXISTS idx_briefing_items_queued ON briefing_items (workspac
 """
 
 EXPECTED_TABLES = frozenset(
-    {"workspaces", "contacts", "interactions", "action_drafts", "briefing_items"}
+    {"workspaces", "contacts", "interactions", "action_drafts", "briefing_items", "model_usage"}
 )

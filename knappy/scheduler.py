@@ -6,11 +6,12 @@ import argparse
 import asyncio
 import os
 
-from knappy.config import load_dotenv
+from knappy.config import DEFAULT_MODEL_AGENT, DEFAULT_MODEL_LIGHT, ConfigError, load_dotenv
 from knappy.db.factory import open_repository, sqlite_path
 from knappy.heartbeat.engine import HeartbeatEngine
-from knappy.heartbeat.triage import ProactiveAlertTriager
-from knappy.runtime import heuristic_triage
+from knappy.heartbeat.triage import ProactiveAlertTriager, model_triage
+from knappy.llm.client import GeminiClient, ModelIds
+from knappy.runtime import usage_recorder
 from knappy.slack.egress import build_say
 
 
@@ -33,14 +34,29 @@ async def _slack_sender():
     return build_say(client), client
 
 
+def _gemini_key() -> str:
+    key = os.environ.get("GEMINI_API_KEY")
+    if not key:
+        raise ConfigError("Missing required environment variables: GEMINI_API_KEY")
+    return key
+
+
 async def run_now(database: str, workspace_id: str, user_id: str) -> dict[str, int]:
+    api_key = _gemini_key()
     repo = await open_repository(database)
     await repo.init_schema()
     await repo.upsert_workspace(workspace_id, "Knappy", "local")
     sender, client = await _slack_sender()
     engine = HeartbeatEngine(
         repo,
-        ProactiveAlertTriager(heuristic_triage),
+        ProactiveAlertTriager(model_triage(GeminiClient(
+            api_key,
+            ModelIds(
+                agent=os.environ.get("KNAPPY_MODEL_AGENT") or DEFAULT_MODEL_AGENT,
+                light=os.environ.get("KNAPPY_MODEL_LIGHT") or DEFAULT_MODEL_LIGHT,
+            ),
+            on_usage=usage_recorder(repo, workspace_id),
+        ))),
         workspace_id=workspace_id,
         user_id=user_id,
         sender=sender,

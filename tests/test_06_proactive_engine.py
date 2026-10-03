@@ -7,12 +7,16 @@ from datetime import timedelta
 
 import pytest
 
+from knappy.config import ConfigError
+
 from knappy.agent.memory import ThreadMemory
 from knappy.agent.react import ReActAgent
 from knappy.agent.tools import ToolRegistry
 from knappy.db.repository import SqliteRepository, format_ts, utc_now
 from knappy.heartbeat.engine import HeartbeatEngine
 from knappy.heartbeat.triage import ProactiveAlertTriager
+from knappy.llm.fake import FakeModel
+from knappy.llm.types import ModelTurn
 from knappy.scheduler import main as scheduler_main
 
 
@@ -146,11 +150,11 @@ async def test_proact_06_thread_handoff(repo: SqliteRepository) -> None:
     memory.append("thread-1", "assistant", "You promised Alex: send the revised budget")
     seen: list[str] = []
 
-    async def complete(messages):
-        seen.append(messages[-1]["content"])
-        return type("Turn", (), {"text": "I updated the draft.", "tool_name": None, "tool_args": {}})()
+    async def complete(request):
+        seen.append(request.contents[-1].text)
+        return ModelTurn(text="I updated the draft.")
 
-    agent = ReActAgent(ToolRegistry(repo, "T_TEST"), complete, memory)
+    agent = ReActAgent(ToolRegistry(repo, "T_TEST"), FakeModel(complete), memory)
     reply = await agent.run(
         "Actually, tell her I will send it Monday morning.",
         {"thread_ts": "thread-1", "user_id": "U1", "channel_id": "D1"},
@@ -159,7 +163,14 @@ async def test_proact_06_thread_handoff(repo: SqliteRepository) -> None:
     assert reply.text == "I updated the draft."
 
 
-def test_scheduler_run_now(tmp_path) -> None:
+def test_scheduler_run_now_requires_gemini_key(tmp_path, monkeypatch) -> None:
+    monkeypatch.delenv("GEMINI_API_KEY", raising=False)
+    with pytest.raises(ConfigError, match="GEMINI_API_KEY"):
+        scheduler_main(["--run-now", "--database", f"sqlite:///{tmp_path / 'knappy.db'}"])
+
+
+def test_scheduler_run_now(tmp_path, monkeypatch) -> None:
+    monkeypatch.setenv("GEMINI_API_KEY", "test-key")
     database = tmp_path / "knappy.db"
     code = scheduler_main(
         ["--run-now", "--database", f"sqlite:///{database}", "--workspace", "T_TEST", "--user", "U1"]

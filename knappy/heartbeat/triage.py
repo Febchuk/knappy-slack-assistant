@@ -2,10 +2,46 @@
 
 from __future__ import annotations
 
-from typing import Any, Awaitable, Callable
+import json
+from typing import Any, Awaitable, Callable, Literal
 
+from pydantic import BaseModel, Field
+
+from knappy.llm.types import Model
 
 ClassifyFn = Callable[[dict[str, Any]], Awaitable[dict[str, Any]]]
+
+TRIAGE_PROMPT = """
+You decide whether a proactive reminder is worth interrupting a busy person for.
+Interrupt only when acting soon matters: a deadline within hours, or a real cost to waiting.
+Prefer the morning digest for anything that can wait until tomorrow.
+Suppress items with little value. Silence is a good outcome.
+""".strip()
+
+
+class TriageJudgment(BaseModel):
+    interrupt_probability: float = Field(..., ge=0, le=1)
+    strategy: Literal["immediate_dm", "batch_into_morning_digest", "suppress_low_value"]
+    strategy_confidence: float = Field(..., ge=0, le=1)
+    consequence_score: float = Field(..., ge=0, le=3, description="0 trivial, 3 severe cost of missing it")
+
+
+def model_triage(model: Model) -> ClassifyFn:
+    async def classify(candidate: dict[str, Any]) -> dict[str, Any]:
+        judgment = await model.generate_structured(
+            tier="light",
+            system=TRIAGE_PROMPT,
+            text=json.dumps(_triage_view(candidate), default=str),
+            schema=TriageJudgment,
+        )
+        return judgment.model_dump()
+
+    return classify
+
+
+def _triage_view(candidate: dict[str, Any]) -> dict[str, Any]:
+    keys = ("kind", "contact_name", "commitment", "summary", "due_date", "hours_until_due", "days_since_last_contact")
+    return {key: candidate[key] for key in keys if candidate.get(key) is not None}
 
 
 class ProactiveAlertTriager:

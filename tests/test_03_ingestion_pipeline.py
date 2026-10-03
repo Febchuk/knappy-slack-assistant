@@ -11,7 +11,9 @@ import pytest
 
 from knappy.db.repository import SqliteRepository
 from knappy.ingestion.embed import generate_embedding
-from knappy.ingestion.extract import ExtractedInteraction, SlmExtractor, heuristic_extract
+from knappy.ingestion.extract import ExtractedInteraction, SlmExtractor
+from knappy.llm.fake import FakeModel
+from fakes import HeuristicModel
 from knappy.ingestion.filter import LocalStructuralFilter
 from knappy.ingestion.gate import CompositeSystemOneGate, JevSystemOneAdapter, RegexFallbackAdapter
 from knappy.ingestion.pipeline import IngestionPipeline
@@ -88,16 +90,25 @@ async def test_ingest_05_circuit_breaker() -> None:
     assert decision.category == "MEETING_NOTE"
 
 
-def test_ingest_06_schema_and_relative_date() -> None:
-    now = datetime(2026, 10, 1, 12, 0, 0)
-    extracted = heuristic_extract(
-        "Sync with Alex from Acme, promised to deliver the pitch deck by tomorrow at 5pm",
-        now,
-    )
+@pytest.mark.asyncio
+async def test_ingest_06_extractor_sends_reference_date_and_validates() -> None:
+    async def structured(schema, system, text):
+        return {
+            "contact_name": "Alex",
+            "summary": "Sync with Alex from Acme",
+            "commitment": "deliver the pitch deck",
+            "due_date": "2026-10-02T17:00:00",
+        }
+
+    model = FakeModel(structured=structured)
+    note = "Sync with Alex from Acme, promised to deliver the pitch deck by tomorrow at 5pm"
+    extracted = await SlmExtractor(model).extract(note, datetime(2026, 10, 1, 12, 0, 0))
     assert isinstance(extracted, ExtractedInteraction)
-    assert extracted.contact_name == "Alex"
-    assert extracted.commitment is not None and "pitch deck" in extracted.commitment
     assert extracted.due_date == "2026-10-02T17:00:00"
+    schema, system, text = model.structured_requests[0]
+    assert schema is ExtractedInteraction
+    assert "2026-10-01T12:00:00" in system
+    assert text == note
 
 
 def test_ingest_07_embedding_shape_and_latency() -> None:
@@ -113,7 +124,7 @@ def test_ingest_07_embedding_shape_and_latency() -> None:
 @pytest.mark.asyncio
 async def test_ingest_08_atomic_upsert(repo: SqliteRepository) -> None:
     gate = CompositeSystemOneGate(RegexFallbackAdapter(), RegexFallbackAdapter())
-    pipeline = IngestionPipeline(repo, gate, workspace_id="T_TEST")
+    pipeline = IngestionPipeline(repo, gate, SlmExtractor(HeuristicModel()), workspace_id="T_TEST")
     first = {"text": "note: Met with Alex from Acme, promised to send the revised budget by Thursday.", "channel": "D1"}
     second = {"text": "note: Met with Alex from Acme, promised to send the signed contract by Friday.", "channel": "D1"}
     await pipeline.run(first)

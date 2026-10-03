@@ -31,25 +31,39 @@ def load_dotenv(path: Path | None = None) -> None:
             os.environ[key] = value
 
 
+DEFAULT_MODEL_AGENT = "gemini-3-flash-preview"
+DEFAULT_MODEL_LIGHT = "gemini-3.1-flash-lite-preview"
+REQUIRED = ("SLACK_BOT_TOKEN", "SLACK_APP_TOKEN", "SLACK_SIGNING_SECRET", "GEMINI_API_KEY")
+
+
 @dataclass(frozen=True)
 class Settings:
     slack_bot_token: str
     slack_app_token: str
     slack_signing_secret: str
+    gemini_api_key: str
     database_url: str = "sqlite:///knappy.db"
+    model_agent: str = DEFAULT_MODEL_AGENT
+    model_light: str = DEFAULT_MODEL_LIGHT
+    daily_budget_usd: float = 1.00
 
     @classmethod
     def from_env(cls) -> Settings:
-        missing = [
-            name
-            for name in ("SLACK_BOT_TOKEN", "SLACK_APP_TOKEN", "SLACK_SIGNING_SECRET")
-            if not os.environ.get(name)
-        ]
+        missing = [name for name in REQUIRED if not os.environ.get(name)]
         if missing:
             raise ConfigError(f"Missing required environment variables: {', '.join(missing)}")
+        budget = os.environ.get("KNAPPY_DAILY_BUDGET_USD", "1.00")
+        try:
+            daily_budget = float(budget)
+        except ValueError:
+            raise ConfigError(f"KNAPPY_DAILY_BUDGET_USD must be a number, got {budget!r}") from None
         return cls(
             slack_bot_token=os.environ["SLACK_BOT_TOKEN"],
             slack_app_token=os.environ["SLACK_APP_TOKEN"],
             slack_signing_secret=os.environ["SLACK_SIGNING_SECRET"],
+            gemini_api_key=os.environ["GEMINI_API_KEY"],
             database_url=os.environ.get("KNAPPY_DATABASE_URL", "sqlite:///knappy.db"),
+            model_agent=os.environ.get("KNAPPY_MODEL_AGENT") or DEFAULT_MODEL_AGENT,
+            model_light=os.environ.get("KNAPPY_MODEL_LIGHT") or DEFAULT_MODEL_LIGHT,
+            daily_budget_usd=daily_budget,
         )

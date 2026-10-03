@@ -24,12 +24,12 @@ class IngestionPipeline:
         self,
         repo: SqliteRepository,
         gate: CompositeSystemOneGate,
-        extractor: SlmExtractor | None = None,
+        extractor: SlmExtractor,
         workspace_id: str = "default_ws",
     ) -> None:
         self.repo = repo
         self.gate = gate
-        self.extractor = extractor or SlmExtractor()
+        self.extractor = extractor
         self.workspace_id = workspace_id
 
     async def run(self, event: dict) -> ExtractedInteraction | None:

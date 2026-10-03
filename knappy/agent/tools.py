@@ -3,17 +3,67 @@
 from __future__ import annotations
 
 from contextvars import ContextVar
-from typing import Any
+from typing import Any, Literal
+
+from pydantic import BaseModel, Field
 
 from knappy.db.repository import SqliteRepository
 from knappy.hitl.blocks import approval_blocks
 from knappy.ingestion.embed import generate_embedding
+from knappy.llm.types import ToolSpec
 
 current_owner: ContextVar[str | None] = ContextVar("knappy_owner", default=None)
 
 _HISTORY_STOP = frozenset(
     {"what", "did", "we", "you", "say", "said", "about", "the", "slack", "channel", "message", "messages"}
 )
+
+
+class SearchCommitmentsArgs(BaseModel):
+    query: str = Field(..., description="What the commitment is about, or a person's name")
+    status: Literal["PENDING", "FULFILLED", "CANCELLED", "EXPIRED"] | None = "PENDING"
+    due_before: str | None = Field(default=None, description="ISO 8601 timestamp")
+
+
+class QueryRelationshipGraphArgs(BaseModel):
+    contact_name: str | None = None
+    company: str | None = None
+    topic: str | None = Field(default=None, description="Subject to match against past interactions")
+
+
+class GetMeetingContextArgs(BaseModel):
+    contact_name: str
+    limit: int = Field(default=5, ge=1, le=20)
+
+
+class StageOutboundActionArgs(BaseModel):
+    action_type: Literal["SEND_SLACK_DM"]
+    recipient: str = Field(..., description="Display name of the person to message")
+    summary: str = Field(..., description="One line describing the action, shown on the approval card")
+    staged_content: str = Field(..., description="The exact message text to send after approval")
+    recipient_identifier: str | None = Field(default=None, description="Slack user id, if known")
+
+
+class SearchSlackHistoryArgs(BaseModel):
+    query: str
+    channel_id: str | None = None
+    limit: int = Field(default=20, ge=1, le=50)
+
+
+TOOL_SPECS: dict[str, ToolSpec] = {
+    spec.name: spec
+    for spec in (
+        ToolSpec("search_commitments", "Find the user's commitments and promises, by topic or person.", SearchCommitmentsArgs),
+        ToolSpec("query_relationship_graph", "Look up the user's contacts by name, company, or topic.", QueryRelationshipGraphArgs),
+        ToolSpec("get_meeting_context", "Recent notes and interactions with one contact.", GetMeetingContextArgs),
+        ToolSpec(
+            "stage_outbound_action",
+            "Draft a message to another person. It is only sent after the user approves the card. Never claim it was sent.",
+            StageOutboundActionArgs,
+        ),
+        ToolSpec("search_slack_history", "Search recent messages in Slack channels Knappy was invited to.", SearchSlackHistoryArgs),
+    )
+}
 
 
 class ToolRegistry:
@@ -78,7 +128,8 @@ class ToolRegistry:
         action_type: str,
         recipient: str,
         summary: str,
-        payload: dict[str, Any],
+        staged_content: str,
+        recipient_identifier: str | None = None,
         *,
         user_id: str,
         channel_id: str,
@@ -86,11 +137,11 @@ class ToolRegistry:
     ) -> dict[str, Any]:
         staged = {
             "action_type": action_type,
-            "recipient_identifier": payload.get("recipient_identifier", recipient),
+            "recipient_identifier": recipient_identifier or recipient,
             "recipient_name": recipient,
             "preview_summary": summary,
-            "staged_content": payload.get("staged_content") or summary,
-            "metadata": payload.get("metadata") or {},
+            "staged_content": staged_content or summary,
+            "metadata": {},
         }
         draft_id = await self.repo.create_draft(
             workspace_id=self.workspace_id,
@@ -152,6 +203,9 @@ class ToolRegistry:
                 if len(hits) >= limit:
                     return hits
         return hits
+
+    def specs(self) -> list[ToolSpec]:
+        return list(TOOL_SPECS.values())
 
     async def call(self, name: str, arguments: dict[str, Any]) -> Any:
         method = getattr(self, name)

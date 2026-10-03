@@ -2,24 +2,30 @@
 
 from __future__ import annotations
 
+import logging
 import re
 from typing import Any, Awaitable, Callable
 
 from knappy.agent.memory import ThreadMemory
-from knappy.agent.react import AgentReply, ModelTurn, ReActAgent
+from knappy.agent.react import AgentReply, ReActAgent
 from knappy.agent.router import IntentClassification, SystemOneRouter
 from knappy.agent.tools import ToolRegistry, current_owner
 from knappy.slack.egress import delivery_kwargs
 from knappy.db.repository import SqliteRepository
 from knappy.heartbeat.engine import HeartbeatEngine
-from knappy.heartbeat.triage import ProactiveAlertTriager
+from knappy.heartbeat.triage import ProactiveAlertTriager, model_triage
 from knappy.hitl.gateway import ActionExecutor, ApprovalGateway
 from knappy.ingestion.extract import SlmExtractor
 from knappy.ingestion.filter import LocalStructuralFilter
 from knappy.ingestion.gate import CompositeSystemOneGate, JevSystemOneAdapter, RegexFallbackAdapter
 from knappy.ingestion.pipeline import IngestionPipeline, acknowledgement
+from knappy.llm.client import OnUsage
+from knappy.llm.types import Model, Tier, Usage
 
+logger = logging.getLogger("knappy")
 Say = Callable[..., Awaitable[None]]
+
+BUDGET_TEXT = "I've hit today's usage limit, so I can't think this through right now. I'll be back tomorrow."
 
 _MENTION = re.compile(r"<@[A-Z0-9]+(?:\|[^>]+)?>")
 
@@ -56,68 +62,15 @@ async def heuristic_intent(query: str, thread_context: dict[str, Any]) -> Intent
     return IntentClassification("chitchat", 0.95, 0.1, 0.0)
 
 
-async def heuristic_complete(messages: list[dict[str, Any]]) -> ModelTurn:
-    if any(item.get("role") == "tool" for item in messages):
-        return ModelTurn(text="Done.")
-    user = next(item["content"] for item in messages if item["role"] == "user")
-    query = user.split("User:", 1)[-1].strip()
-    lower = query.lower()
-    if any(phrase in lower for phrase in ("said", "say about", "in slack", "slack message")):
-        return ModelTurn(tool_name="search_slack_history", tool_args={"query": query})
-    if "follow up" in lower:
-        recipient = "them"
-        for token in query.split():
-            if token[:1].isupper() and token.lower() not in {"follow", "up", "with"}:
-                recipient = token.strip(".,!?")
-                break
-        return ModelTurn(
-            tool_name="stage_outbound_action",
-            tool_args={
-                "action_type": "SEND_SLACK_DM",
-                "recipient": recipient,
-                "summary": f"Follow up with {recipient}",
-                "payload": {
-                    "staged_content": f"Hi {recipient}, following up as we discussed.",
-                    "recipient_identifier": recipient,
-                },
-            },
-        )
-    return ModelTurn(tool_name="search_commitments", tool_args={"query": user})
-
-
-async def heuristic_triage(candidate: dict[str, Any]) -> dict[str, float | str]:
-    hours = candidate.get("hours_until_due")
-    if isinstance(hours, (int, float)) and hours <= 4:
-        return {
-            "interrupt_probability": 0.9,
-            "strategy": "immediate_dm",
-            "strategy_confidence": 0.9,
-            "consequence_score": 2.0,
-        }
-    if isinstance(hours, (int, float)):
-        return {
-            "interrupt_probability": 0.55,
-            "strategy": "batch_into_morning_digest",
-            "strategy_confidence": 0.8,
-            "consequence_score": 1.0,
-        }
-    return {
-        "interrupt_probability": 0.2,
-        "strategy": "suppress_low_value",
-        "strategy_confidence": 0.8,
-        "consequence_score": 0.2,
-    }
-
-
 class KnappyRuntime:
     def __init__(
         self,
         repo: SqliteRepository,
         *,
         workspace_id: str,
+        model: Model,
         classify=heuristic_intent,
-        complete=heuristic_complete,
-        triage_classify=heuristic_triage,
+        daily_budget_usd: float | None = None,
         executor: ActionExecutor | None = None,
         say: Say | None = None,
         sender: Say | None = None,
@@ -126,16 +79,17 @@ class KnappyRuntime:
         self.repo = repo
         self.workspace_id = workspace_id
         self.say = say
+        self.daily_budget_usd = daily_budget_usd
         self.memory = ThreadMemory()
         self.tools = ToolRegistry(repo, workspace_id, history=history)
-        self.agent = ReActAgent(self.tools, complete, self.memory)
+        self.agent = ReActAgent(self.tools, model, self.memory)
         self.router = SystemOneRouter(self.tools, self.agent, classify)
         self.gate = CompositeSystemOneGate(JevSystemOneAdapter(), RegexFallbackAdapter())
-        self.pipeline = IngestionPipeline(repo, self.gate, SlmExtractor(), workspace_id)
+        self.pipeline = IngestionPipeline(repo, self.gate, SlmExtractor(model), workspace_id)
         self.gateway = ApprovalGateway(repo, executor or _RefusingExecutor())
         self.heartbeat = HeartbeatEngine(
             repo,
-            ProactiveAlertTriager(triage_classify),
+            ProactiveAlertTriager(model_triage(model)),
             workspace_id=workspace_id,
             user_id="user",
             sender=sender,
@@ -155,6 +109,10 @@ class KnappyRuntime:
     async def _handle_event(self, event: dict[str, Any]) -> AgentReply | None:
         text = strip_mentions(event.get("text", ""))
         event = {**event, "text": text}
+        if await self._over_budget(str(event.get("user") or "")):
+            reply = AgentReply(text=BUDGET_TEXT)
+            await self._post(event, reply)
+            return reply
         thread_ts = _conversation_key(event)
         self.memory.append(thread_ts, "user", text)
         if text.strip().lower().startswith("note:"):
@@ -180,6 +138,11 @@ class KnappyRuntime:
         await self._post(event, reply)
         return reply
 
+    async def _over_budget(self, owner: str) -> bool:
+        if self.daily_budget_usd is None:
+            return False
+        return await self.repo.spend_today(self.workspace_id, owner) >= self.daily_budget_usd
+
     async def _post(self, event: dict[str, Any], reply: AgentReply) -> None:
         if self.say is None:
             return
@@ -202,3 +165,18 @@ def _is_user_query(text: str) -> bool:
 class _RefusingExecutor:
     async def execute(self, draft: dict[str, Any]) -> None:
         raise RuntimeError("No executor configured")
+
+
+def usage_recorder(repo: SqliteRepository, workspace_id: str) -> OnUsage:
+    async def record(tier: Tier, model: str, usage: Usage) -> None:
+        owner = current_owner.get() or ""
+        logger.info("usage owner=%s tier=%s model=%s cost=%.6f", owner, tier, model, usage.cost_usd)
+        await repo.add_model_usage(
+            workspace_id,
+            owner,
+            input_tokens=usage.input_tokens,
+            output_tokens=usage.output_tokens,
+            cost_usd=usage.cost_usd,
+        )
+
+    return record

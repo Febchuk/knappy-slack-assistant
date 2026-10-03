@@ -11,6 +11,7 @@ from knappy.main import FALLBACK_TEXT, dispatch_event
 from knappy.runtime import KnappyRuntime
 from knappy.slack.egress import build_say
 from knappy.slack.events import on_app_mention, on_message
+from fakes import HeuristicModel
 
 
 class FakeSlack:
@@ -57,7 +58,7 @@ async def _seed(tmp_path, *, with_alex: bool) -> SqliteRepository:
 
 
 def _runtime(repo: SqliteRepository, client: FakeSlack) -> KnappyRuntime:
-    return KnappyRuntime(repo, workspace_id="T_TEST", say=build_say(client), history=client)
+    return KnappyRuntime(repo, workspace_id="T_TEST", model=HeuristicModel(), say=build_say(client), history=client)
 
 
 @pytest.mark.asyncio
@@ -79,7 +80,7 @@ async def test_who_are_you_posts_and_logs_identity(tmp_path, caplog: pytest.LogC
     )
     assert len(client.ephemerals) == 1
     assert "I'm Knappy" in client.ephemerals[0]["text"]
-    assert "who are you" in caplog.text
+    assert "who are you" not in caplog.text
     assert "path=identity" in caplog.text
     assert "deliver ephemeral channel=C1" in caplog.text
     await repo.close()
@@ -220,7 +221,7 @@ async def test_draft_show_and_general_question(tmp_path) -> None:
 async def test_handler_error_posts_fallback(tmp_path, caplog: pytest.LogCaptureFixture) -> None:
     repo = await _seed(tmp_path, with_alex=False)
     client = FakeSlack()
-    runtime = KnappyRuntime(repo, workspace_id="T_TEST", say=BoomSay())
+    runtime = KnappyRuntime(repo, workspace_id="T_TEST", model=HeuristicModel(), say=BoomSay())
     caplog.set_level(logging.INFO, logger="knappy")
     await dispatch_event(
         runtime,

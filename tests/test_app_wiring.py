@@ -6,7 +6,8 @@ from datetime import timedelta
 
 import pytest
 
-from knappy.agent.react import ModelTurn
+from knappy.llm.fake import FakeModel
+from knappy.llm.types import ModelTurn
 from knappy.agent.router import IntentClassification
 from knappy.config import Settings
 from knappy.db.repository import SqliteRepository, format_ts, utc_now
@@ -14,6 +15,7 @@ from knappy.hitl.gateway import ApprovalGateway
 from knappy.runtime import KnappyRuntime
 from knappy.slack.actions import register_actions
 from knappy.slack.events import EventDeduplicator, on_app_mention, on_message
+from fakes import HeuristicModel
 
 
 class FakeApp:
@@ -68,7 +70,7 @@ def _body(action_id: str, value: str, user: str = "U1") -> dict:
 
 @pytest.mark.asyncio
 async def test_action_handlers_update_slack(repo: SqliteRepository) -> None:
-    runtime = KnappyRuntime(repo, workspace_id="T_TEST", executor=Recorder())
+    runtime = KnappyRuntime(repo, workspace_id="T_TEST", model=HeuristicModel(), executor=Recorder())
     app = FakeApp()
     register_actions(app, runtime)
     draft_id = await repo.create_draft(
@@ -196,11 +198,11 @@ async def test_router_branches(repo: SqliteRepository) -> None:
     tools = ToolRegistry(repo, "T_TEST")
     calls = {"n": 0}
 
-    async def complete(messages):
+    async def complete(request):
         calls["n"] += 1
         return ModelTurn(text="react")
 
-    agent = ReActAgent(tools, complete, ThreadMemory())
+    agent = ReActAgent(tools, FakeModel(complete), ThreadMemory())
     intents = [
         IntentClassification("query_contact", 0.95, 0.2, 0.0),
         IntentClassification("meeting_context", 0.95, 0.2, 0.0),
@@ -308,6 +310,7 @@ async def test_socket_mode_serve(monkeypatch: pytest.MonkeyPatch, tmp_path) -> N
     monkeypatch.setenv("SLACK_BOT_TOKEN", "xoxb-test")
     monkeypatch.setenv("SLACK_APP_TOKEN", "xapp-test")
     monkeypatch.setenv("SLACK_SIGNING_SECRET", "secret")
+    monkeypatch.setenv("GEMINI_API_KEY", "test-key")
     monkeypatch.setenv("KNAPPY_DATABASE_URL", f"sqlite:///{tmp_path / 'knappy.db'}")
     monkeypatch.setenv("KNAPPY_WORKSPACE_ID", "T_SERVE")
 
@@ -324,6 +327,22 @@ async def test_socket_mode_serve(monkeypatch: pytest.MonkeyPatch, tmp_path) -> N
 
     monkeypatch.setattr(AsyncSocketModeHandler, "start_async", start_async)
     monkeypatch.setattr(AsyncWebClient, "auth_test", auth_test)
+    import knappy.main as main_module
+    from knappy.llm.client import GeminiClient
+
+    built: list = []
+    real_runtime = main_module.KnappyRuntime
+
+    def capture(*args, **kwargs):
+        runtime = real_runtime(*args, **kwargs)
+        built.append(runtime)
+        return runtime
+
+    monkeypatch.setattr(main_module, "KnappyRuntime", capture)
     await _serve()
+    runtime = built[0]
+    assert isinstance(runtime.agent.model, GeminiClient)
+    assert runtime.pipeline.extractor.model is runtime.agent.model
+    assert runtime.daily_budget_usd == 1.0
     settings = Settings.from_env()
     assert settings.database_url.endswith("knappy.db")

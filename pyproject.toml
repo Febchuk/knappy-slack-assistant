@@ -14,6 +14,7 @@ dependencies = [
     "pydantic>=2",
     "aiohttp>=3.9",
     "asyncpg>=0.29",
+    "google-genai>=1.0",
 ]
 
 [project.optional-dependencies]
@@ -29,7 +30,8 @@ include = ["knappy*"]
 [tool.pytest.ini_options]
 asyncio_mode = "auto"
 testpaths = ["tests"]
-addopts = "-q"
+addopts = "-q -m 'not live_model'"
+markers = ["live_model: calls the real Gemini API; needs GEMINI_API_KEY"]
 
 [tool.coverage.run]
 source = ["knappy"]

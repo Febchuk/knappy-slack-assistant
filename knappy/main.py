@@ -11,7 +11,8 @@ from slack_bolt.adapter.socket_mode.async_handler import AsyncSocketModeHandler
 from knappy.config import Settings, load_dotenv
 from knappy.db.factory import open_repository
 from knappy.heartbeat.schedule import cadence_due
-from knappy.runtime import KnappyRuntime
+from knappy.llm.client import GeminiClient, ModelIds
+from knappy.runtime import KnappyRuntime, usage_recorder
 from knappy.slack.actions import register_actions
 from knappy.slack.app import create_app
 from knappy.slack.egress import build_say
@@ -82,9 +83,16 @@ async def _serve() -> None:
     workspace_id = await _workspace_id(app.client)
     await repo.upsert_workspace(workspace_id, "Knappy", settings.slack_bot_token)
     say = build_say(app.client)
+    model = GeminiClient(
+        settings.gemini_api_key,
+        ModelIds(agent=settings.model_agent, light=settings.model_light),
+        on_usage=usage_recorder(repo, workspace_id),
+    )
     runtime = KnappyRuntime(
         repo,
         workspace_id=workspace_id,
+        model=model,
+        daily_budget_usd=settings.daily_budget_usd,
         say=say,
         sender=say,
         executor=SlackActionExecutor(app.client),

@@ -579,6 +579,36 @@ class SqliteRepository:
         )
         await self.connection.commit()
 
+    async def add_model_usage(
+        self,
+        workspace_id: str,
+        owner_user_id: str,
+        *,
+        input_tokens: int,
+        output_tokens: int,
+        cost_usd: float,
+    ) -> None:
+        await self.connection.execute(
+            """
+            INSERT INTO model_usage (workspace_id, owner_user_id, day, calls, input_tokens, output_tokens, cost_usd)
+            VALUES (?, ?, ?, 1, ?, ?, ?)
+            ON CONFLICT (workspace_id, owner_user_id, day) DO UPDATE SET
+                calls = model_usage.calls + 1,
+                input_tokens = model_usage.input_tokens + excluded.input_tokens,
+                output_tokens = model_usage.output_tokens + excluded.output_tokens,
+                cost_usd = model_usage.cost_usd + excluded.cost_usd
+            """,
+            (workspace_id, owner_user_id, utc_now().date().isoformat(), input_tokens, output_tokens, cost_usd),
+        )
+        await self.connection.commit()
+
+    async def spend_today(self, workspace_id: str, owner_user_id: str) -> float:
+        row = await self._one(
+            "SELECT cost_usd FROM model_usage WHERE workspace_id = ? AND owner_user_id = ? AND day = ?",
+            (workspace_id, owner_user_id, utc_now().date().isoformat()),
+        )
+        return float(row["cost_usd"]) if row else 0.0
+
     def _store_embedding(self, embedding: list[float] | None) -> Any:
         if embedding is None:
             return None

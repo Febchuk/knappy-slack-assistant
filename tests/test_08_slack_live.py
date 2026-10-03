@@ -15,9 +15,10 @@ from knappy.db.schema import POSTGRES_SCHEMA
 from knappy.heartbeat.engine import HeartbeatEngine
 from knappy.heartbeat.schedule import cadence_due
 from knappy.heartbeat.triage import ProactiveAlertTriager
-from knappy.runtime import KnappyRuntime, heuristic_triage
+from knappy.runtime import KnappyRuntime
 from knappy.slack.egress import build_say
 from knappy.slack.executor import SlackActionExecutor
+from fakes import HeuristicModel, heuristic_triage
 
 
 class FakeSlack:
@@ -43,6 +44,7 @@ def _runtime(repo: SqliteRepository, client: FakeSlack) -> KnappyRuntime:
     return KnappyRuntime(
         repo,
         workspace_id="T_TEST",
+        model=HeuristicModel(),
         say=build_say(client),
         sender=build_say(client),
         executor=SlackActionExecutor(client),

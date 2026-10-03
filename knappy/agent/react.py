@@ -2,23 +2,19 @@
 
 from __future__ import annotations
 
-import json
 import logging
-from dataclasses import dataclass, field
-from typing import Any, Awaitable, Callable
+from dataclasses import dataclass
+from typing import Any
+
+from pydantic import ValidationError
 
 from knappy.agent.memory import ThreadMemory
-from knappy.agent.tools import ToolRegistry, format_commitment_results, format_history_results
+from knappy.agent.tools import TOOL_SPECS, ToolRegistry, format_commitment_results, format_history_results
+from knappy.llm.types import Message, Model, ToolCall, ToolResult, UserMessage
 
-CompleteFn = Callable[[list[dict[str, Any]]], Awaitable["ModelTurn"]]
 logger = logging.getLogger("knappy")
 
-
-@dataclass
-class ModelTurn:
-    text: str | None = None
-    tool_name: str | None = None
-    tool_args: dict[str, Any] = field(default_factory=dict)
+SYSTEM_PROMPT = "You are Knappy, a relationship assistant. Use tools. Never send messages yourself."
 
 
 @dataclass
@@ -31,44 +27,57 @@ class AgentReply:
 class ReActAgent:
     MAX_ITERATIONS = 3
 
-    def __init__(self, tools: ToolRegistry, complete: CompleteFn, memory: ThreadMemory) -> None:
+    def __init__(self, tools: ToolRegistry, model: Model, memory: ThreadMemory) -> None:
         self.tools = tools
-        self.complete = complete
+        self.model = model
         self.memory = memory
 
-    def build_messages(self, query: str, thread_context: dict[str, Any]) -> list[dict[str, Any]]:
+    def build_messages(self, query: str, thread_context: dict[str, Any]) -> list[Message]:
         thread_ts = thread_context.get("thread_ts") or ""
         history = self.memory.prompt_block(thread_ts)
-        return [
-            {
-                "role": "system",
-                "content": "You are Knappy, a relationship assistant. Use tools. Never send messages yourself.",
-            },
-            {"role": "user", "content": f"Thread {thread_ts}\n{history}\nUser: {query}"},
-        ]
+        return [UserMessage(f"Thread {thread_ts}\n{history}\nUser: {query}")]
 
     async def run(self, query: str, thread_context: dict[str, Any]) -> AgentReply:
-        messages = self.build_messages(query, thread_context)
+        contents = self.build_messages(query, thread_context)
         for _ in range(self.MAX_ITERATIONS):
-            turn = await self.complete(messages)
-            if not turn.tool_name:
+            turn = await self.model.generate(
+                tier="agent", system=SYSTEM_PROMPT, contents=contents, tools=self.tools.specs()
+            )
+            if not turn.tool_calls:
                 return AgentReply(text=turn.text or "")
-            logger.info("tool %s", turn.tool_name)
-            arguments = dict(turn.tool_args)
-            if turn.tool_name == "stage_outbound_action":
-                arguments.setdefault("user_id", thread_context.get("user_id", ""))
-                arguments.setdefault("channel_id", thread_context.get("channel_id", ""))
-                arguments.setdefault("thread_ts", thread_context.get("thread_ts"))
-            result = await self.tools.call(turn.tool_name, arguments)
-            if turn.tool_name == "stage_outbound_action":
-                return AgentReply(
-                    text=f"Staged a {arguments.get('action_type', 'message')} for {arguments.get('recipient', 'the recipient')}.",
-                    blocks=result["blocks"],
-                    draft_id=result["draft_id"],
-                )
-            if turn.tool_name == "search_commitments" and result == []:
-                return AgentReply(text=format_commitment_results([], query))
-            if turn.tool_name == "search_slack_history":
-                return AgentReply(text=format_history_results(result, query))
-            messages.append({"role": "tool", "name": turn.tool_name, "content": json.dumps(result, default=str)})
+            contents.append(turn)
+            for call in turn.tool_calls:
+                logger.info("tool %s", call.name)
+                arguments = _validated(call)
+                if isinstance(arguments, str):
+                    contents.append(ToolResult(call, {"error": arguments}))
+                    continue
+                if call.name == "stage_outbound_action":
+                    arguments.update(
+                        user_id=thread_context.get("user_id", ""),
+                        channel_id=thread_context.get("channel_id", ""),
+                        thread_ts=thread_context.get("thread_ts"),
+                    )
+                result = await self.tools.call(call.name, arguments)
+                if call.name == "stage_outbound_action":
+                    return AgentReply(
+                        text=f"Staged a {arguments['action_type']} for {arguments['recipient']}.",
+                        blocks=result["blocks"],
+                        draft_id=result["draft_id"],
+                    )
+                if call.name == "search_commitments" and result == []:
+                    return AgentReply(text=format_commitment_results([], query))
+                if call.name == "search_slack_history":
+                    return AgentReply(text=format_history_results(result, query))
+                contents.append(ToolResult(call, result))
         return AgentReply(text="I need a bit more detail before I can answer. Could you clarify what you want?")
+
+
+def _validated(call: ToolCall) -> dict[str, Any] | str:
+    spec = TOOL_SPECS.get(call.name)
+    if spec is None:
+        return f"Unknown tool {call.name}"
+    try:
+        return spec.args_model.model_validate(call.args).model_dump()
+    except ValidationError as exc:
+        return f"Invalid arguments for {call.name}: {exc.errors(include_url=False)}"

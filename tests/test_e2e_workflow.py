@@ -6,6 +6,7 @@ import pytest
 
 from knappy.db.repository import SqliteRepository
 from knappy.runtime import KnappyRuntime
+from fakes import HeuristicModel
 
 
 class Recorder:
@@ -19,7 +20,7 @@ class Recorder:
 @pytest.mark.asyncio
 async def test_note_recall_and_approval(repo: SqliteRepository) -> None:
     recorder = Recorder()
-    runtime = KnappyRuntime(repo, workspace_id="T_TEST", executor=recorder)
+    runtime = KnappyRuntime(repo, workspace_id="T_TEST", model=HeuristicModel(), executor=recorder)
     runtime.bind_user("U1")
 
     logged = await runtime.handle_event(

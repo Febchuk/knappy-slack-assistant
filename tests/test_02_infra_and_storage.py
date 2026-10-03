@@ -19,9 +19,12 @@ def test_infra_01_settings_load(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setenv("SLACK_BOT_TOKEN", "xoxb-test")
     monkeypatch.setenv("SLACK_APP_TOKEN", "xapp-test")
     monkeypatch.setenv("SLACK_SIGNING_SECRET", "secret")
+    monkeypatch.setenv("GEMINI_API_KEY", "test-key")
     settings = Settings.from_env()
     assert settings.slack_bot_token == "xoxb-test"
     assert settings.slack_app_token == "xapp-test"
+    assert settings.gemini_api_key == "test-key"
+    assert settings.model_agent and settings.model_light
     app = create_app(settings)
     assert app is not None
 
@@ -37,6 +40,23 @@ def test_dotenv_strips_quotes_and_inline_comments(tmp_path, monkeypatch: pytest.
     load_dotenv(env_file)
     assert os.environ["KNAPPY_DATABASE_URL"] == "sqlite:///knappy.db"
     assert os.environ["KNAPPY_WORKSPACE_ID"] == "T123456789"
+
+
+def test_llm_01_missing_gemini_key(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("SLACK_BOT_TOKEN", "xoxb-test")
+    monkeypatch.setenv("SLACK_APP_TOKEN", "xapp-test")
+    monkeypatch.setenv("SLACK_SIGNING_SECRET", "secret")
+    monkeypatch.delenv("GEMINI_API_KEY", raising=False)
+    with pytest.raises(ConfigError, match="GEMINI_API_KEY"):
+        Settings.from_env()
+
+
+def test_llm_01_bad_budget(monkeypatch: pytest.MonkeyPatch) -> None:
+    for name, value in {"SLACK_BOT_TOKEN": "x", "SLACK_APP_TOKEN": "x", "SLACK_SIGNING_SECRET": "x", "GEMINI_API_KEY": "x"}.items():
+        monkeypatch.setenv(name, value)
+    monkeypatch.setenv("KNAPPY_DAILY_BUDGET_USD", "lots")
+    with pytest.raises(ConfigError, match="KNAPPY_DAILY_BUDGET_USD"):
+        Settings.from_env()
 
 
 def test_infra_01_missing_tokens(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -113,6 +133,7 @@ async def test_socket_mode_handler_constructs(monkeypatch: pytest.MonkeyPatch) -
     monkeypatch.setenv("SLACK_BOT_TOKEN", "xoxb-test")
     monkeypatch.setenv("SLACK_APP_TOKEN", "xapp-test")
     monkeypatch.setenv("SLACK_SIGNING_SECRET", "secret")
+    monkeypatch.setenv("GEMINI_API_KEY", "test-key")
     from slack_bolt.adapter.socket_mode.async_handler import AsyncSocketModeHandler
 
     settings = Settings.from_env()
