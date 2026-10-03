@@ -92,6 +92,7 @@ async def test_loop_03_endless_tools_stop_at_max_steps(repo: SqliteRepository) -
     assert all(request.tools for request in model.requests[:-1])
     assert model.requests[-1].tools == []
     assert FINAL_TURN_NOTE in model.requests[-1].system
+    assert model.requests[-1].contents[-1] == UserMessage(FINAL_TURN_NOTE), "a closing turn asks for text"
     assert client.shown("100.1")["text"] == reply.text == "I searched a lot but found nothing about widgets."
 
 

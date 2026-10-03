@@ -12,6 +12,7 @@ import uuid
 from collections.abc import Callable, Iterable
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
+from itertools import dropwhile
 from typing import Any
 
 import numpy as np
@@ -187,6 +188,8 @@ class MemoryStore:
                     (owner, key, recap["updated_at"]),
                 )
                 after = int(row["seq"] or 0) if row else 0
+        # A forget clears short-term context: earlier answers, and its confirmation, may restate what was forgotten.
+        forgot_at = await self._last_forget_seq(owner)
         rows = await self._all(
             """
             SELECT id, seq, conversation_key, role, content, created_at FROM conversation_turns
@@ -194,9 +197,12 @@ class MemoryStore:
               AND role IN ('user', 'assistant')
             ORDER BY seq
             """,
-            (self.workspace_id, owner, key, after),
+            (self.workspace_id, owner, key, max(after, forgot_at)),
         )
-        turns = _without_retracted(_logged(rows), await self.retracted_turn_ids(owner))
+        logged = _logged(rows)
+        if forgot_at > after:
+            logged = list(dropwhile(lambda turn: turn.role == "assistant", logged))
+        turns = _without_retracted(logged, await self.retracted_turn_ids(owner))
         start = 0
         if key.startswith("dm:") and turns:
             for index in range(1, len(turns)):
@@ -211,6 +217,32 @@ class MemoryStore:
             recap=recap["body"] if recap else None,
             new_segment=window_start == start and start > 0,
         )
+
+    async def _prompt_of(self, owner: str, reply_id: str) -> str | None:
+        """The user turn an assistant reply answered: the turn before it in the same conversation."""
+        row = await self._one(
+            """
+            SELECT prev.id FROM conversation_turns reply
+            JOIN conversation_turns prev ON prev.owner_user_id = reply.owner_user_id
+             AND prev.conversation_key = reply.conversation_key AND prev.role IN ('user', 'assistant')
+            WHERE reply.owner_user_id = ? AND reply.id = ? AND prev.seq < reply.seq
+            ORDER BY prev.seq DESC LIMIT 1
+            """,
+            (owner, reply_id),
+        )
+        return row["id"] if row else None
+
+    async def _last_forget_seq(self, owner: str) -> int:
+        row = await self._one(
+            """
+            SELECT MAX(t.seq) AS seq FROM conversation_turns t
+            JOIN memory_provenance p ON p.owner_user_id = t.owner_user_id AND p.source_type = 'turn' AND p.source_id = t.id
+            JOIN memory_events e ON e.id = p.target_id
+            WHERE t.workspace_id = ? AND t.owner_user_id = ? AND p.target_type = 'event' AND e.kind = 'forgotten'
+            """,
+            (self.workspace_id, owner),
+        )
+        return int(row["seq"] or 0) if row else 0
 
     async def save_recap(self, owner: str, key: str, body: str, through_turn_id: str) -> None:
         async with self.repo.transaction():
@@ -322,8 +354,10 @@ class MemoryStore:
                 ORDER BY bm25(turns_fts) LIMIT 50
             """
             params = [" OR ".join(f'"{term}"' for term in terms), *params]
-        hidden = await self.retracted_turn_ids(owner)
+        hidden = await self.retracted_turn_ids(owner, with_forget_requests=True)
         hits = [row for row in await self._all(sql, params) if row["id"] not in hidden]
+        if hidden:
+            hits = [row for row in hits if row["role"] != "assistant" or await self._prompt_of(owner, row["id"]) not in hidden]
         return [
             {
                 "conversation": row["conversation_key"],
@@ -535,6 +569,24 @@ class MemoryStore:
         )
         return [{**_hit(rows[rid]), "score": round(score, 3)} for score, rid in ranked[:limit]]
 
+    async def superseded_matches(self, owner: str, query: str, *, types: Iterable[str], limit: int = 10) -> list[str]:
+        """Earlier versions of records whose text mentions any query term, newest first."""
+        terms = search_terms(query)
+        kinds = list(types)
+        if not terms or not kinds:
+            return []
+        matches = " OR ".join("LOWER(title || ' ' || aliases || ' ' || body) LIKE ?" for _ in terms)
+        rows = await self._all(
+            f"""
+            SELECT id FROM memory_records
+            WHERE workspace_id = ? AND owner_user_id = ? AND status = 'SUPERSEDED'
+              AND type IN ({', '.join('?' for _ in kinds)}) AND ({matches})
+            ORDER BY updated_at DESC LIMIT ?
+            """,
+            (self.workspace_id, owner, *kinds, *[f"%{term}%" for term in terms], limit),
+        )
+        return [row["id"] for row in rows]
+
     async def _text_scores(self, terms: list[str], type_sql: str, scope: list[Any]) -> dict[str, float]:
         if self.repo.dialect == "postgres":
             query = " | ".join(terms)
@@ -671,8 +723,13 @@ class MemoryStore:
 
         for record_id in record_ids:
             await forget(record_id)
+        # Forgetting only an earlier version keeps the events its current version still stands on.
+        heads = {record_id.split("@", 1)[0] for record_id in record_ids} - dead_records
+        protected = {source_id for head in heads for _, source_id in await self.sources(owner, "record", head)}
         for version_id in list(dead_records):
             for event in await self.source_events(owner, version_id):
+                if event["id"] in protected:
+                    continue
                 if event["status"] == "ACTIVE":
                     await self._run("UPDATE memory_events SET status = 'RETRACTED' WHERE id = ?", (event["id"],))
                     cascade.retracted.append(event["id"])

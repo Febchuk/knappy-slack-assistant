@@ -189,7 +189,10 @@ class MemoryEngine:
         targets = await self._forget_targets(owner, query_or_id)
         if not targets:
             return {"forgotten": [], "note": f"Nothing in memory matched {query_or_id!r}."}
-        titles = {record_id: (await self.store.get_record(owner, record_id))["title"] for record_id in targets}
+        titles = {
+            record_id: (await self.store.get_record(owner, record_id))["title"] + (" (earlier version)" if "@" in record_id else "")
+            for record_id in targets
+        }
         async with self._tx:
             cascade = await self.store.cascade_forget(owner, targets, now)
             await self.store.rebuild_profile(owner, now)
@@ -239,14 +242,17 @@ class MemoryEngine:
         }
 
     async def _forget_targets(self, owner: str, query_or_id: str) -> list[str]:
+        """Matching active records, plus superseded versions that still say it ("forget that I used to eat meat")."""
         record = await self.store.get_record(owner, query_or_id.strip())
-        if record is not None and record["status"] == "ACTIVE":
+        if record is not None and record["status"] in ("ACTIVE", "SUPERSEDED"):
             return [record["id"]]
         hits = await self.store.search(owner, query_or_id, types=FORGETTABLE, limit=5)
-        if not hits or "score" not in hits[0]:
-            return []
-        top = hits[0]["score"]
-        return [hit["id"] for hit in hits if hit["score"] >= 0.6 * top][:3]
+        active: list[str] = []
+        if hits and "score" in hits[0]:
+            top = hits[0]["score"]
+            active = [hit["id"] for hit in hits if hit["score"] >= 0.6 * top][:3]
+        past = await self.store.superseded_matches(owner, query_or_id, types=FORGETTABLE)
+        return active + [version for version in past if version.split("@", 1)[0] not in active]
 
     async def read(self, owner: str, record_id: str, history: bool = False) -> dict[str, Any]:
         record = await self.store.get_record(owner, record_id)

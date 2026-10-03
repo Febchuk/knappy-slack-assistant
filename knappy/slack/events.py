@@ -84,7 +84,7 @@ def _from_bot(event: dict[str, Any]) -> bool:
 
 
 def _log_received(event_type: str, event: dict[str, Any]) -> None:
-    from knappy.runtime import strip_mentions
+    from knappy.runtime import strip_address
 
     logger.info("event type=%s channel=%s user=%s", event_type, event.get("channel"), event.get("user"))
-    logger.debug("event text=%s", strip_mentions(str(event.get("text") or "")))
+    logger.debug("event text=%s", strip_address(str(event.get("text") or "")))

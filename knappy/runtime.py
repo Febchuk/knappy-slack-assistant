@@ -32,11 +32,12 @@ logger = logging.getLogger("knappy")
 
 BUDGET_TEXT = "I've hit today's usage limit, so I can't think this through right now. I'll be back tomorrow."
 
-_MENTION = re.compile(r"<@[A-Z0-9]+(?:\|[^>]+)?>")
+# An app_mention starts with the bot's own mention. Other mentions stay: they tell the model who someone is.
+_ADDRESS = re.compile(r"^\s*<@[A-Z0-9]+(?:\|[^>]+)?>")
 
 
-def strip_mentions(text: str) -> str:
-    return re.sub(r"\s+", " ", _MENTION.sub(" ", text)).strip()
+def strip_address(text: str) -> str:
+    return re.sub(r"\s+", " ", _ADDRESS.sub(" ", text)).strip()
 
 
 def failure_text(ref: str) -> str:
@@ -89,7 +90,7 @@ class KnappyRuntime:
 
     async def handle_event(self, event: dict[str, Any]) -> AgentReply:
         """Answer one Slack message. Never raises: failures become an apology with a log reference."""
-        event = {**event, "text": strip_mentions(str(event.get("text") or ""))}
+        event = {**event, "text": strip_address(str(event.get("text") or ""))}
         owner = str(event.get("user") or "")
         key = conversation_key(event)
         reply = open_reply(self.say, event)

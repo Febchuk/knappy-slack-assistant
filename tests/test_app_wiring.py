@@ -12,42 +12,7 @@ from knappy.hitl.gateway import ApprovalGateway
 from knappy.runtime import KnappyRuntime
 from knappy.slack.actions import register_actions
 from knappy.slack.events import EventDeduplicator, on_app_mention, on_message
-from fakes import HeuristicModel
-
-
-class FakeApp:
-    def __init__(self) -> None:
-        self.handlers: dict[str, object] = {}
-
-    def action(self, name: str):
-        def decorate(fn):
-            self.handlers[name] = fn
-            return fn
-
-        return decorate
-
-    def view(self, name: str):
-        def decorate(fn):
-            self.handlers[name] = fn
-            return fn
-
-        return decorate
-
-
-class FakeClient:
-    def __init__(self) -> None:
-        self.updates: list[dict] = []
-        self.ephemerals: list[dict] = []
-        self.modals: list[dict] = []
-
-    async def chat_update(self, **kwargs):
-        self.updates.append(kwargs)
-
-    async def chat_postEphemeral(self, **kwargs):
-        self.ephemerals.append(kwargs)
-
-    async def views_open(self, **kwargs):
-        self.modals.append(kwargs)
+from fakes import FakeApp, FakeSlack, HeuristicModel
 
 
 class Recorder:
@@ -84,7 +49,7 @@ async def test_action_handlers_update_slack(repo: SqliteRepository) -> None:
             "metadata": {},
         },
     )
-    client = FakeClient()
+    client = FakeSlack()
 
     async def ack():
         return None

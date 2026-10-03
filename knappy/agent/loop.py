@@ -82,8 +82,12 @@ class AgentLoop:
             drafts.extend(result.result for result in results if isinstance(result.result, StagedDraft))
             ran.extend(_for_model(result) for result in results)
             contents.extend(_for_model(result) for result in results)
+        # Gemini keeps calling tools after a tool result even when none are declared; a closing user turn gets text.
         final = await self.model.generate(
-            tier="agent", system=f"{message.system}\n\n{FINAL_TURN_NOTE}", contents=contents, tools=None
+            tier="agent",
+            system=f"{message.system}\n\n{FINAL_TURN_NOTE}",
+            contents=[*contents, UserMessage(FINAL_TURN_NOTE)],
+            tools=None,
         )
         logger.info("agent steps=%d stop=limit ms=%d", steps, _ms(started))
         return _reply(final.text, drafts, ran)

@@ -15,40 +15,13 @@ import pytest
 from knappy.db.repository import SqliteRepository
 from knappy.llm.fake import FakeModel
 from knappy.llm.types import ModelTurn, UserMessage
-from knappy.memory import MemoryConfig, MemoryEngine, MemoryStore
+from knappy.memory import MemoryEngine, MemoryStore
 from knappy.memory.engine import BACKGROUND_TIMEOUT_S
 from knappy.runtime import KnappyRuntime
 from knappy.slack.egress import build_say
-from fakes import FakeSlack, dm, event, memory_structured, op, tool_results, tool_turn, user_turns
+from fakes import FakeClock, FakeSlack, agent, dm, event, memory_structured, op, tool_results, user_turns
 
 START = datetime(2026, 10, 3, 12, 0, tzinfo=timezone.utc)  # a Saturday
-
-
-class Clock:
-    def __init__(self, at: datetime = START) -> None:
-        self.now = at
-
-    def __call__(self) -> datetime:
-        return self.now
-
-    def advance(self, **delta: float) -> None:
-        self.now += timedelta(**delta)
-
-
-def agent(script: dict[str, tuple[str, dict]] | None = None):
-    """Agent double: calls the scripted tool for a message prefix, then reports the tool results."""
-
-    async def respond(request):
-        results = tool_results(request.contents)
-        if results:
-            return ModelTurn(text=json.dumps([result.result for result in results], default=str))
-        text = request.contents[-1].text.lower()
-        for prefix, (name, args) in (script or {}).items():
-            if text.startswith(prefix):
-                return tool_turn(name, args)
-        return ModelTurn(text="ok")
-
-    return respond
 
 
 def runtime_for(repo, *, script=None, reconcile=None, clock=None, client=None, config=None):
@@ -56,7 +29,7 @@ def runtime_for(repo, *, script=None, reconcile=None, clock=None, client=None, c
     model = FakeModel(agent(script), structured=memory_structured(reconcile))
     runtime = KnappyRuntime(
         repo, workspace_id="T_TEST", model=model, say=build_say(client), sender=build_say(client), slack=client,
-        clock=clock or Clock(), memory_config=config,
+        clock=clock or FakeClock(START), memory_config=config,
     )
     return runtime, model, client
 
@@ -107,7 +80,7 @@ def employer(payload: dict) -> dict:
 
 
 async def test_mem_01_turns_survive_restart(tmp_path: Path, open_db) -> None:
-    clock = Clock()
+    clock = FakeClock(START)
     repo = await open_db(tmp_path / "k.db")
     runtime, _model, _client = runtime_for(repo, clock=clock)
     await runtime.handle_event(dm("my sister is visiting next week", "1.0"))
@@ -130,7 +103,7 @@ async def test_mem_01_turns_survive_restart(tmp_path: Path, open_db) -> None:
 async def test_mem_02_remember_is_in_the_next_prompt(repo: SqliteRepository) -> None:
     script = {"remember": ("remember", {"text": "I'm vegetarian", "type": "preference", "about": "diet"})}
     seen: list[dict] = []
-    clock = Clock()
+    clock = FakeClock(START)
     runtime, model, _client = runtime_for(repo, script=script, clock=clock, reconcile=lambda payload: seen.append(payload) or {})
     await runtime.handle_event(dm("Remember I'm vegetarian", "1.0"))
     await runtime.handle_event(dm("pick a lunch spot", "2.0", thread_ts="2.0"))
@@ -152,7 +125,7 @@ async def test_mem_02_remember_is_in_the_next_prompt(repo: SqliteRepository) -> 
 
 
 async def test_mem_03_supersede_keeps_history(repo: SqliteRepository) -> None:
-    clock = Clock()
+    clock = FakeClock(START)
     runtime, _model, _client = runtime_for(repo, reconcile=employer, clock=clock)
     await runtime.handle_event(dm("I work at Google", "1.0"))
     clock.advance(minutes=5)
@@ -173,7 +146,7 @@ async def test_mem_03_supersede_keeps_history(repo: SqliteRepository) -> None:
 
 
 async def test_background_reconcile_gets_the_long_timeout(repo: SqliteRepository) -> None:
-    clock = Clock()
+    clock = FakeClock(START)
     runtime, model, _client = runtime_for(repo, reconcile=employer, clock=clock)
     await runtime.handle_event(dm("I work at Google", "1.0"))
     clock.advance(minutes=21)
@@ -191,7 +164,7 @@ async def test_mem_04_time_bound_fact_expires(repo: SqliteRepository) -> None:
             op("create", events=[0], type="fact", title="Exam", body="- Exam on October 12", expires_at="2026-10-13T00:00:00Z")
         ]}
 
-    clock = Clock()
+    clock = FakeClock(START)
     runtime, _model, _client = runtime_for(repo, reconcile=exam, clock=clock)
     await runtime.handle_event(dm("My exam is on the 12th", "1.0"))
     clock.advance(minutes=21)
@@ -221,9 +194,8 @@ async def test_mem_05_forget_is_honored_on_the_next_read(repo: SqliteRepository)
     assert "Remember I'm vegetarian" not in [getattr(item, "text", None) for item in model.requests[-1].contents]
     assert "vegetarian" not in model.requests[-1].system
     assert await runtime.store.search("U1", "vegetarian") == []
-    assert await runtime.store.search_conversations("U1", "remember vegetarian") == [
-        {"conversation": "dm:D1", "role": "user", "date": "2026-10-03 12:00 UTC", "text": "Forget that I'm vegetarian"}
-    ]
+    assert await runtime.store.search_conversations("U1", "vegetarian") == [], "nor the forget request, which restates it"
+    assert [hit["text"] for hit in await runtime.store.search_conversations("U1", "eat")] == ["what should I eat?"]
     assert "Diet" in forgot.text
 
 
@@ -253,7 +225,7 @@ async def test_mem_07_unknown_id_is_rejected_and_the_rest_applies(
         ]}
 
     caplog.set_level(logging.INFO, logger="knappy")
-    clock = Clock()
+    clock = FakeClock(START)
     runtime, _model, _client = runtime_for(repo, reconcile=reconcile, clock=clock)
     await runtime.handle_event(dm("I always take the window seat", "1.0"))
     clock.advance(minutes=21)
@@ -274,7 +246,7 @@ async def test_mem_08_secrets_never_reach_memory(repo: SqliteRepository) -> None
             op("create", events=[0], type="fact", title=f"OpenAI key {key}", body=f"- key: {key}", aliases=[key])
         ]}
 
-    clock = Clock()
+    clock = FakeClock(START)
     runtime, _model, _client = runtime_for(
         repo, reconcile=naive, clock=clock,
         script={"save": ("remember", {"text": f"my api key is {key}"})},
@@ -350,7 +322,7 @@ def _fastembed_or_skip() -> None:
 async def test_mem_10_semantic_search_finds_paraphrases(repo: SqliteRepository, monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setenv("KNAPPY_EMBEDDER", "fastembed")
     _fastembed_or_skip()
-    store = MemoryStore(repo, "T_TEST", Clock())
+    store = MemoryStore(repo, "T_TEST", FakeClock(START))
     async with repo.transaction():
         for title, aliases, body in (
             ("Pasta preference", ["food", "italian"], "- Loves carbonara"),
@@ -377,7 +349,7 @@ async def test_mem_11_small_talk_is_discarded(repo: SqliteRepository) -> None:
             "discarded": [f"small talk: {turn['text']}" for turn in turns],
         }
 
-    clock = Clock()
+    clock = FakeClock(START)
     runtime, _model, _client = runtime_for(repo, reconcile=chatty, clock=clock)
     for index, text in enumerate(("lol", "thanks!", "ok see you")):
         await runtime.handle_event(dm(text, f"{index}.0"))
@@ -405,7 +377,7 @@ async def test_mem_12_nothing_is_written_without_provenance(repo: SqliteReposito
             ],
         }
 
-    clock = Clock()
+    clock = FakeClock(START)
     runtime, _model, _client = runtime_for(repo, reconcile=unsourced, clock=clock)
     await runtime.handle_event(dm("my dog Rex is sick", "1.0"))
     clock.advance(minutes=21)
@@ -440,7 +412,7 @@ def diet_and_dinners(payload: dict) -> dict:
 
 
 async def test_mem_13_forget_cascades_through_provenance(repo: SqliteRepository) -> None:
-    clock = Clock()
+    clock = FakeClock(START)
     runtime, model, _client = runtime_for(
         repo, reconcile=diet_and_dinners, clock=clock,
         script={"forget": ("forget", {"query_or_id": "preference:diet"})},
@@ -476,7 +448,7 @@ async def test_mem_13_forget_cascades_through_provenance(repo: SqliteRepository)
 
 
 async def test_mem_14_why_do_you_think_that_cites_the_source(repo: SqliteRepository) -> None:
-    clock = Clock()
+    clock = FakeClock(START)
     runtime, model, _client = runtime_for(
         repo, reconcile=employer, clock=clock,
         script={"why": ("memory_read", {"id": "fact:employer"})},
@@ -514,7 +486,7 @@ async def test_mem_15_follow_through_surfaces_without_progress(repo: SqliteRepos
                 ops.append(op("commitment_progress", events=[len(events) - 1], record_id=lease))
         return {"events": events, "ops": ops}
 
-    clock = Clock()
+    clock = FakeClock(START)
     runtime, _model, client = runtime_for(repo, reconcile=follow_through, clock=clock)
     await runtime.handle_event(dm("If Alex doesn't send the contract by Thursday, remind me to chase him.", "1.0"))
     await runtime.handle_event(dm("check on the lease renewal Monday", "2.0"))
@@ -547,7 +519,7 @@ async def test_mem_16_raw_turns_are_dropped_after_retention(repo: SqliteReposito
         return {"events": [event("learned", "Allergic to peanuts", [turn["id"]], occurred_at="2026-06-25T12:00:00Z")],
                 "ops": [op("create", events=[0], type="fact", title="Peanut allergy", body="- Allergic to peanuts")]}
 
-    clock = Clock(datetime(2026, 6, 25, 12, 0, tzinfo=timezone.utc))
+    clock = FakeClock(datetime(2026, 6, 25, 12, 0, tzinfo=timezone.utc))
     store = MemoryStore(repo, "T_TEST", clock)
     engine = MemoryEngine(store, FakeModel(structured=memory_structured(allergy)))
     from knappy.agent.session import Turn
@@ -599,7 +571,7 @@ REBUILD_SCRIPT = {
 }
 
 
-async def drive(repo: SqliteRepository, reconcile, clock: Clock) -> KnappyRuntime:
+async def drive(repo: SqliteRepository, reconcile, clock: FakeClock) -> KnappyRuntime:
     """Two days of conversation with idle reconciles, an explicit remember, a forget, and nightly passes."""
     runtime, _model, _client = runtime_for(repo, reconcile=reconcile, clock=clock, script=REBUILD_SCRIPT)
     await runtime.handle_event(dm("I'm vegetarian", "1.0"))
@@ -631,7 +603,7 @@ async def snapshot(repo: SqliteRepository) -> dict[str, Any]:
 
 
 async def test_mem_17_rebuild_matches_a_fresh_run(tmp_path: Path, open_db) -> None:
-    clock = Clock()
+    clock = FakeClock(START)
     repo = await open_db(tmp_path / "rebuilt.db")
     runtime = await drive(repo, versioned("v1"), clock)
     assert "(v1)" in (await runtime.store.get_record("U1", "fact:employer"))["body"]
@@ -641,7 +613,7 @@ async def test_mem_17_rebuild_matches_a_fresh_run(tmp_path: Path, open_db) -> No
     rebuilt = await snapshot(repo)
 
     fresh_repo = await open_db(tmp_path / "fresh.db")
-    await drive(fresh_repo, versioned("v2"), Clock())
+    await drive(fresh_repo, versioned("v2"), FakeClock(START))
     fresh = await snapshot(fresh_repo)
 
     assert rebuilt == fresh
@@ -654,7 +626,7 @@ async def test_mem_17_rebuild_matches_a_fresh_run(tmp_path: Path, open_db) -> No
 
 
 async def test_mem_17_rebuild_since_keeps_earlier_memory(tmp_path: Path, open_db) -> None:
-    clock = Clock()
+    clock = FakeClock(START)
     repo = await open_db(tmp_path / "k.db")
     runtime = await drive(repo, versioned("v1"), clock)
 
@@ -678,7 +650,7 @@ async def test_failing_reconciler_backs_off_then_recovers(repo: SqliteRepository
         return {"events": [event("learned", "Lives in Lisbon", [turn["id"]])],
                 "ops": [op("create", events=[0], type="fact", title="Home", body="- Lives in Lisbon")]}
 
-    clock = Clock()
+    clock = FakeClock(START)
     runtime, _model, _client = runtime_for(repo, reconcile=flaky, clock=clock)
     await runtime.handle_event(dm("I live in Lisbon", "1.0"))
     clock.advance(minutes=21)
@@ -695,7 +667,7 @@ async def test_failing_reconciler_backs_off_then_recovers(repo: SqliteRepository
 
 
 async def test_dm_gap_starts_a_new_segment_with_a_recap(repo: SqliteRepository) -> None:
-    clock = Clock()
+    clock = FakeClock(START)
     runtime, model, _client = runtime_for(repo, clock=clock)
     await runtime.handle_event(dm("the offsite is in Lisbon", "1.0"))
     clock.advance(minutes=2)
@@ -715,7 +687,7 @@ async def test_dm_gap_starts_a_new_segment_with_a_recap(repo: SqliteRepository) 
 
 
 async def test_failed_recap_keeps_the_old_segment_out_and_retries(repo: SqliteRepository) -> None:
-    clock = Clock()
+    clock = FakeClock(START)
     runtime, model, _client = runtime_for(repo, clock=clock)
     drafts = model._structured
     failures = [RuntimeError("model unavailable")]
@@ -739,7 +711,7 @@ async def test_failed_recap_keeps_the_old_segment_out_and_retries(repo: SqliteRe
 
 
 async def test_long_thread_gets_a_recap_after_the_window_slides(repo: SqliteRepository) -> None:
-    clock = Clock()
+    clock = FakeClock(START)
     runtime, model, _client = runtime_for(repo, clock=clock)
     for index in range(16):
         await runtime.handle_event(dm(f"point {index}", f"{index + 10}.0", thread_ts="9.0"))
@@ -752,7 +724,7 @@ async def test_long_thread_gets_a_recap_after_the_window_slides(repo: SqliteRepo
 
 
 async def test_transaction_is_atomic_against_concurrent_writers(repo: SqliteRepository) -> None:
-    store = MemoryStore(repo, "T_TEST", Clock())
+    store = MemoryStore(repo, "T_TEST", FakeClock(START))
     started = asyncio.Event()
 
     async def failing_batch():
@@ -776,7 +748,7 @@ async def test_transaction_is_atomic_against_concurrent_writers(repo: SqliteRepo
 
 
 async def test_title_and_alias_matches_outrank_body_matches(repo: SqliteRepository) -> None:
-    store = MemoryStore(repo, "T_TEST", Clock())
+    store = MemoryStore(repo, "T_TEST", FakeClock(START))
     async with repo.transaction():
         await store.create_record("U1", record_id="fact:commute", type="fact", title="Commute",
                                   body="- Bikes past the Stripe office", source="remember", now=START, sources=[])
@@ -793,7 +765,7 @@ async def test_passive_learning_survives_restart(tmp_path: Path, open_db) -> Non
             op("create", events=[0], type="person", title="Priya", body="- The user's manager at Stripe", aliases=["manager", "boss"]),
         ]}
 
-    clock = Clock()
+    clock = FakeClock(START)
     repo = await open_db(tmp_path / "k.db")
     runtime, _model, _client = runtime_for(repo, reconcile=manager, clock=clock)
     await runtime.handle_event(dm("I just started at Stripe, my manager is Priya", "1.0"))

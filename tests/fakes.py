@@ -195,6 +195,8 @@ class FakeSlack:
         self.tz = tz
         self.ephemeral_error = ephemeral_error
         self.users_info_calls = 0
+        self.modals: list[dict] = []
+        self.uploads: list[dict] = []
 
     async def chat_postMessage(self, **kwargs):
         self.posts.append(kwargs)
@@ -214,6 +216,13 @@ class FakeSlack:
 
     async def reactions_remove(self, **kwargs):
         self.reactions.append(("remove", kwargs))
+
+    async def files_upload_v2(self, **kwargs):
+        self.uploads.append(kwargs)
+        return {"ok": True, "files": [{"id": f"F{len(self.uploads)}"}]}
+
+    async def views_open(self, **kwargs):
+        self.modals.append(kwargs)
 
     async def users_info(self, *, user):
         self.users_info_calls += 1
@@ -241,6 +250,59 @@ def dm(text: str, ts: str, *, user: str = "U1", channel: str = "D1", thread_ts: 
 
 def mention(text: str, ts: str, *, user: str = "U1", channel: str = "C1") -> dict:
     return {"type": "app_mention", "text": f"<@UBOT> {text}", "channel": channel, "user": user, "ts": ts}
+
+
+class FakeApp:
+    """Bolt app double: collects the action and view handlers register_actions installs."""
+
+    def __init__(self) -> None:
+        self.handlers: dict[str, Callable[..., Awaitable[None]]] = {}
+
+    def action(self, name: str):
+        def decorate(fn):
+            self.handlers[name] = fn
+            return fn
+
+        return decorate
+
+    view = action
+
+
+class FakeClock:
+    def __init__(self, at: datetime) -> None:
+        self.now = at
+
+    def __call__(self) -> datetime:
+        return self.now
+
+    def advance(self, **delta: float) -> None:
+        self.now += timedelta(**delta)
+
+
+ToolPlan = tuple[str, dict[str, Any] | Callable[[Any], dict[str, Any]]]
+
+
+def agent(script: dict[str, ToolPlan | list[ToolPlan]] | None = None):
+    """Agent double for FakeModel: calls the scripted tools for a message prefix, then reports the tool results as JSON.
+
+    A plan's args may be a function of the request, to read ids out of the system prompt as the model would.
+    """
+
+    async def respond(request):
+        results = tool_results(request.contents)
+        if results:
+            return ModelTurn(text=json.dumps([result.result for result in results], default=str))
+        text = request.contents[-1].text.lower()
+        for prefix, plan in (script or {}).items():
+            if text.startswith(prefix):
+                plans = plan if isinstance(plan, list) else [plan]
+                return ModelTurn(tool_calls=[
+                    ToolCall(id=f"call_{index}_{name}", name=name, args=args(request) if callable(args) else args)
+                    for index, (name, args) in enumerate(plans)
+                ])
+        return ModelTurn(text="ok")
+
+    return respond
 
 
 Reconcile = Callable[[dict[str, Any]], "ReconcileResult | dict[str, Any] | Awaitable[ReconcileResult | dict[str, Any]]"]
