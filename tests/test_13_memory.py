@@ -777,3 +777,12 @@ async def test_passive_learning_survives_restart(tmp_path: Path, open_db) -> Non
     runtime, model, _client = runtime_for(repo, clock=clock)
     await runtime.handle_event(dm("who's my manager?", "2.0", thread_ts="2.0"))
     assert "Priya: The user's manager at Stripe" in model.requests[-1].system
+
+
+async def test_search_conversations_does_not_find_the_message_being_answered(repo: SqliteRepository) -> None:
+    runtime, model, _client = runtime_for(repo, script={"what did i say": ("search_conversations", {"query": "budget"})})
+    await runtime.handle_event(dm("the budget is due Friday", "1.0"))
+    await runtime.handle_event(dm("what did I say about the budget?", "2.0"))
+
+    found = tool_results(model.requests[-1].contents)[0].result
+    assert [hit["text"] for hit in found] == ["the budget is due Friday"]

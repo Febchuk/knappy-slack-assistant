@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import logging
 import time
+from collections import Counter
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass, field
 from typing import Any
@@ -19,6 +20,14 @@ logger = logging.getLogger("knappy")
 
 StatusFn = Callable[[str], Awaitable[None]]
 EMPTY_ANSWER = "I couldn't put an answer together for that. Could you try asking again?"
+# Gemini retries an empty search with reworded queries until the step limit. A tool that came back empty this many
+# times is withdrawn for the rest of the message.
+EMPTY_LIMIT = 2
+WITHDRAWN = "This tool found nothing twice already and is withdrawn for this message. Answer with what you have."
+NOTHING_FOUND = (
+    "Nothing found. This source has nothing on it; rewording the query will not change that. "
+    "Don't search it again for this message. Answer with what you have, or ask the user."
+)
 
 
 @dataclass(frozen=True)
@@ -60,6 +69,8 @@ class AgentLoop:
         drafts: list[StagedDraft] = []
         ran: list[ToolResult] = []
         specs = self.tools.specs()
+        empty: Counter[str] = Counter()
+        withdrawn: set[str] = set()
         steps = 0
         for steps in range(1, self.max_steps + 1):
             remaining = deadline - time.monotonic()
@@ -78,10 +89,13 @@ class AgentLoop:
             contents.append(turn)
             if on_status is not None:
                 await on_status(_status(turn.tool_calls))
-            results = await self._run_tools(turn.tool_calls, deadline)
+            results = await self._run_tools(turn.tool_calls, deadline, withdrawn)
             drafts.extend(result.result for result in results if isinstance(result.result, StagedDraft))
             ran.extend(_for_model(result) for result in results)
             contents.extend(_for_model(result) for result in results)
+            empty.update(result.call.name for result in results if result.result == [])
+            withdrawn = {name for name, count in empty.items() if count >= EMPTY_LIMIT}
+            specs = [spec for spec in specs if spec.name not in withdrawn]
         # Gemini keeps calling tools after a tool result even when none are declared; a closing user turn gets text.
         final = await self.model.generate(
             tier="agent",
@@ -92,8 +106,8 @@ class AgentLoop:
         logger.info("agent steps=%d stop=limit ms=%d", steps, _ms(started))
         return _reply(final.text, drafts, ran)
 
-    async def _run_tools(self, calls: list[ToolCall], deadline: float) -> list[ToolResult]:
-        tasks = [asyncio.ensure_future(self._run_tool(call)) for call in calls]
+    async def _run_tools(self, calls: list[ToolCall], deadline: float, withdrawn: set[str]) -> list[ToolResult]:
+        tasks = [asyncio.ensure_future(self._run_tool(call, call.name in withdrawn)) for call in calls]
         _done, pending = await asyncio.wait(tasks, timeout=max(deadline - time.monotonic(), 0))
         for task in pending:
             task.cancel()
@@ -102,8 +116,11 @@ class AgentLoop:
             for call, task in zip(calls, tasks)
         ]
 
-    async def _run_tool(self, call: ToolCall) -> ToolResult:
+    async def _run_tool(self, call: ToolCall, withdrawn: bool) -> ToolResult:
         started = time.monotonic()
+        if withdrawn:
+            logger.info("tool name=%s outcome=withdrawn", call.name)
+            return ToolResult(call, {"error": WITHDRAWN})
         arguments = _validated(call)
         if isinstance(arguments, str):
             logger.info("tool name=%s outcome=invalid", call.name)
@@ -130,6 +147,8 @@ def _validated(call: ToolCall) -> dict[str, Any] | str:
 def _for_model(result: ToolResult) -> ToolResult:
     if isinstance(result.result, StagedDraft):
         return ToolResult(result.call, result.result.for_model())
+    if result.result == []:
+        return ToolResult(result.call, {"matches": [], "note": NOTHING_FOUND})
     return result
 
 

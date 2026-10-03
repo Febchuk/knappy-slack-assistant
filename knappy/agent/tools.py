@@ -381,7 +381,8 @@ class ToolRegistry:
         if self.memory is None:
             return _NO_MEMORY
         start = datetime.combine(since, time(0), timezone.utc) if since else None
-        return await self.memory.store.search_conversations(self._owner() or "", query, start)
+        # The message being answered is already logged; finding it again reads as a lead worth chasing.
+        return await self.memory.store.search_conversations(self._owner() or "", query, start, exclude=current_turn.get())
 
     def specs(self) -> list[ToolSpec]:
         return list(TOOL_SPECS.values())

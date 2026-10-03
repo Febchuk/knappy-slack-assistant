@@ -329,7 +329,7 @@ class MemoryStore:
             await self._run("UPDATE conversation_turns SET reconciled_at = ? WHERE id = ?", (format_ts(now), turn_id))
 
     async def search_conversations(
-        self, owner: str, query: str, since: datetime | None = None, limit: int = 10
+        self, owner: str, query: str, since: datetime | None = None, limit: int = 10, exclude: str | None = None
     ) -> list[dict[str, Any]]:
         terms = search_terms(query)
         if not terms:
@@ -355,7 +355,7 @@ class MemoryStore:
             """
             params = [" OR ".join(f'"{term}"' for term in terms), *params]
         hidden = await self.retracted_turn_ids(owner, with_forget_requests=True)
-        hits = [row for row in await self._all(sql, params) if row["id"] not in hidden]
+        hits = [row for row in await self._all(sql, params) if row["id"] not in hidden and row["id"] != exclude]
         if hidden:
             hits = [row for row in hits if row["role"] != "assistant" or await self._prompt_of(owner, row["id"]) not in hidden]
         return [

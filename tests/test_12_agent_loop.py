@@ -378,3 +378,44 @@ async def test_history_window_feeds_the_model_as_turns(repo: SqliteRepository) -
     contents = model.requests[1].contents
     assert contents == [UserMessage("first"), ModelTurn(text="first answer"), UserMessage("second")]
     assert not any(isinstance(item, ToolResult) for item in contents)
+
+
+def searching_forever():
+    """A model that rewords search_commitments for as long as it is offered, then answers."""
+
+    async def respond(request):
+        if "search_commitments" in [spec.name for spec in request.tools]:
+            return ModelTurn(tool_calls=[ToolCall(f"c{len(request.contents)}", "search_commitments", {"query": f"alex {len(request.contents)}"})])
+        return ModelTurn(text="I couldn't find anything about Alex.")
+
+    return FakeModel(respond)
+
+
+async def test_empty_results_say_so_and_a_twice_empty_tool_is_withdrawn(repo: SqliteRepository) -> None:
+    model = searching_forever()
+    reply = await AgentLoop(ToolRegistry(repo, "T_TEST"), model).run(InboundMessage(text="follow up with Alex", system="s"))
+
+    offered = [[spec.name for spec in request.tools] for request in model.requests]
+    assert ["search_commitments" in names for names in offered] == [True, True, False]
+    assert reply.text == "I couldn't find anything about Alex."
+    seen = tool_results(model.requests[1].contents)[0].result
+    assert seen["matches"] == [] and "rewording the query will not change that" in seen["note"]
+
+
+async def test_a_withdrawn_tool_is_not_run_even_if_called(repo: SqliteRepository) -> None:
+    call = lambda n: ModelTurn(tool_calls=[ToolCall(f"c{n}", "search_commitments", {"query": f"alex {n}"})])  # noqa: E731
+    model = FakeModel([call(1), call(2), call(3), ModelTurn(text="done")])
+    await AgentLoop(ToolRegistry(repo, "T_TEST"), model).run(InboundMessage(text="follow up with Alex", system="s"))
+
+    third = tool_results(model.requests[3].contents)[2].result
+    assert "withdrawn" in third["error"]
+
+
+async def test_tools_that_find_something_stay_available(repo: SqliteRepository) -> None:
+    await _commitment(repo, "", "send Alex the deck")
+    calls = [ModelTurn(tool_calls=[ToolCall(f"c{n}", "search_commitments", {"query": "deck"})]) for n in range(3)]
+    model = FakeModel([*calls, ModelTurn(text="done")])
+    await AgentLoop(ToolRegistry(repo, "T_TEST"), model).run(InboundMessage(text="what about the deck?", system="s"))
+
+    assert all("search_commitments" in [spec.name for spec in request.tools] for request in model.requests)
+    assert all(result.result[0]["commitment"] == "send Alex the deck" for result in tool_results(model.requests[-1].contents))
