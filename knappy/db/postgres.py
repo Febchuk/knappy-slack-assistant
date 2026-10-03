@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import json
 from typing import Any
 
@@ -29,30 +30,36 @@ class _PgConnection:
     def __init__(self, raw: Any) -> None:
         self.raw = raw
         self._tx: Any = None
+        # asyncpg rejects overlapping operations on one connection; the agent runs tools concurrently.
+        self._busy = asyncio.Lock()
 
     async def execute(self, sql: str, params: tuple[Any, ...] = ()) -> _PgResult:
         converted, values = _placeholders(sql, params)
-        await self._begin()
-        if _returns_rows(converted):
-            rows = await self.raw.fetch(converted, *values)
-            return _PgResult(rows, len(rows))
-        status = await self.raw.execute(converted, *values)
-        return _PgResult([], _rowcount(status))
+        async with self._busy:
+            await self._begin()
+            if _returns_rows(converted):
+                rows = await self.raw.fetch(converted, *values)
+                return _PgResult(rows, len(rows))
+            status = await self.raw.execute(converted, *values)
+            return _PgResult([], _rowcount(status))
 
     async def executescript(self, script: str) -> None:
-        for statement in _statements(script):
-            await self._begin()
-            await self.raw.execute(statement)
+        async with self._busy:
+            for statement in _statements(script):
+                await self._begin()
+                await self.raw.execute(statement)
 
     async def commit(self) -> None:
-        if self._tx is not None:
-            await self._tx.commit()
-            self._tx = None
+        async with self._busy:
+            if self._tx is not None:
+                await self._tx.commit()
+                self._tx = None
 
     async def rollback(self) -> None:
-        if self._tx is not None:
-            await self._tx.rollback()
-            self._tx = None
+        async with self._busy:
+            if self._tx is not None:
+                await self._tx.rollback()
+                self._tx = None
 
     async def close(self) -> None:
         await self.rollback()

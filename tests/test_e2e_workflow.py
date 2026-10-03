@@ -46,7 +46,7 @@ async def test_note_recall_and_approval(repo: SqliteRepository) -> None:
         }
     )
     assert recalled is not None
-    assert recalled.text == "You promised to send Alex the revised budget by Thursday."
+    assert recalled.text == "Alex: send the revised budget by Thursday"
 
     staged = await runtime.handle_event(
         {
@@ -58,7 +58,7 @@ async def test_note_recall_and_approval(repo: SqliteRepository) -> None:
         }
     )
     assert staged is not None and staged.draft_id is not None
-    action_ids = [element["action_id"] for element in staged.blocks[2]["elements"]]
+    action_ids = [element["action_id"] for element in staged.blocks[-1]["elements"]]
     assert "btn_approve_action" in action_ids
     assert "btn_cancel_action" in action_ids
 

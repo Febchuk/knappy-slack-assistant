@@ -1,1 +1,1 @@
-"""Conversational fast-path router and bounded ReAct loop."""
+"""Model-driven agent loop, its tools, prompt assembly, and conversation sessions."""

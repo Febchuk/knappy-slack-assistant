@@ -18,27 +18,8 @@ from knappy.slack.app import create_app
 from knappy.slack.egress import build_say
 from knappy.slack.executor import SlackActionExecutor
 
-logger = logging.getLogger("knappy")
-FALLBACK_TEXT = "I hit an error answering that."
-
-
 def configure_logging() -> None:
     logging.basicConfig(level=logging.INFO, format="%(levelname)s %(name)s %(message)s")
-
-
-async def dispatch_event(runtime, client, event) -> None:
-    try:
-        await runtime.handle_event(event)
-    except Exception as exc:
-        logger.exception("handle_event failed: %s: %s", type(exc).__name__, exc)
-        channel = event.get("channel")
-        if channel and client is not None:
-            try:
-                await client.chat_postMessage(channel=channel, text=FALLBACK_TEXT)
-            except Exception:
-                logger.exception("fallback post failed")
-            else:
-                logger.info("deliver postMessage channel=%s", channel)
 
 
 async def _workspace_id(client) -> str:
@@ -77,7 +58,7 @@ async def _serve() -> None:
     async def process(event):
         runtime = holder.get("runtime")
         if runtime is not None:
-            await dispatch_event(runtime, app.client, event)
+            await runtime.handle_event(event)
 
     app = create_app(settings, processor=process)
     workspace_id = await _workspace_id(app.client)
@@ -96,7 +77,7 @@ async def _serve() -> None:
         say=say,
         sender=say,
         executor=SlackActionExecutor(app.client),
-        history=app.client,
+        slack=app.client,
     )
     holder["runtime"] = runtime
     register_actions(app, runtime)

@@ -155,7 +155,7 @@ class SqliteRepository:
         self,
         *,
         workspace_id: str,
-        contact_id: str,
+        contact_id: str | None,
         source_type: str,
         channel_id: str,
         raw_text: str,
@@ -316,7 +316,7 @@ class SqliteRepository:
         clauses = ["i.workspace_id = ?", "i.commitment IS NOT NULL"]
         params: list[Any] = [workspace_id]
         if owner_user_id is not None:
-            clauses.append("c.owner_user_id = ?")
+            clauses.append("i.owner_user_id = ?")
             params.append(owner_user_id)
         if status:
             clauses.append("i.status = ?")
@@ -328,7 +328,7 @@ class SqliteRepository:
             f"""
             SELECT i.*, c.name AS contact_name, c.company AS company
             FROM interactions i
-            JOIN contacts c ON c.id = i.contact_id
+            LEFT JOIN contacts c ON c.id = i.contact_id
             WHERE {' AND '.join(clauses)}
             """,
             tuple(params),
@@ -394,13 +394,13 @@ class SqliteRepository:
                 c.name AS contact_name,
                 c.company AS company,
                 c.slack_user_id,
-                c.owner_user_id,
+                i.owner_user_id,
                 i.id AS interaction_id,
                 i.commitment,
                 i.due_date,
                 i.summary
             FROM interactions i
-            JOIN contacts c ON i.contact_id = c.id
+            LEFT JOIN contacts c ON i.contact_id = c.id
             WHERE i.workspace_id = ?
               AND i.status = 'PENDING'
               AND i.commitment IS NOT NULL

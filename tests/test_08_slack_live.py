@@ -18,26 +18,7 @@ from knappy.heartbeat.triage import ProactiveAlertTriager
 from knappy.runtime import KnappyRuntime
 from knappy.slack.egress import build_say
 from knappy.slack.executor import SlackActionExecutor
-from fakes import HeuristicModel, heuristic_triage
-
-
-class FakeSlack:
-    def __init__(self, messages: list[dict] | None = None) -> None:
-        self.posts: list[dict] = []
-        self.ephemerals: list[dict] = []
-        self.messages = messages or []
-
-    async def chat_postMessage(self, **kwargs):
-        self.posts.append(kwargs)
-
-    async def chat_postEphemeral(self, **kwargs):
-        self.ephemerals.append(kwargs)
-
-    async def conversations_history(self, *, channel, limit=20):
-        return {"messages": self.messages}
-
-    async def users_conversations(self, **kwargs):
-        return {"channels": []}
+from fakes import FakeSlack, HeuristicModel, dm, heuristic_triage, mention
 
 
 def _runtime(repo: SqliteRepository, client: FakeSlack) -> KnappyRuntime:
@@ -48,7 +29,7 @@ def _runtime(repo: SqliteRepository, client: FakeSlack) -> KnappyRuntime:
         say=build_say(client),
         sender=build_say(client),
         executor=SlackActionExecutor(client),
-        history=client,
+        slack=client,
     )
 
 
@@ -56,46 +37,25 @@ def _runtime(repo: SqliteRepository, client: FakeSlack) -> KnappyRuntime:
 async def test_egress_note_answer_card_and_single_send(repo: SqliteRepository) -> None:
     client = FakeSlack()
     runtime = _runtime(repo, client)
-    note = await runtime.handle_event(
-        {
-            "text": "note: Met with Alex from Acme Corp, promised to send the revised budget by Thursday.",
-            "channel": "D1",
-            "channel_type": "im",
-            "user": "U1",
-            "ts": "1.0",
-        }
+    await runtime.handle_event(
+        dm("note: Met with Alex from Acme Corp, promised to send the revised budget by Thursday.", "1.0")
     )
-    assert note is not None
     assert len(client.posts) == 1
-    assert "Alex" in client.posts[0]["text"]
     assert "thread_ts" not in client.posts[0]
+    assert "Alex" in client.shown("100.1")["text"]
 
-    answer = await runtime.handle_event(
-        {
-            "text": "What did I promise to send Alex?",
-            "channel": "D1",
-            "channel_type": "im",
-            "user": "U1",
-            "ts": "2.0",
-        }
-    )
-    assert answer is not None
+    answer = await runtime.handle_event(dm("What did I promise to send Alex?", "2.0"))
     assert len(client.posts) == 2
-    assert answer.text == "You promised to send Alex the revised budget by Thursday."
+    assert answer.text == "Alex: send the revised budget by Thursday"
+    assert client.shown("100.2")["text"] == answer.text
 
-    staged = await runtime.handle_event(
-        {
-            "text": "Follow up with Alex",
-            "channel": "D1",
-            "channel_type": "im",
-            "user": "U1",
-            "ts": "3.0",
-        }
-    )
-    assert staged is not None and staged.blocks is not None
+    staged = await runtime.handle_event(dm("Follow up with Alex", "3.0"))
+    assert staged.draft_id is not None
     assert len(client.posts) == 3
-    action_ids = [element["action_id"] for element in client.posts[-1]["blocks"][2]["elements"]]
+    shown = client.shown("100.3")
+    action_ids = [element["action_id"] for element in shown["blocks"][-1]["elements"]]
     assert "btn_approve_action" in action_ids
+    assert "not sent" in shown["blocks"][0]["text"]["text"]
 
     approved = await runtime.gateway.approve(staged.draft_id, "U1")
     again = await runtime.gateway.approve(staged.draft_id, "U1")
@@ -106,59 +66,10 @@ async def test_egress_note_answer_card_and_single_send(repo: SqliteRepository) -
 
 
 @pytest.mark.asyncio
-async def test_mention_questions_are_not_small_talk(repo: SqliteRepository) -> None:
-    client = FakeSlack()
-    runtime = _runtime(repo, client)
-    await repo.record_interaction(
-        workspace_id="T_TEST",
-        contact_name="Alex",
-        source_type="NOTE_INGEST",
-        channel_id="D1",
-        raw_text="send the revised budget",
-        summary="send the revised budget",
-        commitment="send the revised budget by Thursday",
-        owner_user_id="U1",
-    )
-    who = await runtime.handle_event(
-        {
-            "type": "app_mention",
-            "text": "<@UBOT> who are you",
-            "channel": "C1",
-            "channel_type": "channel",
-            "user": "U1",
-            "ts": "8.0",
-        }
-    )
-    tasks = await runtime.handle_event(
-        {
-            "type": "app_mention",
-            "text": "<@UBOT> what do I have to do",
-            "channel": "C1",
-            "channel_type": "channel",
-            "user": "U1",
-            "ts": "8.1",
-        }
-    )
-    assert who is not None and "I'm Knappy" in who.text
-    assert "How can I help" not in who.text
-    assert tasks is not None and "revised budget" in tasks.text
-    assert "How can I help" not in tasks.text
-
-
-@pytest.mark.asyncio
 async def test_channel_answer_is_ephemeral(repo: SqliteRepository) -> None:
     client = FakeSlack()
     runtime = _runtime(repo, client)
-    await runtime.handle_event(
-        {
-            "type": "app_mention",
-            "text": "What did I promise to send Alex?",
-            "channel": "C1",
-            "channel_type": "channel",
-            "user": "U1",
-            "ts": "4.0",
-        }
-    )
+    await runtime.handle_event(mention("What did I promise to send Alex?", "4.0"))
     assert client.posts == []
     assert len(client.ephemerals) == 1
     assert client.ephemerals[0]["user"] == "U1"
@@ -197,15 +108,7 @@ async def test_history_answers_without_ingestion(repo: SqliteRepository) -> None
     client = FakeSlack(messages=[{"text": "ship the budget Friday", "user": "U2", "ts": "9.0"}])
     runtime = _runtime(repo, client)
     before = await repo.find_contacts("T_TEST")
-    reply = await runtime.handle_event(
-        {
-            "text": "What did we say about the budget?",
-            "channel": "D1",
-            "channel_type": "im",
-            "user": "U1",
-            "ts": "5.0",
-        }
-    )
+    reply = await runtime.handle_event(dm("What did we say about the budget?", "5.0"))
     after = await repo.find_contacts("T_TEST")
     assert reply is not None
     assert "ship the budget Friday" in reply.text
@@ -292,3 +195,5 @@ def test_dockerfile_starts_one_worker() -> None:
     manifest = Path("slack/manifest.yml").read_text()
     assert "channels:history" in manifest
     assert "groups:history" in manifest
+    assert "reactions:write" in manifest
+    assert "users:read" in manifest

@@ -1,0 +1,143 @@
+"""Model-driven tool loop (Spec 12 §3). The model writes every answer; tools never end the loop."""
+
+from __future__ import annotations
+
+import asyncio
+import logging
+import time
+from collections.abc import Awaitable, Callable
+from dataclasses import dataclass, field
+from typing import Any
+
+from pydantic import ValidationError
+
+from knappy.agent.prompt import FINAL_TURN_NOTE
+from knappy.agent.tools import TOOL_SPECS, TOOL_STATUS, StagedDraft, ToolRegistry
+from knappy.llm.types import Message, Model, ToolCall, ToolResult, UserMessage
+
+logger = logging.getLogger("knappy")
+
+StatusFn = Callable[[str], Awaitable[None]]
+EMPTY_ANSWER = "I couldn't put an answer together for that. Could you try asking again?"
+
+
+@dataclass(frozen=True)
+class InboundMessage:
+    text: str
+    system: str
+    history: list[Message] = field(default_factory=list)
+
+
+@dataclass
+class AgentReply:
+    text: str
+    blocks: list[dict[str, Any]] | None = None
+    draft_id: str | None = None
+
+
+class AgentLoop:
+    MAX_STEPS = 8
+    WALL_CLOCK_S = 60.0
+
+    def __init__(
+        self,
+        tools: ToolRegistry,
+        model: Model,
+        *,
+        max_steps: int = MAX_STEPS,
+        wall_clock_s: float = WALL_CLOCK_S,
+    ) -> None:
+        self.tools = tools
+        self.model = model
+        self.max_steps = max_steps
+        self.wall_clock_s = wall_clock_s
+
+    async def run(self, message: InboundMessage, on_status: StatusFn | None = None) -> AgentReply:
+        started = time.monotonic()
+        deadline = started + self.wall_clock_s
+        contents: list[Message] = [*message.history, UserMessage(message.text)]
+        drafts: list[StagedDraft] = []
+        specs = self.tools.specs()
+        steps = 0
+        for steps in range(1, self.max_steps + 1):
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                break
+            try:
+                turn = await asyncio.wait_for(
+                    self.model.generate(tier="agent", system=message.system, contents=contents, tools=specs),
+                    timeout=remaining,
+                )
+            except asyncio.TimeoutError:
+                break
+            if not turn.tool_calls:
+                logger.info("agent steps=%d stop=answer ms=%d", steps, _ms(started))
+                return _reply(turn.text, drafts)
+            contents.append(turn)
+            if on_status is not None:
+                await on_status(_status(turn.tool_calls))
+            results = await self._run_tools(turn.tool_calls, deadline)
+            drafts.extend(result.result for result in results if isinstance(result.result, StagedDraft))
+            contents.extend(_for_model(result) for result in results)
+        final = await self.model.generate(
+            tier="agent", system=f"{message.system}\n\n{FINAL_TURN_NOTE}", contents=contents, tools=None
+        )
+        logger.info("agent steps=%d stop=limit ms=%d", steps, _ms(started))
+        return _reply(final.text, drafts)
+
+    async def _run_tools(self, calls: list[ToolCall], deadline: float) -> list[ToolResult]:
+        tasks = [asyncio.ensure_future(self._run_tool(call)) for call in calls]
+        _done, pending = await asyncio.wait(tasks, timeout=max(deadline - time.monotonic(), 0))
+        for task in pending:
+            task.cancel()
+        return [
+            task.result() if task not in pending else ToolResult(call, {"error": "Timed out before this tool finished."})
+            for call, task in zip(calls, tasks)
+        ]
+
+    async def _run_tool(self, call: ToolCall) -> ToolResult:
+        started = time.monotonic()
+        arguments = _validated(call)
+        if isinstance(arguments, str):
+            logger.info("tool name=%s outcome=invalid", call.name)
+            return ToolResult(call, {"error": arguments})
+        try:
+            result = await self.tools.call(call.name, arguments)
+        except Exception as exc:
+            logger.warning("tool name=%s outcome=error ms=%d error=%s", call.name, _ms(started), type(exc).__name__)
+            return ToolResult(call, {"error": f"{type(exc).__name__}: {exc}"})
+        logger.info("tool name=%s outcome=ok ms=%d", call.name, _ms(started))
+        return ToolResult(call, result)
+
+
+def _validated(call: ToolCall) -> dict[str, Any] | str:
+    spec = TOOL_SPECS.get(call.name)
+    if spec is None:
+        return f"Unknown tool {call.name}"
+    try:
+        return spec.args_model.model_validate(call.args).model_dump()
+    except ValidationError as exc:
+        return f"Invalid arguments for {call.name}: {exc.errors(include_url=False)}"
+
+
+def _for_model(result: ToolResult) -> ToolResult:
+    if isinstance(result.result, StagedDraft):
+        return ToolResult(result.call, result.result.for_model())
+    return result
+
+
+def _status(calls: list[ToolCall]) -> str:
+    labels = dict.fromkeys(TOOL_STATUS.get(call.name, "working") for call in calls)
+    return ", ".join(labels)
+
+
+def _reply(text: str | None, drafts: list[StagedDraft]) -> AgentReply:
+    answer = (text or "").strip() or EMPTY_ANSWER
+    if not drafts:
+        return AgentReply(text=answer)
+    blocks = [block for draft in drafts for block in draft.blocks]
+    return AgentReply(text=answer, blocks=blocks, draft_id=drafts[-1].draft_id)
+
+
+def _ms(started: float) -> int:
+    return int((time.monotonic() - started) * 1000)

@@ -16,6 +16,8 @@ oauth_config:
       - app_mentions:read
       - channels:history
       - groups:history
+      - reactions:write
+      - users:read
 settings:
   socket_mode_enabled: true
   event_subscriptions:

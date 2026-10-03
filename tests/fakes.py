@@ -86,12 +86,16 @@ async def heuristic_triage(candidate: dict[str, Any]) -> dict[str, float | str]:
     return {"interrupt_probability": 0.2, "strategy": "suppress_low_value", "strategy_confidence": 0.8, "consequence_score": 0.2}
 
 
-def heuristic_turn(contents: list[Message]) -> ModelTurn:
-    if any(isinstance(item, ToolResult) for item in contents):
-        return ModelTurn(text="Done.")
-    user = next(item.text for item in contents if isinstance(item, UserMessage))
-    query = user.split("User:", 1)[-1].strip()
+def heuristic_turn(system: str, contents: list[Message]) -> ModelTurn:
+    """Keyword stand-in for the model: picks a tool, then answers from what the tools returned."""
+    last_user = max(index for index, item in enumerate(contents) if isinstance(item, UserMessage))
+    query = contents[last_user].text
+    results = [item for item in contents[last_user:] if isinstance(item, ToolResult)]
+    if results:
+        return ModelTurn(text=" | ".join(describe(result.result) for result in results))
     lower = query.lower()
+    if "what do i have" in lower:
+        return ModelTurn(text=system.split("Open commitments", 1)[1])
     if any(phrase in lower for phrase in ("said", "say about", "in slack", "slack message")):
         return tool_turn("search_slack_history", {"query": query})
     if "follow up" in lower:
@@ -110,7 +114,23 @@ def heuristic_turn(contents: list[Message]) -> ModelTurn:
                 "recipient_identifier": recipient,
             },
         )
-    return tool_turn("search_commitments", {"query": user})
+    if "promise" in lower or "commitment" in lower:
+        return tool_turn("search_commitments", {"query": query})
+    return ModelTurn(text=f"Model answer to: {query}")
+
+
+def describe(value: Any) -> str:
+    if isinstance(value, list):
+        return "; ".join(describe(item) for item in value) or "nothing found"
+    if isinstance(value, dict):
+        if "error" in value:
+            return f"error: {value['error']}"
+        if "draft_id" in value:
+            return str(value["status"])
+        if value.get("commitment"):
+            return f"{value.get('contact_name') or 'you'}: {value['commitment']}"
+        return str(value.get("text") or value.get("name") or value)
+    return str(value)
 
 
 def tool_turn(name: str, args: dict[str, Any]) -> ModelTurn:
@@ -135,7 +155,7 @@ class HeuristicModel:
         contents: list[Message],
         tools: list[ToolSpec] | None = None,
     ) -> ModelTurn:
-        return heuristic_turn(contents)
+        return heuristic_turn(system, contents)
 
     async def generate_structured(self, *, tier: Tier, system: str, text: str, schema: type[SchemaT]) -> SchemaT:
         result: BaseModel
@@ -146,3 +166,69 @@ class HeuristicModel:
         else:
             raise AssertionError(f"HeuristicModel has no answer for {schema.__name__}")
         return schema.model_validate(result.model_dump())
+
+
+class FakeSlack:
+    """Slack Web API double. Posts return a ts so placeholders can be updated."""
+
+    def __init__(
+        self,
+        *,
+        messages: list[dict] | None = None,
+        tz: str = "America/New_York",
+        ephemeral_error: BaseException | None = None,
+    ) -> None:
+        self.posts: list[dict] = []
+        self.updates: list[dict] = []
+        self.ephemerals: list[dict] = []
+        self.reactions: list[tuple[str, dict]] = []
+        self.messages = messages or []
+        self.tz = tz
+        self.ephemeral_error = ephemeral_error
+        self.users_info_calls = 0
+
+    async def chat_postMessage(self, **kwargs):
+        self.posts.append(kwargs)
+        return {"ok": True, "ts": f"100.{len(self.posts)}"}
+
+    async def chat_update(self, **kwargs):
+        self.updates.append(kwargs)
+        return {"ok": True}
+
+    async def chat_postEphemeral(self, **kwargs):
+        if self.ephemeral_error is not None:
+            raise self.ephemeral_error
+        self.ephemerals.append(kwargs)
+
+    async def reactions_add(self, **kwargs):
+        self.reactions.append(("add", kwargs))
+
+    async def reactions_remove(self, **kwargs):
+        self.reactions.append(("remove", kwargs))
+
+    async def users_info(self, *, user):
+        self.users_info_calls += 1
+        return {"ok": True, "user": {"id": user, "tz": self.tz}}
+
+    async def conversations_history(self, *, channel, limit=20):
+        return {"messages": self.messages}
+
+    async def users_conversations(self, **kwargs):
+        return {"channels": []}
+
+    def shown(self, ts: str) -> dict:
+        """The message at ts as the user now sees it: the post, overlaid by its latest update."""
+        post = next(post for index, post in enumerate(self.posts, 1) if f"100.{index}" == ts)
+        latest = [update for update in self.updates if update["ts"] == ts]
+        return {**post, **latest[-1]} if latest else post
+
+
+def dm(text: str, ts: str, *, user: str = "U1", channel: str = "D1", thread_ts: str | None = None) -> dict:
+    event = {"text": text, "channel": channel, "channel_type": "im", "user": user, "ts": ts}
+    if thread_ts:
+        event["thread_ts"] = thread_ts
+    return event
+
+
+def mention(text: str, ts: str, *, user: str = "U1", channel: str = "C1") -> dict:
+    return {"type": "app_mention", "text": f"<@UBOT> {text}", "channel": channel, "user": user, "ts": ts}

@@ -1,18 +1,30 @@
-"""Deterministic tools available to the fast path and the ReAct loop."""
+"""Tools the agent loop can call. Reads run freely; outbound messages are only staged."""
 
 from __future__ import annotations
 
 from contextvars import ContextVar
+from dataclasses import dataclass
+from datetime import datetime
 from typing import Any, Literal
 
-from pydantic import BaseModel, Field
+from pydantic import AwareDatetime, BaseModel, Field
 
-from knappy.db.repository import SqliteRepository
+from knappy.db.repository import SqliteRepository, format_ts
 from knappy.hitl.blocks import approval_blocks
 from knappy.ingestion.embed import generate_embedding
 from knappy.llm.types import ToolSpec
 
 current_owner: ContextVar[str | None] = ContextVar("knappy_owner", default=None)
+
+
+@dataclass(frozen=True)
+class SlackThread:
+    channel_id: str
+    thread_ts: str | None
+
+
+# Where the current message came from. Tools read it instead of trusting model-supplied ids.
+current_thread: ContextVar[SlackThread | None] = ContextVar("knappy_thread", default=None)
 
 _HISTORY_STOP = frozenset(
     {"what", "did", "we", "you", "say", "said", "about", "the", "slack", "channel", "message", "messages"}
@@ -46,8 +58,23 @@ class StageOutboundActionArgs(BaseModel):
 
 class SearchSlackHistoryArgs(BaseModel):
     query: str
-    channel_id: str | None = None
+    channel_id: str | None = Field(default=None, description="Channel to search first; defaults to the current one")
     limit: int = Field(default=20, ge=1, le=50)
+
+
+class AddCommitmentArgs(BaseModel):
+    commitment: str = Field(..., description="What the user will do, as a short imperative: 'send Alex the deck'")
+    person: str | None = Field(default=None, description="Who it is for or about, if anyone")
+    due: AwareDatetime | None = Field(
+        default=None, description="When it is due, ISO 8601 with the user's UTC offset, e.g. 2026-10-09T17:00:00-04:00"
+    )
+
+
+class CompleteCommitmentArgs(BaseModel):
+    commitment_id: str = Field(..., description="Id from the open commitments list or search_commitments")
+    status: Literal["FULFILLED", "CANCELLED"] = Field(
+        default="FULFILLED", description="FULFILLED when done, CANCELLED when no longer needed"
+    )
 
 
 TOOL_SPECS: dict[str, ToolSpec] = {
@@ -62,8 +89,32 @@ TOOL_SPECS: dict[str, ToolSpec] = {
             StageOutboundActionArgs,
         ),
         ToolSpec("search_slack_history", "Search recent messages in Slack channels Knappy was invited to.", SearchSlackHistoryArgs),
+        ToolSpec("add_commitment", "Record something the user will do, or asked to be reminded about.", AddCommitmentArgs),
+        ToolSpec("complete_commitment", "Mark one of the user's commitments done or cancelled.", CompleteCommitmentArgs),
     )
 }
+
+TOOL_STATUS: dict[str, str] = {
+    "search_commitments": "checking your commitments",
+    "query_relationship_graph": "looking up contacts",
+    "get_meeting_context": "reading your notes",
+    "stage_outbound_action": "drafting a message",
+    "search_slack_history": "searching Slack",
+    "add_commitment": "saving that",
+    "complete_commitment": "updating your commitments",
+}
+
+
+@dataclass(frozen=True)
+class StagedDraft:
+    """A draft awaiting approval. The card goes to Slack; the model only sees the summary."""
+
+    draft_id: str
+    recipient: str
+    blocks: list[dict[str, Any]]
+
+    def for_model(self) -> dict[str, str]:
+        return {"draft_id": self.draft_id, "status": f"Drafted for {self.recipient}. Waiting for the user's approval; not sent."}
 
 
 class ToolRegistry:
@@ -130,11 +181,8 @@ class ToolRegistry:
         summary: str,
         staged_content: str,
         recipient_identifier: str | None = None,
-        *,
-        user_id: str,
-        channel_id: str,
-        thread_ts: str | None = None,
-    ) -> dict[str, Any]:
+    ) -> StagedDraft:
+        thread = _thread()
         staged = {
             "action_type": action_type,
             "recipient_identifier": recipient_identifier or recipient,
@@ -145,13 +193,51 @@ class ToolRegistry:
         }
         draft_id = await self.repo.create_draft(
             workspace_id=self.workspace_id,
-            user_id=user_id,
-            channel_id=channel_id,
-            thread_ts=thread_ts,
+            user_id=self._owner() or "",
+            channel_id=thread.channel_id,
+            thread_ts=thread.thread_ts,
             action_type=action_type,
             payload=staged,
         )
-        return {"draft_id": draft_id, "blocks": approval_blocks(draft_id, recipient, staged["staged_content"])}
+        return StagedDraft(draft_id, recipient, approval_blocks(draft_id, recipient, staged["staged_content"]))
+
+    async def add_commitment(
+        self,
+        commitment: str,
+        person: str | None = None,
+        due: datetime | None = None,
+    ) -> dict[str, Any]:
+        thread = _thread()
+        owner = self._owner() or ""
+        fields = {
+            "workspace_id": self.workspace_id,
+            "source_type": "DIRECT_DM" if thread.channel_id.startswith("D") else "APP_MENTION",
+            "channel_id": thread.channel_id,
+            "thread_ts": thread.thread_ts,
+            "raw_text": commitment,
+            "summary": commitment,
+            "commitment": commitment,
+            "due_date": format_ts(due) if due else None,
+            "embedding": generate_embedding(commitment),
+            "owner_user_id": owner,
+        }
+        if person:
+            _contact_id, interaction_id = await self.repo.record_interaction(contact_name=person, **fields)
+        else:
+            interaction_id = await self.repo.insert_interaction(contact_id=None, **fields)
+        return {"id": interaction_id, "commitment": commitment, "person": person, "due_utc": fields["due_date"]}
+
+    async def complete_commitment(self, commitment_id: str, status: str = "FULFILLED") -> dict[str, Any]:
+        row = await self.repo.get_interaction(commitment_id)
+        if (
+            row is None
+            or row["workspace_id"] != self.workspace_id
+            or row["owner_user_id"] != (self._owner() or "")
+            or not row.get("commitment")
+        ):
+            return {"error": f"No commitment with id {commitment_id}"}
+        await self.repo.update_interaction_status(commitment_id, status)
+        return {"id": commitment_id, "commitment": row["commitment"], "status": status}
 
     async def search_slack_history(
         self,
@@ -162,9 +248,9 @@ class ToolRegistry:
         client = self.history
         if client is None:
             return []
-        channels: list[str] = []
-        if channel_id:
-            channels.append(channel_id)
+        thread = current_thread.get()
+        first = channel_id or (thread.channel_id if thread else None)
+        channels: list[str] = [first] if first else []
         try:
             listed = await client.users_conversations(
                 types="public_channel,private_channel,im",
@@ -212,39 +298,8 @@ class ToolRegistry:
         return await method(**arguments)
 
 
-def format_commitment_results(results: list[dict[str, Any]], query: str) -> str:
-    if not results:
-        return f"I couldn't find any commitments regarding {query}."
-    parts: list[str] = []
-    for row in results:
-        name = row.get("contact_name") or "them"
-        commitment = (row.get("commitment") or "").rstrip(".")
-        if commitment.lower().startswith("send "):
-            parts.append(f"You promised to send {name} {commitment[5:]}.")
-        else:
-            parts.append(f"{name} has a pending commitment: {commitment}.")
-    return " ".join(parts)
-
-
-def format_contact_results(results: list[dict[str, Any]], query: str) -> str:
-    if not results:
-        return f"I couldn't find any contacts regarding {query}."
-    parts = []
-    for row in results:
-        company = f" at {row['company']}" if row.get("company") else ""
-        parts.append(f"{row.get('name') or row.get('contact_name')}{company}")
-    return "I found " + "; ".join(parts) + "."
-
-
-def format_history_results(results: list[dict[str, Any]], query: str) -> str:
-    if not results:
-        return f"I couldn't find recent Slack messages regarding {query}."
-    lines = [row["text"] for row in results if row.get("text")]
-    return "Recent Slack messages: " + " | ".join(lines)
-
-
-def format_meeting_results(results: list[dict[str, Any]], query: str) -> str:
-    if not results:
-        return f"I couldn't find any meeting notes regarding {query}."
-    summaries = [row.get("summary") or "" for row in results if row.get("summary")]
-    return "Recent notes: " + " | ".join(summaries)
+def _thread() -> SlackThread:
+    thread = current_thread.get()
+    if thread is None:
+        raise RuntimeError("No Slack thread in scope for this tool call")
+    return thread

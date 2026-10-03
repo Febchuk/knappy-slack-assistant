@@ -65,8 +65,8 @@ class HeartbeatEngine:
         counts["scanned"] = len(candidates)
         if not candidates and not deliver_digest:
             return counts
-        queued_contacts = {
-            item["contact_id"]
+        queued_keys = {
+            _briefing_key(item)
             for item in await self.repo.list_queued_briefings(self.workspace_id)
         }
         for candidate in candidates:
@@ -77,7 +77,7 @@ class HeartbeatEngine:
                 await self._dispatch_immediate(candidate)
                 counts["immediate"] += 1
             elif action == "QUEUE_MORNING_DIGEST":
-                if candidate.get("contact_id") not in queued_contacts:
+                if _briefing_key(candidate) not in queued_keys:
                     owner = candidate.get("owner_user_id") or self.user_id
                     await self.repo.enqueue_briefing(
                         workspace_id=self.workspace_id,
@@ -88,7 +88,7 @@ class HeartbeatEngine:
                         contact_id=candidate.get("contact_id"),
                         owner_user_id=owner,
                     )
-                    queued_contacts.add(candidate.get("contact_id"))
+                    queued_keys.add(_briefing_key(candidate))
                 counts["queued"] += 1
             else:
                 counts["suppressed"] += 1
@@ -133,24 +133,27 @@ class HeartbeatEngine:
     async def _dispatch_immediate(self, candidate: dict[str, Any]) -> None:
         summary = await self.synthesize(candidate)
         owner = candidate.get("owner_user_id") or self.user_id
-        draft_id = await self.repo.create_draft(
-            workspace_id=self.workspace_id,
-            user_id=owner,
-            channel_id=owner,
-            action_type="SEND_SLACK_DM",
-            payload={
-                "action_type": "SEND_SLACK_DM",
-                "recipient_identifier": candidate.get("slack_user_id") or candidate["contact_name"],
-                "recipient_name": candidate["contact_name"],
-                "preview_summary": summary,
-                "staged_content": summary,
-                "metadata": {},
-            },
-        )
+        contact_name = candidate.get("contact_name")
+        draft_id = None
+        if contact_name:
+            draft_id = await self.repo.create_draft(
+                workspace_id=self.workspace_id,
+                user_id=owner,
+                channel_id=owner,
+                action_type="SEND_SLACK_DM",
+                payload={
+                    "action_type": "SEND_SLACK_DM",
+                    "recipient_identifier": candidate.get("slack_user_id") or contact_name,
+                    "recipient_name": contact_name,
+                    "preview_summary": summary,
+                    "staged_content": summary,
+                    "metadata": {},
+                },
+            )
         blocks = proactive_blocks(
             draft_id,
             candidate.get("interaction_id") or "",
-            candidate["contact_name"],
+            contact_name,
             candidate.get("commitment") or summary,
         )
         if self.sender is not None:
@@ -173,6 +176,11 @@ class HeartbeatEngine:
             "days_since_last_contact": days,
             "summary": f"No contact with {row['contact_name']} in {days} days",
         }
+
+
+def _briefing_key(item: dict[str, Any]) -> str | None:
+    """One briefing per contact; commitments without a contact are each their own item."""
+    return item.get("contact_id") or item.get("interaction_id")
 
 
 async def _async_default(candidate: dict[str, Any]) -> str:

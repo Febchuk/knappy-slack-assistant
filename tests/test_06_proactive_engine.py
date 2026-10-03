@@ -9,15 +9,15 @@ import pytest
 
 from knappy.config import ConfigError
 
-from knappy.agent.memory import ThreadMemory
-from knappy.agent.react import ReActAgent
-from knappy.agent.tools import ToolRegistry
+from knappy.agent.session import Turn
 from knappy.db.repository import SqliteRepository, format_ts, utc_now
 from knappy.heartbeat.engine import HeartbeatEngine
 from knappy.heartbeat.triage import ProactiveAlertTriager
 from knappy.llm.fake import FakeModel
-from knappy.llm.types import ModelTurn
+from knappy.llm.types import ModelTurn, UserMessage
+from knappy.runtime import KnappyRuntime
 from knappy.scheduler import main as scheduler_main
+from fakes import dm
 
 
 def _decision(strategy: str, interrupt: float, confidence: float = 0.9, consequence: float = 1.0):
@@ -145,26 +145,61 @@ async def test_proact_05_mark_done(repo: SqliteRepository) -> None:
 
 
 @pytest.mark.asyncio
-async def test_proact_06_thread_handoff(repo: SqliteRepository) -> None:
-    memory = ThreadMemory()
-    memory.append("thread-1", "assistant", "You promised Alex: send the revised budget")
-    seen: list[str] = []
-
-    async def complete(request):
-        seen.append(request.contents[-1].text)
-        return ModelTurn(text="I updated the draft.")
-
-    agent = ReActAgent(ToolRegistry(repo, "T_TEST"), FakeModel(complete), memory)
-    reply = await agent.run(
-        "Actually, tell her I will send it Monday morning.",
-        {"thread_ts": "thread-1", "user_id": "U1", "channel_id": "D1"},
+async def test_contactless_commitment_reminds_owner_without_a_draft(repo: SqliteRepository) -> None:
+    await repo.insert_interaction(
+        workspace_id="T_TEST",
+        contact_id=None,
+        source_type="DIRECT_DM",
+        channel_id="D1",
+        raw_text="renew passport",
+        summary="renew passport",
+        commitment="renew passport",
+        due_date=format_ts(utc_now() + timedelta(hours=2)),
+        owner_user_id="U1",
     )
-    assert "send the revised budget" in seen[0]
+    sent: list[dict] = []
+
+    async def sender(**kwargs):
+        sent.append(kwargs)
+
+    engine = HeartbeatEngine(
+        repo,
+        ProactiveAlertTriager(_decision("immediate_dm", 0.91)),
+        workspace_id="T_TEST",
+        user_id="U_FALLBACK",
+        sender=sender,
+    )
+    counts = await engine.run_tick()
+    drafts = await (await repo.connection.execute("SELECT COUNT(*) AS n FROM action_drafts")).fetchone()
+    assert counts["immediate"] == 1
+    assert sent[0]["channel"] == "U1"
+    assert [element["action_id"] for element in sent[0]["blocks"][1]["elements"]] == [
+        "btn_resolve_commitment",
+        "btn_snooze_commitment",
+    ]
+    assert drafts["n"] == 0
+
+
+@pytest.mark.asyncio
+async def test_proact_06_thread_handoff(repo: SqliteRepository) -> None:
+    model = FakeModel([ModelTurn(text="I updated the draft.")])
+    runtime = KnappyRuntime(repo, workspace_id="T_TEST", model=model)
+    await runtime.conversations.append(
+        "U1", "thread:D1:thread-1", Turn("assistant", "You promised Alex: send the revised budget")
+    )
+    reply = await runtime.handle_event(
+        dm("Actually, tell her I will send it Monday morning.", "2.0", thread_ts="thread-1")
+    )
+    assert model.requests[0].contents == [
+        ModelTurn(text="You promised Alex: send the revised budget"),
+        UserMessage("Actually, tell her I will send it Monday morning."),
+    ]
     assert reply.text == "I updated the draft."
 
 
 def test_scheduler_run_now_requires_gemini_key(tmp_path, monkeypatch) -> None:
     monkeypatch.delenv("GEMINI_API_KEY", raising=False)
+    monkeypatch.setattr("knappy.scheduler.load_dotenv", lambda: None)
     with pytest.raises(ConfigError, match="GEMINI_API_KEY"):
         scheduler_main(["--run-now", "--database", f"sqlite:///{tmp_path / 'knappy.db'}"])
 

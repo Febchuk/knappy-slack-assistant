@@ -107,28 +107,32 @@ def edit_modal(draft_id: str, staged_content: str) -> dict:
     }
 
 
-def proactive_blocks(draft_id: str, interaction_id: str, contact_name: str, commitment_text: str) -> list[dict]:
+def proactive_blocks(
+    draft_id: str | None, interaction_id: str, contact_name: str | None, commitment_text: str
+) -> list[dict]:
+    """Due-commitment card. Without a contact there is no one to message, so no send button."""
+    headline = f"You promised *{contact_name}*:" if contact_name else "You noted:"
+    send = [
+        {
+            "type": "button",
+            "text": {"type": "plain_text", "text": "Send Slack DM"},
+            "style": "primary",
+            "action_id": "btn_approve_proactive_action",
+            "value": draft_id,
+        }
+    ] if draft_id else []
     return [
         {
             "type": "section",
             "text": {
                 "type": "mrkdwn",
-                "text": (
-                    ":alarm_clock: *Commitment Due Today*\n"
-                    f"You promised *{contact_name}*:\n> \"{commitment_text}\""
-                ),
+                "text": f":alarm_clock: *Commitment Due Today*\n{headline}\n> \"{commitment_text}\"",
             },
         },
         {
             "type": "actions",
             "elements": [
-                {
-                    "type": "button",
-                    "text": {"type": "plain_text", "text": "Send Slack DM"},
-                    "style": "primary",
-                    "action_id": "btn_approve_proactive_action",
-                    "value": draft_id,
-                },
+                *send,
                 {
                     "type": "button",
                     "text": {"type": "plain_text", "text": "Mark as Done"},

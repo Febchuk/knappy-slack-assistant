@@ -1,4 +1,4 @@
-"""Slack action wiring, event dedupe, and the remaining router branches."""
+"""Slack action wiring, event dedupe, and production wiring."""
 
 from __future__ import annotations
 
@@ -6,9 +6,6 @@ from datetime import timedelta
 
 import pytest
 
-from knappy.llm.fake import FakeModel
-from knappy.llm.types import ModelTurn
-from knappy.agent.router import IntentClassification
 from knappy.config import Settings
 from knappy.db.repository import SqliteRepository, format_ts, utc_now
 from knappy.hitl.gateway import ApprovalGateway
@@ -188,47 +185,6 @@ async def test_duplicate_and_mention_events() -> None:
 
 
 @pytest.mark.asyncio
-async def test_router_branches(repo: SqliteRepository) -> None:
-    from knappy.agent.memory import ThreadMemory
-    from knappy.agent.react import ReActAgent
-    from knappy.agent.router import SystemOneRouter
-    from knappy.agent.tools import ToolRegistry
-
-    await repo.upsert_contact("T_TEST", "Alex", company="Acme")
-    tools = ToolRegistry(repo, "T_TEST")
-    calls = {"n": 0}
-
-    async def complete(request):
-        calls["n"] += 1
-        return ModelTurn(text="react")
-
-    agent = ReActAgent(tools, FakeModel(complete), ThreadMemory())
-    intents = [
-        IntentClassification("query_contact", 0.95, 0.2, 0.0),
-        IntentClassification("meeting_context", 0.95, 0.2, 0.0),
-        IntentClassification("chitchat", 0.95, 0.1, 0.0),
-    ]
-
-    async def classify(query, context):
-        if query == "boom":
-            raise RuntimeError("down")
-        return intents.pop(0)
-
-    router = SystemOneRouter(tools, agent, classify)
-    contact = await router.route_and_execute("Alex", {"thread_ts": "t"})
-    notes = await router.route_and_execute("meeting with Alex", {"thread_ts": "t"})
-    chat = await router.route_and_execute("hi", {"thread_ts": "t"})
-    fallback = await router.route_and_execute("boom", {"thread_ts": "t", "user_id": "U", "channel_id": "D"})
-    assert "Alex" in contact.text
-    assert "couldn't find any meeting notes" in notes.text
-    assert "How can I help" in chat.text
-    assert fallback.text == "react"
-    assert calls["n"] == 1
-    empty = await tools.query_relationship_graph(topic="investors")
-    assert isinstance(empty, list)
-
-
-@pytest.mark.asyncio
 async def test_gateway_edit_and_missing(repo: SqliteRepository) -> None:
     gateway = ApprovalGateway(repo, Recorder())
     missing = await gateway.approve("missing", "U1")
@@ -341,8 +297,9 @@ async def test_socket_mode_serve(monkeypatch: pytest.MonkeyPatch, tmp_path) -> N
     monkeypatch.setattr(main_module, "KnappyRuntime", capture)
     await _serve()
     runtime = built[0]
-    assert isinstance(runtime.agent.model, GeminiClient)
-    assert runtime.pipeline.extractor.model is runtime.agent.model
+    assert isinstance(runtime.loop.model, GeminiClient)
+    assert runtime.pipeline.extractor.model is runtime.loop.model
+    assert runtime.tools.history is runtime.users.client is not None
     assert runtime.daily_budget_usd == 1.0
     settings = Settings.from_env()
     assert settings.database_url.endswith("knappy.db")

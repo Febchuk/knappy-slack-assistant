@@ -8,9 +8,8 @@ import pytest
 from google.genai import errors, types
 from pydantic import BaseModel, ValidationError
 
-from fakes import tool_results
-from knappy.agent.memory import ThreadMemory
-from knappy.agent.react import ReActAgent
+from fakes import FakeSlack, dm, tool_results
+from knappy.agent.loop import AgentLoop, InboundMessage
 from knappy.agent.tools import ToolRegistry, current_owner
 from knappy.db.repository import SqliteRepository
 from knappy.heartbeat.triage import TriageJudgment, model_triage
@@ -19,6 +18,7 @@ from knappy.llm.client import GeminiClient, ModelIds, to_contents
 from knappy.llm.fake import FakeModel
 from knappy.llm.types import ModelTurn, ToolCall, ToolResult, UserMessage
 from knappy.runtime import BUDGET_TEXT, KnappyRuntime, usage_recorder
+from knappy.slack.egress import build_say
 
 IDS = ModelIds(agent="gemini-3-flash-preview", light="gemini-3.1-flash-lite-preview")
 
@@ -146,7 +146,7 @@ async def test_llm_03_parallel_tool_calls_all_run_and_return(repo: SqliteReposit
         ModelTurn(text="Alex works at Acme."),
     ]
     model = FakeModel(list(turns))
-    reply = await ReActAgent(ToolRegistry(repo, "T_TEST"), model, ThreadMemory()).run("who is Alex?", {"thread_ts": "t"})
+    reply = await AgentLoop(ToolRegistry(repo, "T_TEST"), model).run(InboundMessage(text="who is Alex?", system="s"))
     assert reply.text == "Alex works at Acme."
     results = tool_results(model.requests[1].contents)
     assert [result.call.name for result in results] == ["query_relationship_graph", "get_meeting_context"]
@@ -171,7 +171,7 @@ async def test_llm_04_invalid_args_do_not_run_the_tool(repo: SqliteRepository) -
         ]),
         ModelTurn(text="I need a name."),
     ])
-    reply = await ReActAgent(registry, model, ThreadMemory()).run("notes?", {"thread_ts": "t"})
+    reply = await AgentLoop(registry, model).run(InboundMessage(text="notes?", system="s"))
     assert ran == []
     errors_sent = [result.result["error"] for result in tool_results(model.requests[1].contents)]
     assert "contact_name" in errors_sent[0] and "limit" in errors_sent[0]
@@ -180,36 +180,17 @@ async def test_llm_04_invalid_args_do_not_run_the_tool(repo: SqliteRepository) -
 
 
 @pytest.mark.asyncio
-async def test_llm_04_model_cannot_spoof_approval_context(repo: SqliteRepository) -> None:
-    model = FakeModel([
-        ModelTurn(tool_calls=[ToolCall("1", "stage_outbound_action", {
-            "action_type": "SEND_SLACK_DM", "recipient": "Alex", "summary": "s",
-            "staged_content": "hi", "user_id": "U_ATTACKER",
-        })]),
-    ])
-    reply = await ReActAgent(ToolRegistry(repo, "T_TEST"), model, ThreadMemory()).run(
-        "follow up", {"thread_ts": "t", "user_id": "U1", "channel_id": "D1"}
-    )
-    draft = await repo.get_draft(reply.draft_id)
-    assert draft["user_id"] == "U1"
-
-
-@pytest.mark.asyncio
 async def test_llm_05_budget_exhausted_skips_the_model(repo: SqliteRepository) -> None:
     await repo.add_model_usage("T_TEST", "U1", input_tokens=1, output_tokens=1, cost_usd=1.5)
-    posts = []
-
-    async def say(**kwargs):
-        posts.append(kwargs)
-
+    client = FakeSlack()
     model = FakeModel()
-    runtime = KnappyRuntime(repo, workspace_id="T_TEST", model=model, daily_budget_usd=1.0, say=say)
-    reply = await runtime.handle_event({"user": "U1", "channel": "D1", "channel_type": "im", "text": "hello"})
+    runtime = KnappyRuntime(repo, workspace_id="T_TEST", model=model, daily_budget_usd=1.0, say=build_say(client))
+    reply = await runtime.handle_event(dm("hello", "1.0"))
     assert reply.text == BUDGET_TEXT
     assert model.requests == [] and model.structured_requests == []
-    assert posts[0]["text"] == BUDGET_TEXT
+    assert client.shown("100.1")["text"] == BUDGET_TEXT
 
-    other = await runtime.handle_event({"user": "U2", "channel": "D2", "channel_type": "im", "text": "hello"})
+    other = await runtime.handle_event(dm("hello", "2.0", user="U2", channel="D2"))
     assert other.text != BUDGET_TEXT
 
 
