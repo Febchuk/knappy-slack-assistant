@@ -160,10 +160,13 @@ class HeuristicModel:
         system: str,
         contents: list[Message],
         tools: list[ToolSpec] | None = None,
+        timeout_s: float | None = None,
     ) -> ModelTurn:
         return heuristic_turn(system, contents)
 
-    async def generate_structured(self, *, tier: Tier, system: str, text: str, schema: type[SchemaT]) -> SchemaT:
+    async def generate_structured(
+        self, *, tier: Tier, system: str, text: str, schema: type[SchemaT], timeout_s: float | None = None
+    ) -> SchemaT:
         result: BaseModel
         if schema is ExtractedInteraction:
             result = heuristic_extract(text, self.now)

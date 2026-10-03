@@ -65,6 +65,7 @@ class Model(Protocol):
         system: str,
         contents: list[Message],
         tools: list[ToolSpec] | None = None,
+        timeout_s: float | None = None,
     ) -> ModelTurn: ...
 
     async def generate_structured(
@@ -74,4 +75,5 @@ class Model(Protocol):
         system: str,
         text: str,
         schema: type[SchemaT],
+        timeout_s: float | None = None,
     ) -> SchemaT: ...

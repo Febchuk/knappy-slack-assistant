@@ -61,11 +61,12 @@ class GeminiClient:
         system: str,
         contents: list[Message],
         tools: list[ToolSpec] | None = None,
+        timeout_s: float | None = None,
     ) -> ModelTurn:
         config = types.GenerateContentConfig(system_instruction=system)
         if tools:
             config.tools = [types.Tool(function_declarations=[_declaration(spec) for spec in tools])]
-        response, usage = await self._call(tier, to_contents(contents), config)
+        response, usage = await self._call(tier, to_contents(contents), config, timeout_s)
         return parse_turn(response, usage)
 
     async def generate_structured(
@@ -75,6 +76,7 @@ class GeminiClient:
         system: str,
         text: str,
         schema: type[SchemaT],
+        timeout_s: float | None = None,
     ) -> SchemaT:
         config = types.GenerateContentConfig(
             system_instruction=system,
@@ -84,7 +86,7 @@ class GeminiClient:
         contents = [types.Content(role="user", parts=[types.Part.from_text(text=text)])]
         last_error: ValidationError | None = None
         for _ in range(2):
-            response, _usage = await self._call(tier, contents, config)
+            response, _usage = await self._call(tier, contents, config, timeout_s)
             try:
                 return schema.model_validate_json(response.text or "")
             except ValidationError as exc:
@@ -93,7 +95,7 @@ class GeminiClient:
         raise last_error
 
     async def _call(
-        self, tier: Tier, contents: list[types.Content], config: types.GenerateContentConfig
+        self, tier: Tier, contents: list[types.Content], config: types.GenerateContentConfig, timeout_s: float | None
     ) -> tuple[Any, Usage]:
         model = self.models.for_tier(tier)
         started = time.perf_counter()
@@ -101,7 +103,7 @@ class GeminiClient:
             try:
                 response = await asyncio.wait_for(
                     self._sdk.aio.models.generate_content(model=model, contents=contents, config=config),
-                    timeout=TIMEOUTS_S[tier],
+                    timeout=timeout_s or TIMEOUTS_S[tier],
                 )
                 break
             except errors.APIError as exc:

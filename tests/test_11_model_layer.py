@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import json
 
 import pytest
@@ -116,6 +117,27 @@ async def test_client_retries_rate_limits_but_not_bad_requests() -> None:
     with pytest.raises(errors.APIError):
         await GeminiClient("k", IDS, sdk=sdk).generate(tier="agent", system="s", contents=[UserMessage("x")])
     assert len(sdk.calls) == 1
+
+
+class SlowSdk(FakeSdk):
+    async def generate_content(self, *, model, contents, config):
+        await asyncio.sleep(0.05)
+        return await super().generate_content(model=model, contents=contents, config=config)
+
+
+@pytest.mark.asyncio
+async def test_callers_can_extend_the_tier_timeout(monkeypatch) -> None:
+    monkeypatch.setitem(client_module.TIMEOUTS_S, "light", 0.01)
+    ok = '{"choice": "a", "score": 0.5}'
+    sdk = SlowSdk([_response([], text_json=ok)])
+    with pytest.raises(asyncio.TimeoutError):
+        await GeminiClient("k", IDS, sdk=sdk).generate_structured(tier="light", system="s", text="t", schema=Pick)
+
+    sdk = SlowSdk([_response([], text_json=ok)])
+    result = await GeminiClient("k", IDS, sdk=sdk).generate_structured(
+        tier="light", system="s", text="t", schema=Pick, timeout_s=1.0
+    )
+    assert result.choice == "a"
 
 
 class Pick(BaseModel):

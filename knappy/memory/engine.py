@@ -44,6 +44,8 @@ from knappy.memory.types import (
 logger = logging.getLogger("knappy")
 
 FORGETTABLE = [*get_args(SavableType), "document"]
+# Reconcile batches and nightly episodes run off the reply path and carry large payloads.
+BACKGROUND_TIMEOUT_S = 90.0
 _RECORD_ID = re.compile(r"^[a-z_]+:[a-z0-9][a-z0-9-]*$")
 
 
@@ -335,7 +337,8 @@ class MemoryEngine:
             ],
         }
         result = await self.model.generate_structured(
-            tier="light", system=RECONCILE_PROMPT, text=json.dumps(payload, default=str), schema=ReconcileResult
+            tier="light", system=RECONCILE_PROMPT, text=json.dumps(payload, default=str), schema=ReconcileResult,
+            timeout_s=BACKGROUND_TIMEOUT_S,
         )
         gated = admit(result, {turn.id for turn in visible}, self.config.admission_threshold)
         report.dropped, report.discarded = gated.dropped, list(result.discarded)
@@ -517,7 +520,9 @@ class MemoryEngine:
             "events": [{"kind": e["kind"], "summary": e["summary"], "when": str(e["occurred_at"])} for e in events],
             "open_commitments": [row["commitment"] for row in await self.store.open_commitments(owner)],
         })
-        draft = await self.model.generate_structured(tier="light", system=DAILY_EPISODE_PROMPT, text=text, schema=EpisodeDraft)
+        draft = await self.model.generate_structured(
+            tier="light", system=DAILY_EPISODE_PROMPT, text=text, schema=EpisodeDraft, timeout_s=BACKGROUND_TIMEOUT_S
+        )
         await self._save_episode(
             owner, f"episode_daily:{day.isoformat()}", "episode_daily", f"Day of {day.isoformat()}", draft.body,
             [("event", event["id"]) for event in events], now,
@@ -532,7 +537,9 @@ class MemoryEngine:
         if not dailies:
             return
         text = "\n\n".join(f"{record['title']}:\n{record['body']}" for record in dailies)
-        draft = await self.model.generate_structured(tier="light", system=WEEKLY_EPISODE_PROMPT, text=text, schema=EpisodeDraft)
+        draft = await self.model.generate_structured(
+            tier="light", system=WEEKLY_EPISODE_PROMPT, text=text, schema=EpisodeDraft, timeout_s=BACKGROUND_TIMEOUT_S
+        )
         week = (monday - timedelta(days=7)).isocalendar()
         await self._save_episode(
             owner, f"episode_weekly:{week.year}-w{week.week:02d}", "episode_weekly",

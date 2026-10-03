@@ -32,6 +32,7 @@ class FakeModel:
         self._structured = structured
         self.requests: list[GenerateRequest] = []
         self.structured_requests: list[tuple[type[BaseModel], str, str]] = []
+        self.structured_timeouts: list[float | None] = []
 
     async def generate(
         self,
@@ -40,6 +41,7 @@ class FakeModel:
         system: str,
         contents: list[Message],
         tools: list[ToolSpec] | None = None,
+        timeout_s: float | None = None,
     ) -> ModelTurn:
         request = GenerateRequest(tier, system, list(contents), list(tools or []))
         self.requests.append(request)
@@ -58,8 +60,10 @@ class FakeModel:
         system: str,
         text: str,
         schema: type[SchemaT],
+        timeout_s: float | None = None,
     ) -> SchemaT:
         self.structured_requests.append((schema, system, text))
+        self.structured_timeouts.append(timeout_s)
         if self._structured is None:
             raise AssertionError(f"FakeModel has no structured response for {schema.__name__}")
         result: Any = await self._structured(schema, system, text)

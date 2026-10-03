@@ -16,6 +16,7 @@ from knappy.db.repository import SqliteRepository
 from knappy.llm.fake import FakeModel
 from knappy.llm.types import ModelTurn, UserMessage
 from knappy.memory import MemoryConfig, MemoryEngine, MemoryStore
+from knappy.memory.engine import BACKGROUND_TIMEOUT_S
 from knappy.runtime import KnappyRuntime
 from knappy.slack.egress import build_say
 from fakes import FakeSlack, dm, event, memory_structured, op, tool_results, tool_turn, user_turns
@@ -169,6 +170,18 @@ async def test_mem_03_supersede_keeps_history(repo: SqliteRepository) -> None:
         ("fact:employer@v1", "SUPERSEDED", "- Works at Google")
     ]
     assert [source["said"] for source in current["sources"]] == ["Moved from Google to Stripe"]
+
+
+async def test_background_reconcile_gets_the_long_timeout(repo: SqliteRepository) -> None:
+    clock = Clock()
+    runtime, model, _client = runtime_for(repo, reconcile=employer, clock=clock)
+    await runtime.handle_event(dm("I work at Google", "1.0"))
+    clock.advance(minutes=21)
+    await runtime.memory_engine.tick()
+    reconciles = [timeout for (schema, _, _), timeout in zip(model.structured_requests, model.structured_timeouts)
+                  if schema.__name__ == "ReconcileResult"]
+    assert reconciles == [BACKGROUND_TIMEOUT_S]
+    assert BACKGROUND_TIMEOUT_S >= 60
 
 
 async def test_mem_04_time_bound_fact_expires(repo: SqliteRepository) -> None:
