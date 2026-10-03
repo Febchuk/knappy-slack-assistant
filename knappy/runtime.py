@@ -27,6 +27,7 @@ from knappy.llm.types import Model, Tier, ToolResult, Usage
 from knappy.memory import MemoryConfig, MemoryEngine, MemoryStore
 from knappy.slack.egress import Reply, SlackEgress, open_reply
 from knappy.slack.users import UserDirectory
+from knappy.web import WebFetcher
 
 logger = logging.getLogger("knappy")
 
@@ -59,6 +60,7 @@ class KnappyRuntime:
         memory: MemoryProvider | None = None,
         memory_config: MemoryConfig | None = None,
         clock: Callable[[], datetime] = utc_now,
+        fetcher: WebFetcher | None = None,
     ) -> None:
         self.repo = repo
         self.workspace_id = workspace_id
@@ -71,7 +73,9 @@ class KnappyRuntime:
         self.conversations: ConversationLog = self.store
         self.locks = ConversationLocks()
         self.users = UserDirectory(slack)
-        self.tools = ToolRegistry(repo, workspace_id, history=slack, memory=self.memory_engine)
+        self.tools = ToolRegistry(
+            repo, workspace_id, history=slack, memory=self.memory_engine, searcher=model, fetcher=fetcher
+        )
         self.loop = AgentLoop(self.tools, model)
         gate = CompositeSystemOneGate(JevSystemOneAdapter(), RegexFallbackAdapter())
         self.pipeline = IngestionPipeline(repo, gate, SlmExtractor(model), workspace_id)

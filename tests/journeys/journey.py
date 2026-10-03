@@ -17,6 +17,7 @@ from knappy.main import heartbeat_tick, open_runtime
 from knappy.runtime import KnappyRuntime
 from knappy.slack.actions import register_actions
 from knappy.slack.egress import PLACEHOLDER
+from knappy.web import WebFetcher
 
 WORKSPACE = "T_JOURNEY"
 # Monday. Journeys that say "by Thursday" mean 2026-10-08.
@@ -79,8 +80,10 @@ class Journey:
         clock: FakeClock,
         slack: FakeSlack | None = None,
         server_tz: str = "UTC",
+        fetcher: WebFetcher | None = None,
     ) -> None:
         self.model = model
+        self.fetcher = fetcher
         self.clock = clock
         self.slack = slack or FakeSlack(tz="UTC")
         self.server_zone = ZoneInfo(server_tz)
@@ -99,7 +102,9 @@ class Journey:
         self._last_digest: date | None = None
 
     async def start(self) -> Journey:
-        runtime = await open_runtime(self.settings, workspace_id=WORKSPACE, client=self.slack, model=self.model, clock=self.clock)
+        runtime = await open_runtime(
+            self.settings, workspace_id=WORKSPACE, client=self.slack, model=self.model, clock=self.clock, fetcher=self.fetcher
+        )
         self._record_tools(runtime)
         self.app = FakeApp()
         register_actions(self.app, runtime)

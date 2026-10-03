@@ -9,7 +9,7 @@ import pytest
 from google.genai import errors, types
 from pydantic import BaseModel, ValidationError
 
-from fakes import FakeSlack, dm, tool_results
+from fakes import FakeSdk, FakeSlack, dm, tool_results
 from knappy.agent.loop import AgentLoop, InboundMessage
 from knappy.agent.tools import ToolRegistry, current_owner
 from knappy.db.repository import SqliteRepository
@@ -33,21 +33,6 @@ def _response(parts: list[types.Part], prompt: int = 1000, out: int = 200, thoug
             prompt_token_count=prompt, candidates_token_count=out, thoughts_token_count=thoughts
         ),
     )
-
-
-class FakeSdk:
-    def __init__(self, outcomes: list) -> None:
-        self.outcomes = outcomes
-        self.calls: list[dict] = []
-        self.aio = self
-        self.models = self
-
-    async def generate_content(self, *, model, contents, config):
-        self.calls.append({"model": model, "contents": contents, "config": config})
-        outcome = self.outcomes.pop(0)
-        if isinstance(outcome, Exception):
-            raise outcome
-        return outcome
 
 
 @pytest.fixture(autouse=True)

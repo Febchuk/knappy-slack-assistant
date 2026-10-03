@@ -13,7 +13,18 @@ from pydantic import BaseModel
 
 from knappy.heartbeat.triage import TriageJudgment
 from knappy.ingestion.extract import ExtractedInteraction
-from knappy.llm.types import Message, ModelTurn, SchemaT, Tier, ToolCall, ToolResult, ToolSpec, UserMessage
+from knappy.llm.types import (
+    Message,
+    ModelTurn,
+    Recency,
+    SchemaT,
+    Tier,
+    ToolCall,
+    ToolResult,
+    ToolSpec,
+    UserMessage,
+    WebSearchResult,
+)
 from knappy.memory.types import EpisodeDraft, RecapDraft, ReconcileResult, RepassDraft
 
 WEEKDAYS = {
@@ -175,6 +186,26 @@ class HeuristicModel:
         else:
             raise AssertionError(f"HeuristicModel has no answer for {schema.__name__}")
         return schema.model_validate(result.model_dump())
+
+    async def search(self, query: str, recency: Recency = "any") -> WebSearchResult:
+        raise AssertionError("HeuristicModel cannot search the web")
+
+
+class FakeSdk:
+    """Stands in for google-genai's client: returns or raises the scripted outcomes in order."""
+
+    def __init__(self, outcomes: list) -> None:
+        self.outcomes = outcomes
+        self.calls: list[dict] = []
+        self.aio = self
+        self.models = self
+
+    async def generate_content(self, *, model, contents, config):
+        self.calls.append({"model": model, "contents": contents, "config": config})
+        outcome = self.outcomes.pop(0)
+        if isinstance(outcome, Exception):
+            raise outcome
+        return outcome
 
 
 class FakeSlack:

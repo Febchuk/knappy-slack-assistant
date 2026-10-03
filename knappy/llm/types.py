@@ -8,6 +8,7 @@ from typing import Any, Literal, Protocol, TypeVar, Union
 from pydantic import BaseModel
 
 Tier = Literal["agent", "light"]
+Recency = Literal["any", "week", "month"]
 SchemaT = TypeVar("SchemaT", bound=BaseModel)
 
 
@@ -57,6 +58,19 @@ class ToolSpec:
     args_model: type[BaseModel]
 
 
+class Source(BaseModel):
+    title: str
+    url: str
+
+
+class WebSearchResult(BaseModel):
+    """A grounded answer and the pages it was grounded on (Spec 14 §2)."""
+
+    answer: str
+    sources: list[Source]
+    searched_queries: list[str]
+
+
 class Model(Protocol):
     async def generate(
         self,
@@ -77,3 +91,5 @@ class Model(Protocol):
         schema: type[SchemaT],
         timeout_s: float | None = None,
     ) -> SchemaT: ...
+
+    async def search(self, query: str, recency: Recency = "any") -> WebSearchResult: ...

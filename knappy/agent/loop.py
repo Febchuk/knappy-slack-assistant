@@ -15,6 +15,7 @@ from pydantic import ValidationError
 from knappy.agent.prompt import FINAL_TURN_NOTE
 from knappy.agent.tools import TOOL_SPECS, TOOL_STATUS, StagedDraft, ToolRegistry
 from knappy.llm.types import Message, Model, ToolCall, ToolResult, UserMessage
+from knappy.web import sources_of, with_citations
 
 logger = logging.getLogger("knappy")
 
@@ -158,7 +159,8 @@ def _status(calls: list[ToolCall]) -> str:
 
 
 def _reply(text: str | None, drafts: list[StagedDraft], ran: list[ToolResult]) -> AgentReply:
-    answer = (text or "").strip() or EMPTY_ANSWER
+    sources = [source for result in ran for source in sources_of(result.call.name, result.result)]
+    answer = with_citations((text or "").strip() or EMPTY_ANSWER, sources)
     if not drafts:
         return AgentReply(text=answer, tool_results=ran)
     blocks = [block for draft in drafts for block in draft.blocks]

@@ -5,19 +5,22 @@ Assertions are on behavior: which tools ran with which arguments, what reached S
 
 from __future__ import annotations
 
+import ipaddress
 import json
 import logging
 import re
 from datetime import datetime, timedelta, timezone
 
+import httpx
 import pytest
 
 from fakes import FakeSlack, agent, event, memory_structured, op, user_turns
 from journey import FakeFile, dm_channel, placeholder_replaced
 from knappy.agent.prompt import IDENTITY
 from knappy.llm.fake import FakeModel, GenerateRequest
-from knappy.llm.types import ModelTurn, UserMessage
+from knappy.llm.types import ModelTurn, Source, ToolCall, ToolResult, UserMessage, WebSearchResult
 from knappy.memory.types import ReconcileResult
+from knappy.web import WebFetcher
 
 def scripted(script=None, reconcile=None) -> FakeModel:
     return FakeModel(agent(script), structured=memory_structured(reconcile))
@@ -159,29 +162,56 @@ async def test_j04_correct_then_forget(journey) -> None:
     assert not [text for text in await j.active_memory("U1") if re.search("stripe|google", text, re.I)]
 
 
-@pytest.mark.xfail(strict=True, reason="spec 14")
+def answering(text: str, tool: str, args: dict):
+    """Calls one tool, then answers `text` without links, as a model that forgot to cite would."""
+
+    async def respond(request: GenerateRequest) -> ModelTurn:
+        if isinstance(request.contents[-1], ToolResult):
+            return ModelTurn(text=text)
+        return ModelTurn(tool_calls=[ToolCall(id="c1", name=tool, args=args)])
+
+    return respond
+
+
 async def test_j05_research(journey) -> None:
-    model = scripted({"what's the latest python release": ("web_search", {"query": "latest Python release"})})
+    release = Source(title="Python 3.14 release notes", url="https://docs.python.org/3/whatsnew/3.14.html")
+    model = FakeModel(
+        answering("Python 3.14 is the latest.", "web_search", {"query": "latest Python release"}),
+        search=WebSearchResult(answer="Python 3.14 is the latest.", sources=[release], searched_queries=["python"]),
+    )
     j = await journey(model)
     reply = await j.dm("U1", "what's the latest Python release and what changed?")
 
     searched = reply.called("web_search")
     assert searched and searched[0].args["query"]
-    hits = searched[0].result
-    assert isinstance(hits, list) and hits and "error" not in hits[0], "web_search is a real tool"
-    assert re.search(r"https?://", reply.text), "the answer cites a source"
+    assert model.searches == [("latest Python release", "any")]
+    assert searched[0].result["sources"] == [release.model_dump()]
+    assert f"<{release.url}|{release.title}>" in reply.reply["text"], "the answer cites its source as a Slack link"
 
 
-@pytest.mark.xfail(strict=True, reason="spec 14")
 async def test_j06_read_a_link(journey) -> None:
     url = "https://docs.python.org/3/whatsnew/3.13.html"
-    model = scripted({"tl;dr": ("fetch_url", {"url": url})})
-    j = await journey(model)
+    page = "<html><head><title>What's New In Python 3.13</title></head><body><article><h1>What's New In Python 3.13</h1><p>" + (
+        "Python 3.13 adds a new interactive interpreter and an experimental free-threaded build. " * 5
+    ) + "</p></article></body></html>"
+    hosts: list[str] = []
+
+    def serve(request: httpx.Request) -> httpx.Response:
+        hosts.append(request.headers["host"])
+        return httpx.Response(200, headers={"content-type": "text/html"}, content=page.encode())
+
+    async def resolve(host: str, port: int):
+        return [ipaddress.ip_address("151.101.0.223")]
+
+    model = FakeModel(answering("3.13 adds a new REPL and a free-threaded build.", "fetch_url", {"url": url}))
+    j = await journey(model, fetcher=WebFetcher(transport=httpx.MockTransport(serve), resolve=resolve))
     reply = await j.dm("U1", f"tl;dr this <{url}>")
 
     fetched = reply.called("fetch_url")
     assert [use.args["url"] for use in fetched] == [url]
-    assert "error" not in fetched[0].result and fetched[0].result.get("text"), "the page was read"
+    assert hosts == ["docs.python.org"]
+    assert "free-threaded" in fetched[0].result["text"], "the page was read"
+    assert f"<{url}|What's New In Python 3.13>" in reply.reply["text"]
 
 
 @pytest.mark.xfail(strict=True, reason="spec 15")

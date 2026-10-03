@@ -24,6 +24,7 @@ from knappy.slack.actions import register_actions
 from knappy.slack.app import create_app
 from knappy.slack.egress import build_say
 from knappy.slack.executor import SlackActionExecutor
+from knappy.web import WebFetcher
 
 
 def configure_logging() -> None:
@@ -74,6 +75,7 @@ async def open_runtime(
     client: Any,
     model: Model | None = None,
     clock: Callable[[], datetime] = utc_now,
+    fetcher: WebFetcher | None = None,
 ) -> KnappyRuntime:
     """Open the database and build the runtime the process serves. Without a model, Gemini with usage recording."""
     repo = await open_repository(settings.database_url)
@@ -98,6 +100,7 @@ async def open_runtime(
             admission_threshold=settings.admission_threshold, raw_retention_days=settings.raw_retention_days
         ),
         clock=clock,
+        fetcher=fetcher,
     )
     migrated = await runtime.store.migrate_contacts(clock())
     if migrated:

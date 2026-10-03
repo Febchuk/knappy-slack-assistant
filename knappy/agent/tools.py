@@ -12,8 +12,9 @@ from pydantic import AwareDatetime, BaseModel, Field
 from knappy.db.repository import SqliteRepository, format_ts
 from knappy.hitl.blocks import approval_blocks
 from knappy.ingestion.embed import generate_embedding
-from knappy.llm.types import ToolSpec
+from knappy.llm.types import Model, Recency, ToolSpec
 from knappy.memory.types import RecordType, SavableType
+from knappy.web import WebFetcher
 
 if TYPE_CHECKING:
     from knappy.memory.engine import MemoryEngine
@@ -111,6 +112,16 @@ class SearchConversationsArgs(BaseModel):
     since: date | None = Field(default=None, description="Only conversations on or after this date")
 
 
+class WebSearchArgs(BaseModel):
+    query: str = Field(..., description="A search engine query")
+    recency: Recency = Field(default="any", description="week or month to limit results to recent pages")
+
+
+class FetchUrlArgs(BaseModel):
+    url: str = Field(..., description="The http(s) URL to read")
+    question: str | None = Field(default=None, description="What you need from the page, to focus long pages")
+
+
 TOOL_SPECS: dict[str, ToolSpec] = {
     spec.name: spec
     for spec in (
@@ -146,6 +157,13 @@ TOOL_SPECS: dict[str, ToolSpec] = {
             MemoryReadArgs,
         ),
         ToolSpec("search_conversations", "Search earlier conversations with the user by keywords.", SearchConversationsArgs),
+        ToolSpec(
+            "web_search",
+            "Search the web. Returns a grounded answer, its sources, and the queries run. "
+            "Use it for anything current or checkable: news, prices, dates, releases, weather, places, opening hours.",
+            WebSearchArgs,
+        ),
+        ToolSpec("fetch_url", "Read one web page or PDF by URL, such as a link the user pasted.", FetchUrlArgs),
     )
 }
 
@@ -162,6 +180,8 @@ TOOL_STATUS: dict[str, str] = {
     "memory_search": "checking what I know",
     "memory_read": "checking what I know",
     "search_conversations": "searching past conversations",
+    "web_search": "searching the web",
+    "fetch_url": "reading the page",
 }
 
 
@@ -184,11 +204,15 @@ class ToolRegistry:
         workspace_id: str,
         history: Any | None = None,
         memory: MemoryEngine | None = None,
+        searcher: Model | None = None,
+        fetcher: WebFetcher | None = None,
     ) -> None:
         self.repo = repo
         self.workspace_id = workspace_id
         self.history = history
         self.memory = memory
+        self.searcher = searcher
+        self.fetcher = fetcher or WebFetcher()
 
     def _owner(self) -> str | None:
         return current_owner.get()
@@ -383,6 +407,14 @@ class ToolRegistry:
         start = datetime.combine(since, time(0), timezone.utc) if since else None
         # The message being answered is already logged; finding it again reads as a lead worth chasing.
         return await self.memory.store.search_conversations(self._owner() or "", query, start, exclude=current_turn.get())
+
+    async def web_search(self, query: str, recency: Recency = "any") -> dict[str, Any]:
+        if self.searcher is None:
+            return {"error": "Web search is not available in this context."}
+        return (await self.searcher.search(query, recency)).model_dump()
+
+    async def fetch_url(self, url: str, question: str | None = None) -> dict[str, Any]:
+        return await self.fetcher.fetch(url, question)
 
     def specs(self) -> list[ToolSpec]:
         return list(TOOL_SPECS.values())

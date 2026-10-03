@@ -7,7 +7,7 @@ from typing import Any, Awaitable, Callable
 
 from pydantic import BaseModel
 
-from knappy.llm.types import Message, ModelTurn, SchemaT, Tier, ToolSpec
+from knappy.llm.types import Message, ModelTurn, Recency, SchemaT, Tier, ToolSpec, WebSearchResult
 
 
 @dataclass(frozen=True)
@@ -27,9 +27,12 @@ class FakeModel:
         self,
         respond: Respond | list[ModelTurn] | None = None,
         structured: RespondStructured | None = None,
+        search: WebSearchResult | None = None,
     ) -> None:
         self._respond = respond
         self._structured = structured
+        self._search = search
+        self.searches: list[tuple[str, Recency]] = []
         self.requests: list[GenerateRequest] = []
         self.structured_requests: list[tuple[type[BaseModel], str, str]] = []
         self.structured_timeouts: list[float | None] = []
@@ -68,3 +71,9 @@ class FakeModel:
             raise AssertionError(f"FakeModel has no structured response for {schema.__name__}")
         result: Any = await self._structured(schema, system, text)
         return schema.model_validate(result.model_dump() if isinstance(result, BaseModel) else result)
+
+    async def search(self, query: str, recency: Recency = "any") -> WebSearchResult:
+        self.searches.append((query, recency))
+        if self._search is None:
+            raise AssertionError("FakeModel has no search result")
+        return self._search

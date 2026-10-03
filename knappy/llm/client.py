@@ -6,14 +6,28 @@ import asyncio
 import json
 import logging
 import time
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
+from datetime import datetime, timedelta, timezone
 from typing import Any, Awaitable, Callable
 
 from google import genai
 from google.genai import errors, types
 from pydantic import ValidationError
 
-from knappy.llm.types import Message, ModelTurn, SchemaT, Tier, ToolCall, ToolResult, ToolSpec, Usage, UserMessage
+from knappy.llm.types import (
+    Message,
+    ModelTurn,
+    Recency,
+    SchemaT,
+    Source,
+    Tier,
+    ToolCall,
+    ToolResult,
+    ToolSpec,
+    Usage,
+    UserMessage,
+    WebSearchResult,
+)
 
 logger = logging.getLogger("knappy")
 
@@ -25,6 +39,16 @@ PRICES: dict[str, tuple[float, float]] = {
     "gemini-2.5-flash-lite": (0.10, 0.40),
 }
 FALLBACK_PRICE = PRICES["gemini-3-flash-preview"]
+# Grounding with Google Search on Gemini 3: $14 per 1,000 search queries, billed per query the model runs,
+# after 5,000 free a month (ai.google.dev/gemini-api/docs/pricing, read 2026-10-03). The free quota is not
+# tracked, so every query is counted. Retrieved search context is not billed as input tokens.
+SEARCH_QUERY_USD = 0.014
+MAX_SOURCES = 8
+RECENCY_DAYS: dict[Recency, int] = {"week": 7, "month": 30}
+SEARCH_SYSTEM = (
+    "Answer the query using Google Search. Be factual and concise: lead with the answer, "
+    "include dates, figures, and names that matter, and say so when sources disagree or nothing relevant was found."
+)
 
 TIMEOUTS_S: dict[Tier, float] = {"agent": 30.0, "light": 10.0}
 RETRY_DELAYS_S = (0.5, 2.0)
@@ -94,6 +118,17 @@ class GeminiClient:
         assert last_error is not None
         raise last_error
 
+    async def search(self, query: str, recency: Recency = "any", timeout_s: float | None = None) -> WebSearchResult:
+        """One grounded request with Google Search and no function declarations (Spec 14 §2)."""
+        search = types.GoogleSearch()
+        if recency in RECENCY_DAYS:
+            end = datetime.now(timezone.utc).replace(microsecond=0)  # the API rejects sub-second times
+            search.time_range_filter = types.Interval(start_time=end - timedelta(days=RECENCY_DAYS[recency]), end_time=end)
+        config = types.GenerateContentConfig(system_instruction=SEARCH_SYSTEM, tools=[types.Tool(google_search=search)])
+        contents = [types.Content(role="user", parts=[types.Part.from_text(text=query)])]
+        response, usage = await self._call("agent", contents, config, timeout_s)
+        return parse_search(response, usage)
+
     async def _call(
         self, tier: Tier, contents: list[types.Content], config: types.GenerateContentConfig, timeout_s: float | None
     ) -> tuple[Any, Usage]:
@@ -111,6 +146,7 @@ class GeminiClient:
                     raise
                 await asyncio.sleep(RETRY_DELAYS_S[attempt])
         usage = usage_from(model, response.usage_metadata, int((time.perf_counter() - started) * 1000))
+        usage = replace(usage, cost_usd=usage.cost_usd + SEARCH_QUERY_USD * len(_search_queries(response)))
         logger.info(
             "model tier=%s model=%s ms=%d in=%d out=%d cached=%d cost=%.6f",
             tier, model, usage.latency_ms, usage.input_tokens, usage.output_tokens,
@@ -194,3 +230,27 @@ def usage_from(model: str, metadata: Any, latency_ms: int) -> Usage:
     price_in, price_out = PRICES.get(model, FALLBACK_PRICE)
     cost = (input_tokens * price_in + output_tokens * price_out) / 1_000_000
     return Usage(input_tokens, output_tokens, cached, cost, latency_ms)
+
+
+def parse_search(response: Any, usage: Usage) -> WebSearchResult:
+    grounding = _grounding(response)
+    sources: dict[str, Source] = {}
+    for chunk in (grounding.grounding_chunks if grounding is not None else None) or []:
+        web = chunk.web
+        if web is not None and web.uri and web.uri not in sources:
+            sources[web.uri] = Source(title=web.title or web.domain or web.uri, url=web.uri)
+    return WebSearchResult(
+        answer=parse_turn(response, usage).text or "",
+        sources=list(sources.values())[:MAX_SOURCES],
+        searched_queries=_search_queries(response),
+    )
+
+
+def _grounding(response: Any) -> Any:
+    candidates = getattr(response, "candidates", None) or []
+    return candidates[0].grounding_metadata if candidates else None
+
+
+def _search_queries(response: Any) -> list[str]:
+    grounding = _grounding(response)
+    return list(grounding.web_search_queries or []) if grounding is not None else []

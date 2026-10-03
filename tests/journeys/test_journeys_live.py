@@ -141,3 +141,31 @@ async def test_j15_reversal_without_bleed_live(journey, live_model) -> None:
         "Describes the user's diet as vegetarian and does not mention that they used to eat meat or steak.",
         diet.reply["text"],
     )
+
+
+async def test_j05_research_live(journey, live_model) -> None:
+    j: Journey = await journey(live_model)
+    reply = await j.dm("U1", "what's the latest Python release and what changed?")
+
+    assert reply.called("web_search"), "the agent searched the web"
+    assert re.search(r"<https?://[^|>]+\|[^>]+>", reply.reply["text"]), f"cites a source as a Slack link: {reply.reply['text']}"
+    await expect(live_model, "Names a specific recent Python version and says something concrete about what changed in it.",
+                 reply.reply["text"])
+
+
+async def test_j06_read_a_link_live(journey, live_model) -> None:
+    url = "https://docs.python.org/3/whatsnew/3.13.html"
+    j: Journey = await journey(live_model)
+    reply = await j.dm("U1", f"tl;dr this <{url}>")
+
+    fetched = reply.called("fetch_url")
+    assert fetched and fetched[0].args["url"] == url
+    assert fetched[0].result.get("text"), fetched[0].result
+    await expect(live_model, "Summarizes what is new in Python 3.13 in a few points.", reply.reply["text"])
+
+
+async def test_web_05_weather_cites_a_source_live(journey, live_model) -> None:
+    j: Journey = await journey(live_model)
+    reply = await j.dm("U1", "what's the weather in Lagos today?")
+
+    assert re.search(r"https?://", reply.reply["text"]), f"cites at least one source URL: {reply.reply['text']}"
