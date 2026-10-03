@@ -173,7 +173,9 @@ def to_contents(messages: list[Message]) -> list[types.Content]:
     contents: list[types.Content] = []
     for message in messages:
         if isinstance(message, UserMessage):
-            contents.append(types.Content(role="user", parts=[types.Part.from_text(text=message.text)]))
+            parts = [types.Part.from_text(text=message.text)]
+            parts.extend(types.Part.from_bytes(data=item.data, mime_type=item.mime_type) for item in message.attachments)
+            contents.append(types.Content(role="user", parts=parts))
         elif isinstance(message, ModelTurn):
             contents.append(message.raw if message.raw is not None else _model_content(message))
         else:

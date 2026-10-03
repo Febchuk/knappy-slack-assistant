@@ -10,7 +10,8 @@ import re
 import pytest
 from pydantic import BaseModel
 
-from journey import Journey, placeholder_replaced
+from fakes import pdf_with
+from journey import FakeFile, Journey, placeholder_replaced
 from knappy.llm.types import Model
 
 pytestmark = pytest.mark.live_model
@@ -169,3 +170,39 @@ async def test_web_05_weather_cites_a_source_live(journey, live_model) -> None:
     reply = await j.dm("U1", "what's the weather in Lagos today?")
 
     assert re.search(r"https?://", reply.reply["text"]), f"cites at least one source URL: {reply.reply['text']}"
+
+
+async def test_j07_files_in_live(journey, live_model) -> None:
+    j: Journey = await journey(live_model)
+    pdf = FakeFile("acme-q3-proposal.pdf", "application/pdf", pdf_with(
+        "Q3 proposal for Acme Corp. Scope: migrate the billing system to the new platform by September.",
+        "Pricing: the Pro plan is $40 per seat per month, billed annually. Over 100 seats the price drops to $34.",
+        "Timeline: kickoff on July 1, pilot in August, rollout complete by the end of September.",
+    ))
+    summary = await j.dm("U1", "summarize this", files=(pdf,))
+    await j.advance(days=1)
+    later = await j.dm("U1", "what did that PDF say about pricing?", thread="new")
+
+    assert placeholder_replaced(summary)
+    await expect(live_model, "Summarizes a billing-migration proposal for Acme, including its pricing or timeline.", summary.reply["text"])
+    assert later.called("list_files") or later.called("memory_search") or later.called("read_file"), "looked the file up"
+    assert not later.called("web_search")
+    assert "$40" in later.reply["text"], later.reply["text"]
+
+
+async def test_file_04_image_description_live(journey, live_model) -> None:
+    from io import BytesIO
+
+    from PIL import Image, ImageDraw
+
+    image = Image.new("RGB", (640, 200), "white")
+    ImageDraw.Draw(image).text((20, 80), "PRO PLAN: $40 PER SEAT", fill="black", font_size=40)
+    buffer = BytesIO()
+    image.save(buffer, format="PNG")
+    j: Journey = await journey(live_model)
+    reply = await j.dm("U1", "what does this screenshot say?", files=(FakeFile("pricing.png", "image/png", buffer.getvalue()),))
+
+    [stored] = await j.rows("SELECT text FROM documents")
+    assert "40" in stored["text"], stored["text"]
+    assert "40" in reply.reply["text"], reply.reply["text"]
+

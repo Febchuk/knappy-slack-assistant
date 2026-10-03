@@ -5,13 +5,15 @@ from __future__ import annotations
 from datetime import datetime, timezone
 
 
-def approval_blocks(draft_id: str, recipient_name: str, staged_content: str) -> list[dict]:
+def approval_blocks(draft_id: str, recipient_name: str, staged_content: str, file_name: str | None = None) -> list[dict]:
+    headline = "Staged File Share" if file_name else "Staged Outbound Message"
+    attached = f"\n*File:* {file_name}" if file_name else ""
     return [
         {
             "type": "section",
             "text": {
                 "type": "mrkdwn",
-                "text": f"*Action Required:* Staged Outbound Message\n*Target:* {recipient_name}",
+                "text": f"*Action Required:* {headline}\n*Target:* {recipient_name}{attached}",
             },
         },
         {

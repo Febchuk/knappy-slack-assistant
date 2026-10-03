@@ -14,7 +14,7 @@ from pydantic import ValidationError
 
 from knappy.agent.prompt import FINAL_TURN_NOTE
 from knappy.agent.tools import TOOL_SPECS, TOOL_STATUS, StagedDraft, ToolRegistry
-from knappy.llm.types import Message, Model, ToolCall, ToolResult, UserMessage
+from knappy.llm.types import Attachment, Message, Model, ToolCall, ToolResult, UserMessage
 from knappy.web import sources_of, with_citations
 
 logger = logging.getLogger("knappy")
@@ -36,6 +36,7 @@ class InboundMessage:
     text: str
     system: str
     history: list[Message] = field(default_factory=list)
+    attachments: tuple[Attachment, ...] = ()
 
 
 @dataclass
@@ -66,7 +67,7 @@ class AgentLoop:
     async def run(self, message: InboundMessage, on_status: StatusFn | None = None) -> AgentReply:
         started = time.monotonic()
         deadline = started + self.wall_clock_s
-        contents: list[Message] = [*message.history, UserMessage(message.text)]
+        contents: list[Message] = [*message.history, UserMessage(message.text, message.attachments)]
         drafts: list[StagedDraft] = []
         ran: list[ToolResult] = []
         specs = self.tools.specs()

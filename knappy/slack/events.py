@@ -9,6 +9,8 @@ from collections.abc import Awaitable, Callable
 from typing import Any
 
 Processor = Callable[[dict[str, Any]], Awaitable[None]]
+# Subtypes that are a person's new message. Edits, deletions, joins, and bot posts are not.
+USER_SUBTYPES = frozenset({None, "file_share", "thread_broadcast"})
 logger = logging.getLogger("knappy")
 
 
@@ -47,7 +49,7 @@ async def on_message(
     elapsed = time.perf_counter() - started
     if event.get("channel_type") not in (None, "im"):
         return elapsed
-    if _from_bot(event):
+    if _from_bot(event) or event.get("subtype") not in USER_SUBTYPES:
         return elapsed
     key = event_key(event)
     if deduper is not None and key is not None and deduper.seen(key):

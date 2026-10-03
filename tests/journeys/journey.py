@@ -10,8 +10,11 @@ from pathlib import Path
 from typing import Any
 from zoneinfo import ZoneInfo
 
+import httpx
+
 from fakes import FakeApp, FakeClock, FakeSlack
 from knappy.config import Settings
+from knappy.files.service import SlackDownloader
 from knappy.llm.types import Model
 from knappy.main import heartbeat_tick, open_runtime
 from knappy.runtime import KnappyRuntime
@@ -30,6 +33,8 @@ class FakeFile:
     name: str
     mimetype: str
     content: bytes
+    # The size Slack reports, when it should differ from the content's (a 30 MB file without 30 MB of test data).
+    size: int | None = None
 
 
 @dataclass(frozen=True)
@@ -95,6 +100,9 @@ class Journey:
             database_url=f"sqlite:///{tmp_path / 'knappy.db'}",
         )
         self.tools: list[ToolUse] = []
+        # Slack's file server: download URL -> bytes, and every request it received.
+        self.files: dict[str, bytes] = {}
+        self.downloads: list[httpx.Request] = []
         self.runtime: KnappyRuntime | None = None
         self.app = FakeApp()
         self._ts = itertools.count(1)
@@ -102,8 +110,10 @@ class Journey:
         self._last_digest: date | None = None
 
     async def start(self) -> Journey:
+        downloader = SlackDownloader(self.settings.slack_bot_token, transport=httpx.MockTransport(self._file_server))
         runtime = await open_runtime(
-            self.settings, workspace_id=WORKSPACE, client=self.slack, model=self.model, clock=self.clock, fetcher=self.fetcher
+            self.settings, workspace_id=WORKSPACE, client=self.slack, model=self.model, clock=self.clock,
+            fetcher=self.fetcher, downloader=downloader,
         )
         self._record_tools(runtime)
         self.app = FakeApp()
@@ -131,10 +141,15 @@ class Journey:
     async def dm(
         self, user: str, text: str, *, thread: str | None = None, files: tuple[FakeFile, ...] = ()
     ) -> SlackCapture:
-        """A DM from `user`. `thread` is the parent ts to reply under, or "new" to start a thread at this message."""
-        assert not files, "file uploads arrive with Spec 15"
+        """A DM from `user`. `thread` is the parent ts to reply under, or "new" to start a thread at this message.
+
+        `files` arrive the way Slack shares them: a file_share message whose download links need the bot token.
+        """
         ts = f"{int(self.clock().timestamp())}.{next(self._ts):06d}"
         event = {"text": text, "channel": dm_channel(user), "channel_type": "im", "user": user, "ts": ts}
+        if files:
+            event["subtype"] = "file_share"
+            event["files"] = [self._share(file) for file in files]
         if thread:
             event["thread_ts"] = ts if thread == "new" else thread
         with self._capture() as capture:
@@ -196,6 +211,24 @@ class Journey:
     def _running(self) -> KnappyRuntime:
         assert self.runtime is not None, "call start() first"
         return self.runtime
+
+    def _share(self, file: FakeFile) -> dict[str, Any]:
+        file_id = f"F{len(self.files) + 1:04d}"
+        url = f"https://files.slack.com/files-pri/{WORKSPACE}-{file_id}/download/{file.name}"
+        self.files[url] = file.content
+        return {
+            "id": file_id, "name": file.name, "mimetype": file.mimetype,
+            "size": len(file.content) if file.size is None else file.size, "url_private_download": url,
+        }
+
+    def _file_server(self, request: httpx.Request) -> httpx.Response:
+        self.downloads.append(request)
+        if request.headers.get("authorization") != f"Bearer {self.settings.slack_bot_token}":
+            return httpx.Response(200, headers={"content-type": "text/html"}, content=b"<html>Sign in</html>")
+        content = self.files.get(str(request.url))
+        if content is None:
+            return httpx.Response(404)
+        return httpx.Response(200, headers={"content-type": "application/octet-stream"}, content=content)
 
     def _record_tools(self, runtime: KnappyRuntime) -> None:
         from knappy.agent.tools import current_owner

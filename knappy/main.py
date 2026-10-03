@@ -14,6 +14,8 @@ from slack_bolt.adapter.socket_mode.async_handler import AsyncSocketModeHandler
 from knappy.config import Settings, load_dotenv
 from knappy.db.factory import open_repository
 from knappy.db.repository import utc_now
+from knappy.files.service import SlackDownloader
+from knappy.files.store import DocumentStore
 from knappy.heartbeat.schedule import cadence_due
 from knappy.ingestion.embed import semantic
 from knappy.llm.client import GeminiClient, ModelIds
@@ -76,6 +78,7 @@ async def open_runtime(
     model: Model | None = None,
     clock: Callable[[], datetime] = utc_now,
     fetcher: WebFetcher | None = None,
+    downloader: SlackDownloader | None = None,
 ) -> KnappyRuntime:
     """Open the database and build the runtime the process serves. Without a model, Gemini with usage recording."""
     repo = await open_repository(settings.database_url)
@@ -94,13 +97,14 @@ async def open_runtime(
         daily_budget_usd=settings.daily_budget_usd,
         say=say,
         sender=say,
-        executor=SlackActionExecutor(client),
+        executor=SlackActionExecutor(client, DocumentStore(repo, workspace_id)),
         slack=client,
         memory_config=MemoryConfig(
             admission_threshold=settings.admission_threshold, raw_retention_days=settings.raw_retention_days
         ),
         clock=clock,
         fetcher=fetcher,
+        downloader=downloader or SlackDownloader(settings.slack_bot_token),
     )
     migrated = await runtime.store.migrate_contacts(clock())
     if migrated:

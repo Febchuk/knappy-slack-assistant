@@ -1,5 +1,22 @@
 """SQLite and PostgreSQL DDL for the dual-memory store."""
 
+ACTION_TYPES = "'SEND_SLACK_DM', 'SHARE_FILE', 'GMAIL_DRAFT', 'CALENDAR_INVITE', 'POST_CHANNEL'"
+
+# SQLite cannot alter a CHECK constraint, so the migration rebuilds the table from this definition.
+SQLITE_ACTION_DRAFTS = f"""CREATE TABLE IF NOT EXISTS action_drafts (
+    id TEXT PRIMARY KEY,
+    workspace_id TEXT NOT NULL REFERENCES workspaces(id) ON DELETE CASCADE,
+    user_id TEXT NOT NULL,
+    channel_id TEXT NOT NULL,
+    thread_ts TEXT,
+    action_type TEXT NOT NULL CHECK(action_type IN ({ACTION_TYPES})),
+    payload TEXT NOT NULL,
+    status TEXT NOT NULL DEFAULT 'PENDING' CHECK(status IN ('PENDING', 'APPROVED', 'CANCELLED', 'EXPIRED', 'FAILED')),
+    expires_at DATETIME,
+    created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+    executed_at DATETIME
+);"""
+
 SQLITE_SCHEMA = """
 CREATE TABLE IF NOT EXISTS workspaces (
     id TEXT PRIMARY KEY,
@@ -44,19 +61,7 @@ CREATE TABLE IF NOT EXISTS interactions (
     waiting_on TEXT
 );
 
-CREATE TABLE IF NOT EXISTS action_drafts (
-    id TEXT PRIMARY KEY,
-    workspace_id TEXT NOT NULL REFERENCES workspaces(id) ON DELETE CASCADE,
-    user_id TEXT NOT NULL,
-    channel_id TEXT NOT NULL,
-    thread_ts TEXT,
-    action_type TEXT NOT NULL CHECK(action_type IN ('SEND_SLACK_DM', 'GMAIL_DRAFT', 'CALENDAR_INVITE', 'POST_CHANNEL')),
-    payload TEXT NOT NULL,
-    status TEXT NOT NULL DEFAULT 'PENDING' CHECK(status IN ('PENDING', 'APPROVED', 'CANCELLED', 'EXPIRED', 'FAILED')),
-    expires_at DATETIME,
-    created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
-    executed_at DATETIME
-);
+""" + SQLITE_ACTION_DRAFTS + """
 
 CREATE TABLE IF NOT EXISTS briefing_items (
     id TEXT PRIMARY KEY,
@@ -191,6 +196,30 @@ CREATE TABLE IF NOT EXISTS memory_provenance (
 );
 CREATE INDEX IF NOT EXISTS idx_prov_source ON memory_provenance (owner_user_id, source_type, source_id);
 
+CREATE TABLE IF NOT EXISTS documents (
+    id TEXT PRIMARY KEY,
+    workspace_id TEXT NOT NULL,
+    owner_user_id TEXT NOT NULL,
+    slack_file_id TEXT NOT NULL,
+    name TEXT NOT NULL,
+    mimetype TEXT NOT NULL,
+    size_bytes INTEGER NOT NULL,
+    text TEXT,
+    summary TEXT,
+    conversation_key TEXT NOT NULL,
+    created_at DATETIME NOT NULL,
+    UNIQUE (workspace_id, owner_user_id, slack_file_id)
+);
+CREATE INDEX IF NOT EXISTS idx_documents_owner ON documents (workspace_id, owner_user_id, created_at);
+
+CREATE TABLE IF NOT EXISTS document_chunks (
+    document_id TEXT NOT NULL REFERENCES documents(id) ON DELETE CASCADE,
+    seq INTEGER NOT NULL,
+    text TEXT NOT NULL,
+    embedding BLOB,
+    PRIMARY KEY (document_id, seq)
+);
+
 CREATE INDEX IF NOT EXISTS idx_contacts_cadence ON contacts (workspace_id, last_interaction_ts);
 CREATE INDEX IF NOT EXISTS idx_interactions_due ON interactions (status, due_date) WHERE status = 'PENDING';
 CREATE INDEX IF NOT EXISTS idx_interactions_contact ON interactions (contact_id);
@@ -248,7 +277,7 @@ CREATE TABLE IF NOT EXISTS action_drafts (
     user_id TEXT NOT NULL,
     channel_id TEXT NOT NULL,
     thread_ts TEXT,
-    action_type TEXT NOT NULL CHECK(action_type IN ('SEND_SLACK_DM', 'GMAIL_DRAFT', 'CALENDAR_INVITE', 'POST_CHANNEL')),
+    action_type TEXT NOT NULL,
     payload JSONB NOT NULL,
     status TEXT NOT NULL DEFAULT 'PENDING' CHECK(status IN ('PENDING', 'APPROVED', 'CANCELLED', 'EXPIRED', 'FAILED')),
     expires_at TIMESTAMP WITH TIME ZONE DEFAULT (CURRENT_TIMESTAMP + INTERVAL '24 hours'),
@@ -381,12 +410,39 @@ CREATE TABLE IF NOT EXISTS memory_provenance (
     PRIMARY KEY (owner_user_id, target_type, target_id, source_type, source_id)
 );
 CREATE INDEX IF NOT EXISTS idx_prov_source ON memory_provenance (owner_user_id, source_type, source_id);
+
+ALTER TABLE action_drafts DROP CONSTRAINT IF EXISTS action_drafts_action_type_check;
+ALTER TABLE action_drafts ADD CONSTRAINT action_drafts_action_type_check CHECK(action_type IN (""" + ACTION_TYPES + """));
+
+CREATE TABLE IF NOT EXISTS documents (
+    id TEXT PRIMARY KEY,
+    workspace_id TEXT NOT NULL,
+    owner_user_id TEXT NOT NULL,
+    slack_file_id TEXT NOT NULL,
+    name TEXT NOT NULL,
+    mimetype TEXT NOT NULL,
+    size_bytes BIGINT NOT NULL,
+    text TEXT,
+    summary TEXT,
+    conversation_key TEXT NOT NULL,
+    created_at TEXT NOT NULL,
+    UNIQUE (workspace_id, owner_user_id, slack_file_id)
+);
+CREATE INDEX IF NOT EXISTS idx_documents_owner ON documents (workspace_id, owner_user_id, created_at);
+
+CREATE TABLE IF NOT EXISTS document_chunks (
+    document_id TEXT NOT NULL REFERENCES documents(id) ON DELETE CASCADE,
+    seq INTEGER NOT NULL,
+    text TEXT NOT NULL,
+    embedding BYTEA,
+    PRIMARY KEY (document_id, seq)
+);
 """
 
 EXPECTED_TABLES = frozenset(
     {
         "workspaces", "contacts", "interactions", "action_drafts", "briefing_items", "model_usage",
         "conversation_turns", "memory_records", "user_profile", "conversation_recaps",
-        "memory_events", "memory_provenance",
+        "memory_events", "memory_provenance", "documents", "document_chunks",
     }
 )

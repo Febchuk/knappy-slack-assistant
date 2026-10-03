@@ -121,3 +121,22 @@ Add bot scopes `files:read`, `files:write`, `reactions:write` (the last for [Spe
 | **TEST-FILE-05** | Ask for "a one-page project plan". The model calls `create_document`. | One `files_upload_v2` to the user's DM. No HITL card. |
 | **TEST-FILE-06** | Ask to "send that plan to Alex". | A `SHARE_FILE` approval card. Nothing reaches Alex before approval. |
 | **TEST-FILE-07** | User B asks for user A's document by id. | `read_file` returns not found. |
+
+---
+
+## 7. Implementation Notes
+
+Where the build differs from the text above, and why.
+
+- **Receiving.** `LocalStructuralFilter` never stood in the way: it only drops bot subtypes, and only on the `note:` ingestion path. The real gap was the reverse. `on_message` passed every subtype to the agent, including edits and deletions. It now admits only a person's new messages (`USER_SUBTYPES`: none, `file_share`, `thread_broadcast`).
+- **`InboundMessage` carries `attachments`, not `files`.** The runtime reads `event["files"]` before the loop runs. The loop only needs model-ready parts, so `UserMessage` gained `attachments: tuple[Attachment, ...]`, which `to_contents` turns into `Part.from_bytes` inline parts.
+- **Scanned PDF pages go to Gemini as one-page PDFs**, not page images. Gemini reads PDFs natively, so no rasterizer (poppler) is needed. At most 20 scanned pages per file are transcribed.
+- **The 100k-character inline budget is per message, not per file.** Three 90k files would otherwise put 270k characters in one turn.
+- **Unreadable types are not stored.** A row with no text gives `list_files` nothing to use and `forget` nothing to find. The reply says the type isn't readable yet.
+- **Uniqueness is `(workspace_id, owner_user_id, slack_file_id)`.** Every other table is workspace-scoped. Sharing the same file again reuses the stored document without downloading it.
+- **Deleting a document is forgetting its `document` record.** `forget` runs the Spec 13 cascade from it, and forgetting a `document` record also deletes its `documents` row and chunks. There is no separate delete tool.
+- **`SHARE_FILE` sends the stored text.** Raw bytes are not kept, so a shared PDF goes out as `<name>.txt`. Documents Knappy created go out under their own name. Shared files reach a user id through `conversations.open`.
+- **Created documents are summarized from their opening text**, not by the light model. They still get a `document` memory record.
+- **Notices are deterministic.** "Too large" and "not readable" are prefixed to the reply, and the model is told the user has already seen them.
+- **The bot token only goes to `https://*.slack.com`.** Without `files:read`, Slack answers with an HTML sign-in page; that is reported as a failed download instead of being read as the file.
+- **Document text is not redacted.** It is the owner's own file, scoped to them. The memory record, which feeds the profile and search, goes through the usual redaction.

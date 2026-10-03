@@ -15,6 +15,8 @@ oauth_config:
       - im:write
       - app_mentions:read
       - channels:history
+      - files:read
+      - files:write
       - groups:history
       - reactions:write
       - users:read

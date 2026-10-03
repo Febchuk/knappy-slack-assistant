@@ -14,7 +14,7 @@ from datetime import datetime, timedelta, timezone
 import httpx
 import pytest
 
-from fakes import FakeSlack, agent, event, memory_structured, op, user_turns
+from fakes import FakeSlack, agent, event, memory_structured, op, pdf_with, user_turns
 from journey import FakeFile, dm_channel, placeholder_replaced
 from knappy.agent.prompt import IDENTITY
 from knappy.llm.fake import FakeModel, GenerateRequest
@@ -214,31 +214,58 @@ async def test_j06_read_a_link(journey) -> None:
     assert f"<{url}|What's New In Python 3.13>" in reply.reply["text"]
 
 
-@pytest.mark.xfail(strict=True, reason="spec 15")
 async def test_j07_files_in(journey) -> None:
-    model = scripted({"what did that pdf say": ("search_documents", {"query": "pricing"})})
+    async def respond(request: GenerateRequest) -> ModelTurn:
+        """Looks the file up, reads the matching part, then answers: two tool rounds."""
+        asked_ = next(item.text for item in reversed(request.contents) if isinstance(item, UserMessage))
+        done = [item for item in request.contents if isinstance(item, ToolResult)]
+        if not asked_.startswith("what did that PDF say"):
+            return ModelTurn(text="summary")
+        if not done:
+            return ModelTurn(tool_calls=[ToolCall("c1", "list_files", {"query": "pricing"})])
+        if len(done) == 1:
+            found = done[0].result[0]["document_id"]
+            return ModelTurn(tool_calls=[ToolCall("c2", "read_file", {"document_id": found, "query": "pricing"})])
+        return ModelTurn(text="The Pro plan is $40 per seat.")
+
+    model = FakeModel(respond, structured=memory_structured())
     j = await journey(model)
-    pdf = FakeFile("pricing.pdf", "application/pdf", b"%PDF-1.4 Pricing: the Pro plan is $40 per seat per month.")
-    await j.dm("U1", "summarize this", files=(pdf,))
+    pdf = FakeFile("q3-proposal.pdf", "application/pdf", pdf_with(
+        "Q3 proposal for Acme. Scope: migrate the billing system to the new platform by September.",
+        "Pricing: the Pro plan is $40 per seat per month, billed annually, with a 10 percent discount over 100 seats.",
+        "Timeline: kickoff on July 1, pilot in August, rollout complete by the end of September.",
+    ))
+    shared = await j.dm("U1", "summarize this", files=(pdf,))
     await j.advance(days=1)
     later = await j.dm("U1", "what did that PDF say about pricing?", thread="new")
 
-    documents = await j.rows("SELECT * FROM memory_records WHERE type = 'document' AND status = 'ACTIVE'")
-    assert len(documents) == 1
-    assert "$40" in json.dumps(results(later, "search_documents"))
+    first = next(request for request in model.requests if request.contents[-1].text.startswith("summarize this"))
+    assert "$40 per seat" in first.contents[-1].text and "rollout complete" in first.contents[-1].text, "the PDF text is in the turn"
+    assert [request.headers["authorization"] for request in j.downloads] == ["Bearer xoxb-journey"]
+    assert placeholder_replaced(shared)
+    documents = await j.rows("SELECT id, name, text FROM documents WHERE owner_user_id = 'U1'")
+    assert [row["name"] for row in documents] == ["q3-proposal.pdf"]
+    records = await j.rows("SELECT body FROM memory_records WHERE type = 'document' AND status = 'ACTIVE'")
+    assert len(records) == 1 and f"[[doc:{documents[0]['id']}]]" in records[0]["body"]
+    assert [use.result[0]["name"] for use in later.called("list_files")] == ["q3-proposal.pdf"]
+    matches = later.called("read_file")[0].result["matches"]
+    assert any("$40 per seat" in match for match in matches), "found later from a different conversation"
 
 
-@pytest.mark.xfail(strict=True, reason="spec 15")
 async def test_j08_files_out(journey) -> None:
+    plan = "# Q3 offsite launch plan\n- Goals\n- Owners\n- Timeline"
     model = scripted({"write me a one-page launch plan": (
-        "create_document", {"title": "Q3 offsite launch plan", "markdown": "# Launch plan\n- Goals\n- Owners"}
+        "create_document", {"title": "Q3 offsite launch plan", "content_markdown": plan}
     )})
     j = await journey(model)
     reply = await j.dm("U1", "Write me a one-page launch plan for the Q3 offsite.")
 
     assert len(reply.called("create_document")) == 1
-    assert [upload["channel"] for upload in j.slack.uploads] == [dm_channel("U1")]
+    assert [(upload["channel"], upload["content"]) for upload in j.slack.uploads] == [(dm_channel("U1"), plan)]
     assert "btn_approve_action" not in reply.text, "a document for the user needs no approval card"
+    assert await j.rows("SELECT action_type FROM action_drafts") == []
+    stored = await j.rows("SELECT name, text FROM documents WHERE owner_user_id = 'U1'")
+    assert stored == [{"name": "q3-offsite-launch-plan.md", "text": plan}], "created documents are searchable later"
 
 
 def open_id(commitment: str):

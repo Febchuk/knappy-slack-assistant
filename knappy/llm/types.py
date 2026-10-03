@@ -38,8 +38,17 @@ class ModelTurn:
 
 
 @dataclass(frozen=True)
+class Attachment:
+    """Inline bytes the model reads alongside text: an image, or PDF pages with no text layer."""
+
+    mime_type: str
+    data: bytes = field(repr=False)
+
+
+@dataclass(frozen=True)
 class UserMessage:
     text: str
+    attachments: tuple[Attachment, ...] = ()
 
 
 @dataclass(frozen=True)

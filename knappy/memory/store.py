@@ -719,6 +719,8 @@ class MemoryStore:
                 dead_records.add(version["id"])
                 summaries[version["id"]] = f"{version['title']}: {summarize_body(version['body'])}"
                 await self.set_status(owner, [version["id"]], "FORGOTTEN", now)
+                if version["type"] == "document":
+                    await self._drop_documents(owner, version["id"])
             cascade.forgotten.append(record_id)
 
         for record_id in record_ids:
@@ -771,6 +773,19 @@ class MemoryStore:
                     await forget(record_id)
                     settled = False
         return cascade
+
+    async def _drop_documents(self, owner: str, record_id: str) -> None:
+        """A forgotten document record takes its stored text and chunks with it (Spec 15 §2.2)."""
+        for kind, document_id in await self.sources(owner, "record", record_id):
+            if kind != "document":
+                continue
+            scope = (self.workspace_id, owner, document_id)
+            await self._run(
+                "DELETE FROM document_chunks WHERE document_id IN "
+                "(SELECT id FROM documents WHERE workspace_id = ? AND owner_user_id = ? AND id = ?)",
+                scope,
+            )
+            await self._run("DELETE FROM documents WHERE workspace_id = ? AND owner_user_id = ? AND id = ?", scope)
 
     async def _dependents(self, owner: str, source_ids: set[str]) -> list[str]:
         ids = sorted(source_ids)

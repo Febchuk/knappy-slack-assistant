@@ -30,14 +30,17 @@ Result: ____
 
 Result: ____
 
-## J-07 Files in (blocked until Spec 15)
+## J-07 Files in, and a document out
+
+Needs the `files:read` and `files:write` scopes from `slack/manifest.yml`. Reinstall the app after updating the manifest, or Slack serves a sign-in page instead of the file and Knappy replies that it couldn't download it.
 
 | Step | Do | Expect |
 | :--- | :--- | :--- |
-| 1 | DM a real PDF (a pricing sheet works well) with the message `summarize this`. | A summary of that PDF. |
-| 2 | The next day, or after a restart, start a new thread: `what did that PDF say about pricing?` | An answer drawn from the PDF, naming it. |
-
-Result: ____
+| 1 | DM a real PDF (a pricing sheet works well) with the message `summarize this`. | The placeholder reads `_reading <name>.pdf…_`, then becomes a summary of that PDF. The log shows `document stored`. |
+| 2 | The next day, or after a restart, start a new thread: `what did that PDF say about pricing?` | An answer drawn from the PDF, naming it. The log shows `list_files`, `read_file`, or `memory_search`, not `web_search`. |
+| 3 | DM a screenshot with `what does this say?` | An answer that reads the screenshot's text. |
+| 4 | DM `write me a one-page launch plan for the Q3 offsite`. | A `.md` file arrives in your DM with a short summary next to it. No approval card. |
+| 5 | DM `send that plan to <@second user>`. | An approval card naming the file. The second user receives nothing until you approve; then exactly one file. |
 
 ## J-10 Act with approval, with a real second user
 

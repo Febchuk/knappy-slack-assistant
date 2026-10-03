@@ -17,6 +17,7 @@ from knappy.memory.types import RecordType, SavableType
 from knappy.web import WebFetcher
 
 if TYPE_CHECKING:
+    from knappy.files.service import DocumentFormat, FileService
     from knappy.memory.engine import MemoryEngine
 
 current_owner: ContextVar[str | None] = ContextVar("knappy_owner", default=None)
@@ -56,11 +57,14 @@ class GetMeetingContextArgs(BaseModel):
 
 
 class StageOutboundActionArgs(BaseModel):
-    action_type: Literal["SEND_SLACK_DM"]
+    action_type: Literal["SEND_SLACK_DM", "SHARE_FILE"] = Field(
+        ..., description="SEND_SLACK_DM for a message; SHARE_FILE to send one of the user's documents"
+    )
     recipient: str = Field(..., description="Display name of the person to message")
     summary: str = Field(..., description="One line describing the action, shown on the approval card")
-    staged_content: str = Field(..., description="The exact message text to send after approval")
+    staged_content: str = Field(..., description="The exact message text to send after approval; for SHARE_FILE, the note with the file")
     recipient_identifier: str | None = Field(default=None, description="Slack user id, if known")
+    document_id: str | None = Field(default=None, description="Required for SHARE_FILE: the document to send")
 
 
 class SearchSlackHistoryArgs(BaseModel):
@@ -122,6 +126,23 @@ class FetchUrlArgs(BaseModel):
     question: str | None = Field(default=None, description="What you need from the page, to focus long pages")
 
 
+class ReadFileArgs(BaseModel):
+    document_id: str = Field(..., description="Id from list_files, memory_search, or a [Shared file] note")
+    query: str | None = Field(default=None, description="What you need from the document; returns the best-matching parts")
+    max_chars: int = Field(default=20_000, ge=1_500, le=100_000)
+
+
+class ListFilesArgs(BaseModel):
+    query: str | None = Field(default=None, description="Words from the file's name or subject; empty lists the most recent")
+    limit: int = Field(default=10, ge=1, le=25)
+
+
+class CreateDocumentArgs(BaseModel):
+    title: str = Field(..., description="Short title, also used for the file name")
+    content_markdown: str = Field(..., description="The full document")
+    format: Literal["md", "txt", "csv"] = "md"
+
+
 TOOL_SPECS: dict[str, ToolSpec] = {
     spec.name: spec
     for spec in (
@@ -164,6 +185,18 @@ TOOL_SPECS: dict[str, ToolSpec] = {
             WebSearchArgs,
         ),
         ToolSpec("fetch_url", "Read one web page or PDF by URL, such as a link the user pasted.", FetchUrlArgs),
+        ToolSpec(
+            "read_file",
+            "Read a document the user shared or you created earlier: the full text, or with query the best-matching parts.",
+            ReadFileArgs,
+        ),
+        ToolSpec("list_files", "List the user's documents, newest first, with id, name, date, and summary.", ListFilesArgs),
+        ToolSpec(
+            "create_document",
+            "Deliver a long piece of writing as a file in the user's own DM. No approval needed. "
+            "Use it for answers over about 3,000 characters or when they ask for a doc, plan, or file.",
+            CreateDocumentArgs,
+        ),
     )
 }
 
@@ -182,6 +215,9 @@ TOOL_STATUS: dict[str, str] = {
     "search_conversations": "searching past conversations",
     "web_search": "searching the web",
     "fetch_url": "reading the page",
+    "read_file": "reading the file",
+    "list_files": "looking through your files",
+    "create_document": "writing the document",
 }
 
 
@@ -206,8 +242,10 @@ class ToolRegistry:
         memory: MemoryEngine | None = None,
         searcher: Model | None = None,
         fetcher: WebFetcher | None = None,
+        files: FileService | None = None,
     ) -> None:
         self.repo = repo
+        self.files = files
         self.workspace_id = workspace_id
         self.history = history
         self.memory = memory
@@ -272,15 +310,24 @@ class ToolRegistry:
         summary: str,
         staged_content: str,
         recipient_identifier: str | None = None,
-    ) -> StagedDraft:
+        document_id: str | None = None,
+    ) -> StagedDraft | dict[str, str]:
         thread = _thread()
+        metadata: dict[str, str] = {}
+        file_name = None
+        if action_type == "SHARE_FILE":
+            document = await self.files.documents.get(self._owner() or "", document_id) if self.files and document_id else None
+            if document is None:
+                return {"error": f"No document with id {document_id}. Find it with list_files."}
+            metadata["document_id"] = document.id
+            file_name = document.name
         staged = {
             "action_type": action_type,
             "recipient_identifier": recipient_identifier or recipient,
             "recipient_name": recipient,
             "preview_summary": summary,
             "staged_content": staged_content or summary,
-            "metadata": {},
+            "metadata": metadata,
         }
         draft_id = await self.repo.create_draft(
             workspace_id=self.workspace_id,
@@ -290,7 +337,7 @@ class ToolRegistry:
             action_type=action_type,
             payload=staged,
         )
-        return StagedDraft(draft_id, recipient, approval_blocks(draft_id, recipient, staged["staged_content"]))
+        return StagedDraft(draft_id, recipient, approval_blocks(draft_id, recipient, staged["staged_content"], file_name))
 
     async def add_commitment(
         self,
@@ -416,6 +463,31 @@ class ToolRegistry:
     async def fetch_url(self, url: str, question: str | None = None) -> dict[str, Any]:
         return await self.fetcher.fetch(url, question)
 
+    async def read_file(self, document_id: str, query: str | None = None, max_chars: int = 20_000) -> dict[str, Any]:
+        if self.files is None:
+            return _NO_FILES
+        owner = self._owner() or ""
+        document = await self.files.documents.get(owner, document_id)
+        if document is None:
+            return {"error": f"No document with id {document_id}"}
+        head = {"document_id": document.id, "name": document.name, "summary": document.summary}
+        if query:
+            parts = await self.files.documents.best_chunks(owner, document.id, query, max_chars)
+            if parts:
+                return {**head, "matches": [text for _seq, text in parts]}
+        text = document.text[:max_chars]
+        return {**head, "text": text, "truncated": len(text) < len(document.text)}
+
+    async def list_files(self, query: str | None = None, limit: int = 10) -> Any:
+        if self.files is None:
+            return _NO_FILES
+        return [document.listing() for document in await self.files.documents.recent(self._owner() or "", query, limit)]
+
+    async def create_document(self, title: str, content_markdown: str, format: DocumentFormat = "md") -> dict[str, Any]:
+        if self.files is None:
+            return _NO_FILES
+        return await self.files.create_document(self._owner() or "", _thread(), title, content_markdown, format)
+
     def specs(self) -> list[ToolSpec]:
         return list(TOOL_SPECS.values())
 
@@ -425,6 +497,7 @@ class ToolRegistry:
 
 
 _NO_MEMORY = {"error": "Memory is not available in this context."}
+_NO_FILES = {"error": "Files are not available in this context."}
 
 
 def _thread() -> SlackThread:

@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import asyncio
-import io
 import ipaddress
 import logging
 import re
@@ -14,6 +13,8 @@ from typing import Any
 import httpx
 import trafilatura
 from pydantic import BaseModel
+
+from knappy.files.extract import UnreadableError, pdf_page_texts
 
 logger = logging.getLogger("knappy")
 
@@ -140,10 +141,6 @@ async def _read_capped(response: httpx.Response) -> tuple[bytes, bool]:
     return b"".join(chunks), False
 
 
-class UnreadableError(Exception):
-    pass
-
-
 def readable(content_type: str, body: bytes, url: str) -> tuple[str | None, str]:
     if content_type == "application/pdf" or (not content_type and url.lower().endswith(".pdf")):
         return None, _pdf_text(body)
@@ -173,14 +170,7 @@ def _body_text(body: bytes) -> str:
 
 
 def _pdf_text(body: bytes) -> str:
-    from pypdf import PdfReader
-    from pypdf.errors import PdfReadError
-
-    try:
-        reader = PdfReader(io.BytesIO(body))
-        return "\n\n".join(page.extract_text() or "" for page in reader.pages).strip()
-    except (PdfReadError, ValueError) as exc:
-        raise UnreadableError(f"Could not read the PDF: {exc}") from None
+    return "\n\n".join(pdf_page_texts(body)).strip()
 
 
 def focus(text: str, question: str | None, limit: int) -> str:

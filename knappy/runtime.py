@@ -16,6 +16,8 @@ from knappy.agent.prompt import OPEN_LOOP_LIMIT, MemoryProvider, build_system_pr
 from knappy.agent.session import ConversationLocks, ConversationLog, Turn, as_messages, conversation_key
 from knappy.agent.tools import SlackThread, ToolRegistry, current_owner, current_thread, current_turn
 from knappy.db.repository import SqliteRepository, utc_now
+from knappy.files.service import FileService, Shared, SlackDownloader
+from knappy.files.store import DocumentStore
 from knappy.heartbeat.engine import HeartbeatEngine
 from knappy.heartbeat.triage import ProactiveAlertTriager, model_triage
 from knappy.hitl.gateway import ActionExecutor, ApprovalGateway
@@ -61,6 +63,7 @@ class KnappyRuntime:
         memory_config: MemoryConfig | None = None,
         clock: Callable[[], datetime] = utc_now,
         fetcher: WebFetcher | None = None,
+        downloader: SlackDownloader | None = None,
     ) -> None:
         self.repo = repo
         self.workspace_id = workspace_id
@@ -73,8 +76,11 @@ class KnappyRuntime:
         self.conversations: ConversationLog = self.store
         self.locks = ConversationLocks()
         self.users = UserDirectory(slack)
+        self.documents = DocumentStore(repo, workspace_id)
+        self.files = FileService(self.documents, self.store, model, downloader, slack)
         self.tools = ToolRegistry(
-            repo, workspace_id, history=slack, memory=self.memory_engine, searcher=model, fetcher=fetcher
+            repo, workspace_id, history=slack, memory=self.memory_engine, searcher=model, fetcher=fetcher,
+            files=self.files,
         )
         self.loop = AgentLoop(self.tools, model)
         gate = CompositeSystemOneGate(JevSystemOneAdapter(), RegexFallbackAdapter())
@@ -125,9 +131,11 @@ class KnappyRuntime:
         text = event["text"]
         if await self._over_budget(owner):
             return AgentReply(text=BUDGET_TEXT)
+        files = event.get("files") or []
+        shared = await self.files.receive(owner, key, files, reply.status) if files else Shared()
         history = await self.conversations.window(owner, key)
         system = None if text.lower().startswith("note:") else await self._system_prompt(owner, key)
-        turn_id = await self.conversations.append(owner, key, Turn("user", text), slack_ts=event.get("ts"))
+        turn_id = await self.conversations.append(owner, key, Turn("user", shared.logged(text)), slack_ts=event.get("ts"))
         turn_token = current_turn.set(turn_id)
         try:
             if system is None:
@@ -135,9 +143,14 @@ class KnappyRuntime:
                 answer = AgentReply(text=acknowledgement(extracted))
             else:
                 answer = await self.loop.run(
-                    InboundMessage(text=text, system=system, history=as_messages(history)),
+                    InboundMessage(
+                        text=shared.prompt(text), system=system, history=as_messages(history),
+                        attachments=shared.attachments,
+                    ),
                     on_status=reply.status,
                 )
+                if shared.notices:
+                    answer.text = "\n".join([*shared.notices, "", answer.text])
         finally:
             current_turn.reset(turn_token)
         for result in answer.tool_results:

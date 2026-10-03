@@ -25,6 +25,7 @@ from knappy.llm.types import (
     UserMessage,
     WebSearchResult,
 )
+from knappy.files.service import DocumentDigest
 from knappy.memory.types import EpisodeDraft, RecapDraft, ReconcileResult, RepassDraft
 
 WEEKDAYS = {
@@ -250,7 +251,11 @@ class FakeSlack:
 
     async def files_upload_v2(self, **kwargs):
         self.uploads.append(kwargs)
-        return {"ok": True, "files": [{"id": f"F{len(self.uploads)}"}]}
+        file_id = f"FUP{len(self.uploads)}"
+        return {"ok": True, "files": [{"id": file_id, "permalink": f"https://slack.test/files/{file_id}"}]}
+
+    async def conversations_open(self, *, users):
+        return {"ok": True, "channel": {"id": f"D{users}"}}
 
     async def views_open(self, **kwargs):
         self.modals.append(kwargs)
@@ -270,6 +275,32 @@ class FakeSlack:
         post = next(post for index, post in enumerate(self.posts, 1) if f"100.{index}" == ts)
         latest = [update for update in self.updates if update["ts"] == ts]
         return {**post, **latest[-1]} if latest else post
+
+
+def pdf_with(*pages: str) -> bytes:
+    """A minimal PDF with one page per argument. An empty string makes a page with no text layer, like a scan."""
+    count = len(pages)
+    objects = [b"<< /Type /Catalog /Pages 2 0 R >>", b"", b"<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica >>"]
+    kids = []
+    for text in pages:
+        stream = f"BT /F1 12 Tf 72 720 Td ({text}) Tj ET".encode() if text else b""
+        objects.append(b"<< /Length %d >>\nstream\n%s\nendstream" % (len(stream), stream))
+        kids.append(len(objects) + 1)
+        objects.append(
+            b"<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] /Contents %d 0 R /Resources << /Font << /F1 3 0 R >> >> >>"
+            % len(objects)
+        )
+    objects[1] = b"<< /Type /Pages /Kids [%s] /Count %d >>" % (b" ".join(b"%d 0 R" % kid for kid in kids), count)
+    out = bytearray(b"%PDF-1.4\n")
+    offsets = []
+    for number, body in enumerate(objects, 1):
+        offsets.append(len(out))
+        out += b"%d 0 obj\n%s\nendobj\n" % (number, body)
+    xref = len(out)
+    out += b"xref\n0 %d\n0000000000 65535 f \n" % (len(objects) + 1)
+    out += b"".join(b"%010d 00000 n \n" % offset for offset in offsets)
+    out += b"trailer\n<< /Size %d /Root 1 0 R >>\nstartxref\n%d\n%%%%EOF\n" % (len(objects) + 1, xref)
+    return bytes(out)
 
 
 def dm(text: str, ts: str, *, user: str = "U1", channel: str = "D1", thread_ts: str | None = None) -> dict:
@@ -320,6 +351,9 @@ def agent(script: dict[str, ToolPlan | list[ToolPlan]] | None = None):
     """
 
     async def respond(request):
+        if request.tier == "light":
+            attached = [item for message in request.contents for item in getattr(message, "attachments", ())]
+            return ModelTurn(text="Read: " + ", ".join(item.mime_type for item in attached))
         results = tool_results(request.contents)
         if results:
             return ModelTurn(text=json.dumps([result.result for result in results], default=str))
@@ -365,6 +399,9 @@ def memory_structured(reconcile: Reconcile | None = None):
             return RepassDraft(body="\n".join(kept))
         if schema is TriageJudgment:
             return TriageJudgment.model_validate(await heuristic_triage(json.loads(text)))
+        if schema is DocumentDigest:
+            name, _, body = text.partition("\n\n")
+            return DocumentDigest(summary=" ".join(body.split())[:300], key_terms=[name.removeprefix("File name: ")])
         raise AssertionError(f"memory_structured has no answer for {schema.__name__}")
 
     return respond

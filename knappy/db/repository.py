@@ -13,7 +13,7 @@ from typing import Any
 
 import aiosqlite
 
-from knappy.db.schema import EXPECTED_TABLES, SQLITE_SCHEMA
+from knappy.db.schema import EXPECTED_TABLES, SQLITE_ACTION_DRAFTS, SQLITE_SCHEMA
 from knappy.db.vectors import cosine_distance, pack_embedding
 
 
@@ -125,6 +125,7 @@ class SqliteRepository:
         await self.connection.execute("PRAGMA foreign_keys = ON")
         await self._migrate_owner_user_id()
         await self._migrate_commitment_scratchpad()
+        await self._migrate_action_types()
         await self.connection.commit()
 
     async def table_names(self) -> set[str]:
@@ -708,6 +709,23 @@ class SqliteRepository:
         for column, kind in (("next_check_at", "DATETIME"), ("on_no_progress", "TEXT"), ("waiting_on", "TEXT")):
             if column not in columns:
                 await self.connection.execute(f"ALTER TABLE interactions ADD COLUMN {column} {kind}")
+
+    async def _migrate_action_types(self) -> None:
+        """Databases created before SHARE_FILE carry the old CHECK constraint; rebuild the table to widen it."""
+        row = await self._one("SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'action_drafts'", ())
+        if row is None or "SHARE_FILE" in row["sql"]:
+            return
+        await self.connection.execute("PRAGMA foreign_keys = OFF")
+        await self.connection.executescript(
+            "ALTER TABLE action_drafts RENAME TO action_drafts_old;\n"
+            + SQLITE_ACTION_DRAFTS
+            + """
+            INSERT INTO action_drafts SELECT * FROM action_drafts_old;
+            DROP TABLE action_drafts_old;
+            CREATE INDEX IF NOT EXISTS idx_action_drafts_pending ON action_drafts (user_id, status) WHERE status = 'PENDING';
+            """
+        )
+        await self.connection.execute("PRAGMA foreign_keys = ON")
 
     async def _migrate_owner_user_id(self) -> None:
         if self.dialect != "sqlite":
