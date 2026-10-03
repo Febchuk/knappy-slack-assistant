@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+from datetime import datetime, timezone
 from typing import Any
 
 from knappy.db.repository import SqliteRepository
@@ -37,11 +38,12 @@ class _PgConnection:
         converted, values = _placeholders(sql, params)
         async with self._busy:
             await self._begin()
+            statement = await self.raw.prepare(converted)
+            typed = [_typed(value, kind.name) for value, kind in zip(values, statement.get_parameters())]
+            rows = await statement.fetch(*typed)
             if _returns_rows(converted):
-                rows = await self.raw.fetch(converted, *values)
                 return _PgResult(rows, len(rows))
-            status = await self.raw.execute(converted, *values)
-            return _PgResult([], _rowcount(status))
+            return _PgResult([], _rowcount(statement.get_statusmsg()))
 
     async def executescript(self, script: str) -> None:
         async with self._busy:
@@ -107,6 +109,16 @@ def _placeholders(sql: str, params: tuple[Any, ...]) -> tuple[str, tuple[Any, ..
     if index != len(params):
         raise ValueError(f"Expected {index} SQL parameters, got {len(params)}")
     return "".join(parts), params
+
+
+def _typed(value: Any, pg_type: str) -> Any:
+    """The repository passes UTC timestamps as 'YYYY-MM-DD HH:MM:SS' text; asyncpg wants datetimes for timestamp columns."""
+    if isinstance(value, str) and pg_type in ("timestamptz", "timestamp"):
+        parsed = datetime.fromisoformat(value.replace("Z", "+00:00"))
+        if parsed.tzinfo is None:
+            parsed = parsed.replace(tzinfo=timezone.utc)
+        return parsed if pg_type == "timestamptz" else parsed.astimezone(timezone.utc).replace(tzinfo=None)
+    return value
 
 
 def _returns_rows(sql: str) -> bool:

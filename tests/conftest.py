@@ -2,7 +2,12 @@
 
 from __future__ import annotations
 
+import os
+
 import pytest
+
+# Spec 13 §5: the hashed embedder is for tests only. Tests that need real embeddings opt in.
+os.environ["KNAPPY_EMBEDDER"] = "hash"
 
 from knappy.db.repository import SqliteRepository
 

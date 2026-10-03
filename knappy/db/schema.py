@@ -38,7 +38,10 @@ CREATE TABLE IF NOT EXISTS interactions (
     embedding BLOB,
     last_alerted_at DATETIME,
     created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
-    owner_user_id TEXT NOT NULL DEFAULT ''
+    owner_user_id TEXT NOT NULL DEFAULT '',
+    next_check_at DATETIME,
+    on_no_progress TEXT,
+    waiting_on TEXT
 );
 
 CREATE TABLE IF NOT EXISTS action_drafts (
@@ -78,6 +81,115 @@ CREATE TABLE IF NOT EXISTS model_usage (
     cost_usd REAL NOT NULL DEFAULT 0,
     PRIMARY KEY (workspace_id, owner_user_id, day)
 );
+
+CREATE TABLE IF NOT EXISTS conversation_turns (
+    seq INTEGER PRIMARY KEY,
+    id TEXT NOT NULL UNIQUE,
+    workspace_id TEXT NOT NULL,
+    owner_user_id TEXT NOT NULL,
+    conversation_key TEXT NOT NULL,
+    role TEXT NOT NULL CHECK(role IN ('user', 'assistant', 'tool')),
+    content TEXT NOT NULL,
+    slack_ts TEXT,
+    created_at DATETIME NOT NULL,
+    reconciled_at DATETIME
+);
+CREATE INDEX IF NOT EXISTS idx_turns_conv ON conversation_turns (owner_user_id, conversation_key, seq);
+CREATE INDEX IF NOT EXISTS idx_turns_unreconciled ON conversation_turns (owner_user_id, reconciled_at) WHERE reconciled_at IS NULL;
+
+CREATE VIRTUAL TABLE IF NOT EXISTS turns_fts USING fts5(
+    content, content='conversation_turns', content_rowid='seq', tokenize='porter unicode61'
+);
+CREATE TRIGGER IF NOT EXISTS turns_fts_insert AFTER INSERT ON conversation_turns BEGIN
+    INSERT INTO turns_fts (rowid, content) VALUES (new.seq, new.content);
+END;
+CREATE TRIGGER IF NOT EXISTS turns_fts_delete AFTER DELETE ON conversation_turns BEGIN
+    INSERT INTO turns_fts (turns_fts, rowid, content) VALUES ('delete', old.seq, old.content);
+END;
+
+CREATE TABLE IF NOT EXISTS memory_records (
+    seq INTEGER PRIMARY KEY,
+    id TEXT NOT NULL,
+    workspace_id TEXT NOT NULL,
+    owner_user_id TEXT NOT NULL,
+    type TEXT NOT NULL CHECK(type IN (
+        'person', 'org', 'fact', 'preference', 'decision',
+        'workstream', 'episode_daily', 'episode_weekly', 'document')),
+    title TEXT NOT NULL,
+    aliases TEXT NOT NULL DEFAULT '',
+    body TEXT NOT NULL,
+    links TEXT NOT NULL DEFAULT '[]',
+    source TEXT NOT NULL,
+    contact_id TEXT REFERENCES contacts(id) ON DELETE SET NULL,
+    status TEXT NOT NULL DEFAULT 'ACTIVE' CHECK(status IN ('ACTIVE', 'SUPERSEDED', 'FORGOTTEN', 'EXPIRED')),
+    supersedes TEXT,
+    valid_from DATETIME NOT NULL,
+    expires_at DATETIME,
+    updated_at DATETIME NOT NULL,
+    embedding BLOB,
+    UNIQUE (workspace_id, owner_user_id, id)
+);
+CREATE INDEX IF NOT EXISTS idx_records_owner ON memory_records (owner_user_id, status, updated_at);
+
+CREATE VIRTUAL TABLE IF NOT EXISTS memory_fts USING fts5(
+    title, aliases, body, content='memory_records', content_rowid='seq', tokenize='porter unicode61'
+);
+CREATE TRIGGER IF NOT EXISTS memory_fts_insert AFTER INSERT ON memory_records BEGIN
+    INSERT INTO memory_fts (rowid, title, aliases, body) VALUES (new.seq, new.title, new.aliases, new.body);
+END;
+CREATE TRIGGER IF NOT EXISTS memory_fts_delete AFTER DELETE ON memory_records BEGIN
+    INSERT INTO memory_fts (memory_fts, rowid, title, aliases, body) VALUES ('delete', old.seq, old.title, old.aliases, old.body);
+END;
+CREATE TRIGGER IF NOT EXISTS memory_fts_update AFTER UPDATE OF title, aliases, body ON memory_records BEGIN
+    INSERT INTO memory_fts (memory_fts, rowid, title, aliases, body) VALUES ('delete', old.seq, old.title, old.aliases, old.body);
+    INSERT INTO memory_fts (rowid, title, aliases, body) VALUES (new.seq, new.title, new.aliases, new.body);
+END;
+
+CREATE TABLE IF NOT EXISTS user_profile (
+    workspace_id TEXT NOT NULL,
+    owner_user_id TEXT NOT NULL,
+    body TEXT NOT NULL,
+    timezone TEXT,
+    generated_at DATETIME NOT NULL,
+    nightly_on TEXT,
+    PRIMARY KEY (workspace_id, owner_user_id)
+);
+
+CREATE TABLE IF NOT EXISTS conversation_recaps (
+    owner_user_id TEXT NOT NULL,
+    conversation_key TEXT NOT NULL,
+    body TEXT NOT NULL,
+    through_turn_id TEXT NOT NULL,
+    updated_at DATETIME NOT NULL,
+    PRIMARY KEY (owner_user_id, conversation_key)
+);
+
+CREATE TABLE IF NOT EXISTS memory_events (
+    id TEXT PRIMARY KEY,
+    workspace_id TEXT NOT NULL,
+    owner_user_id TEXT NOT NULL,
+    kind TEXT NOT NULL CHECK(kind IN (
+        'learned', 'changed', 'commitment_made', 'commitment_progress',
+        'commitment_done', 'decision', 'document_added', 'forgotten')),
+    summary TEXT NOT NULL,
+    occurred_at DATETIME NOT NULL,
+    admission_score REAL NOT NULL,
+    status TEXT NOT NULL DEFAULT 'ACTIVE' CHECK(status IN ('ACTIVE', 'RETRACTED')),
+    commitment_id TEXT,
+    created_at DATETIME NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_events_owner_time ON memory_events (owner_user_id, occurred_at);
+CREATE INDEX IF NOT EXISTS idx_events_commitment ON memory_events (commitment_id) WHERE commitment_id IS NOT NULL;
+
+CREATE TABLE IF NOT EXISTS memory_provenance (
+    target_type TEXT NOT NULL CHECK(target_type IN ('event', 'record')),
+    target_id TEXT NOT NULL,
+    source_type TEXT NOT NULL CHECK(source_type IN ('turn', 'document', 'event', 'record', 'migration')),
+    source_id TEXT NOT NULL,
+    owner_user_id TEXT NOT NULL,
+    PRIMARY KEY (owner_user_id, target_type, target_id, source_type, source_id)
+);
+CREATE INDEX IF NOT EXISTS idx_prov_source ON memory_provenance (owner_user_id, source_type, source_id);
 
 CREATE INDEX IF NOT EXISTS idx_contacts_cadence ON contacts (workspace_id, last_interaction_ts);
 CREATE INDEX IF NOT EXISTS idx_interactions_due ON interactions (status, due_date) WHERE status = 'PENDING';
@@ -174,8 +286,107 @@ CREATE INDEX IF NOT EXISTS idx_interactions_contact ON interactions (contact_id)
 CREATE INDEX IF NOT EXISTS idx_interactions_embedding ON interactions USING hnsw (embedding vector_cosine_ops);
 CREATE INDEX IF NOT EXISTS idx_action_drafts_pending ON action_drafts (user_id, status) WHERE status = 'PENDING';
 CREATE INDEX IF NOT EXISTS idx_briefing_items_queued ON briefing_items (workspace_id, status) WHERE status = 'QUEUED';
+
+ALTER TABLE interactions ADD COLUMN IF NOT EXISTS next_check_at TEXT;
+ALTER TABLE interactions ADD COLUMN IF NOT EXISTS on_no_progress TEXT;
+ALTER TABLE interactions ADD COLUMN IF NOT EXISTS waiting_on TEXT;
+
+CREATE TABLE IF NOT EXISTS conversation_turns (
+    seq BIGSERIAL PRIMARY KEY,
+    id TEXT NOT NULL UNIQUE,
+    workspace_id TEXT NOT NULL,
+    owner_user_id TEXT NOT NULL,
+    conversation_key TEXT NOT NULL,
+    role TEXT NOT NULL CHECK(role IN ('user', 'assistant', 'tool')),
+    content TEXT NOT NULL,
+    slack_ts TEXT,
+    created_at TEXT NOT NULL,
+    reconciled_at TEXT,
+    search TSVECTOR GENERATED ALWAYS AS (to_tsvector('english', content)) STORED
+);
+CREATE INDEX IF NOT EXISTS idx_turns_conv ON conversation_turns (owner_user_id, conversation_key, seq);
+CREATE INDEX IF NOT EXISTS idx_turns_unreconciled ON conversation_turns (owner_user_id, reconciled_at) WHERE reconciled_at IS NULL;
+CREATE INDEX IF NOT EXISTS idx_turns_search ON conversation_turns USING GIN (search);
+
+CREATE TABLE IF NOT EXISTS memory_records (
+    seq BIGSERIAL PRIMARY KEY,
+    id TEXT NOT NULL,
+    workspace_id TEXT NOT NULL,
+    owner_user_id TEXT NOT NULL,
+    type TEXT NOT NULL CHECK(type IN (
+        'person', 'org', 'fact', 'preference', 'decision',
+        'workstream', 'episode_daily', 'episode_weekly', 'document')),
+    title TEXT NOT NULL,
+    aliases TEXT NOT NULL DEFAULT '',
+    body TEXT NOT NULL,
+    links TEXT NOT NULL DEFAULT '[]',
+    source TEXT NOT NULL,
+    contact_id TEXT,
+    status TEXT NOT NULL DEFAULT 'ACTIVE' CHECK(status IN ('ACTIVE', 'SUPERSEDED', 'FORGOTTEN', 'EXPIRED')),
+    supersedes TEXT,
+    valid_from TEXT NOT NULL,
+    expires_at TEXT,
+    updated_at TEXT NOT NULL,
+    embedding BYTEA,
+    search TSVECTOR GENERATED ALWAYS AS (
+        setweight(to_tsvector('english', title || ' ' || aliases), 'A') || setweight(to_tsvector('english', body), 'D')
+    ) STORED,
+    UNIQUE (workspace_id, owner_user_id, id)
+);
+CREATE INDEX IF NOT EXISTS idx_records_owner ON memory_records (owner_user_id, status, updated_at);
+CREATE INDEX IF NOT EXISTS idx_records_search ON memory_records USING GIN (search);
+
+CREATE TABLE IF NOT EXISTS user_profile (
+    workspace_id TEXT NOT NULL,
+    owner_user_id TEXT NOT NULL,
+    body TEXT NOT NULL,
+    timezone TEXT,
+    generated_at TEXT NOT NULL,
+    nightly_on TEXT,
+    PRIMARY KEY (workspace_id, owner_user_id)
+);
+
+CREATE TABLE IF NOT EXISTS conversation_recaps (
+    owner_user_id TEXT NOT NULL,
+    conversation_key TEXT NOT NULL,
+    body TEXT NOT NULL,
+    through_turn_id TEXT NOT NULL,
+    updated_at TEXT NOT NULL,
+    PRIMARY KEY (owner_user_id, conversation_key)
+);
+
+CREATE TABLE IF NOT EXISTS memory_events (
+    id TEXT PRIMARY KEY,
+    workspace_id TEXT NOT NULL,
+    owner_user_id TEXT NOT NULL,
+    kind TEXT NOT NULL CHECK(kind IN (
+        'learned', 'changed', 'commitment_made', 'commitment_progress',
+        'commitment_done', 'decision', 'document_added', 'forgotten')),
+    summary TEXT NOT NULL,
+    occurred_at TEXT NOT NULL,
+    admission_score DOUBLE PRECISION NOT NULL,
+    status TEXT NOT NULL DEFAULT 'ACTIVE' CHECK(status IN ('ACTIVE', 'RETRACTED')),
+    commitment_id TEXT,
+    created_at TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_events_owner_time ON memory_events (owner_user_id, occurred_at);
+CREATE INDEX IF NOT EXISTS idx_events_commitment ON memory_events (commitment_id) WHERE commitment_id IS NOT NULL;
+
+CREATE TABLE IF NOT EXISTS memory_provenance (
+    target_type TEXT NOT NULL CHECK(target_type IN ('event', 'record')),
+    target_id TEXT NOT NULL,
+    source_type TEXT NOT NULL CHECK(source_type IN ('turn', 'document', 'event', 'record', 'migration')),
+    source_id TEXT NOT NULL,
+    owner_user_id TEXT NOT NULL,
+    PRIMARY KEY (owner_user_id, target_type, target_id, source_type, source_id)
+);
+CREATE INDEX IF NOT EXISTS idx_prov_source ON memory_provenance (owner_user_id, source_type, source_id);
 """
 
 EXPECTED_TABLES = frozenset(
-    {"workspaces", "contacts", "interactions", "action_drafts", "briefing_items", "model_usage"}
+    {
+        "workspaces", "contacts", "interactions", "action_drafts", "briefing_items", "model_usage",
+        "conversation_turns", "memory_records", "user_profile", "conversation_recaps",
+        "memory_events", "memory_provenance",
+    }
 )

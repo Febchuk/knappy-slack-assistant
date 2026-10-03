@@ -15,6 +15,7 @@ dependencies = [
     "aiohttp>=3.9",
     "asyncpg>=0.29",
     "google-genai>=1.0",
+    "fastembed>=0.4",
 ]
 
 [project.optional-dependencies]

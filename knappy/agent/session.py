@@ -27,7 +27,7 @@ def is_dm(event: dict[str, Any]) -> bool:
 
 @dataclass(frozen=True)
 class Turn:
-    role: Literal["user", "assistant"]
+    role: Literal["user", "assistant", "tool"]
     text: str
 
 
@@ -36,25 +36,11 @@ def as_messages(turns: list[Turn]) -> list[Message]:
 
 
 class ConversationLog(Protocol):
-    async def append(self, owner: str, key: str, turn: Turn) -> None: ...
+    """Persisted by knappy.memory.store.MemoryStore (Spec 13 §3.1)."""
+
+    async def append(self, owner: str, key: str, turn: Turn, slack_ts: str | None = None) -> str: ...
 
     async def window(self, owner: str, key: str, limit: int = WINDOW_TURNS) -> list[Turn]: ...
-
-
-class InMemoryConversationLog:
-    """Process-local log. Spec 13 replaces it with persisted conversation_turns."""
-
-    def __init__(self, keep: int = WINDOW_TURNS) -> None:
-        self.keep = keep
-        self._turns: dict[tuple[str, str], list[Turn]] = {}
-
-    async def append(self, owner: str, key: str, turn: Turn) -> None:
-        bucket = self._turns.setdefault((owner, key), [])
-        bucket.append(turn)
-        del bucket[: -self.keep]
-
-    async def window(self, owner: str, key: str, limit: int = WINDOW_TURNS) -> list[Turn]:
-        return list(self._turns.get((owner, key), [])[-limit:])
 
 
 class ConversationLocks:

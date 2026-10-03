@@ -4,8 +4,8 @@ from __future__ import annotations
 
 from contextvars import ContextVar
 from dataclasses import dataclass
-from datetime import datetime
-from typing import Any, Literal
+from datetime import date, datetime, time, timezone
+from typing import TYPE_CHECKING, Any, Literal
 
 from pydantic import AwareDatetime, BaseModel, Field
 
@@ -13,8 +13,14 @@ from knappy.db.repository import SqliteRepository, format_ts
 from knappy.hitl.blocks import approval_blocks
 from knappy.ingestion.embed import generate_embedding
 from knappy.llm.types import ToolSpec
+from knappy.memory.types import RecordType, SavableType
+
+if TYPE_CHECKING:
+    from knappy.memory.engine import MemoryEngine
 
 current_owner: ContextVar[str | None] = ContextVar("knappy_owner", default=None)
+# The logged user turn being answered. Memory written by tools cites it as provenance.
+current_turn: ContextVar[str | None] = ContextVar("knappy_turn", default=None)
 
 
 @dataclass(frozen=True)
@@ -77,6 +83,34 @@ class CompleteCommitmentArgs(BaseModel):
     )
 
 
+class RememberArgs(BaseModel):
+    text: str = Field(..., description="The fact, preference, or correction in the user's terms: 'Vegetarian; no fish either'")
+    type: SavableType = Field(default="fact", description="preference for likes and dislikes, person for someone they know")
+    about: str | None = Field(
+        default=None, description="Short subject ('diet', 'manager'), or an existing record id to correct that record"
+    )
+
+
+class ForgetArgs(BaseModel):
+    query_or_id: str = Field(..., description="A record id from memory_search, or a short description of what to forget")
+
+
+class MemorySearchArgs(BaseModel):
+    query: str = Field(..., description="Keywords; empty returns the most recently updated records")
+    types: list[RecordType] = Field(default_factory=list)
+    limit: int = Field(default=8, ge=1, le=25)
+
+
+class MemoryReadArgs(BaseModel):
+    id: str
+    history: bool = Field(default=False, description="Include earlier versions of the record")
+
+
+class SearchConversationsArgs(BaseModel):
+    query: str
+    since: date | None = Field(default=None, description="Only conversations on or after this date")
+
+
 TOOL_SPECS: dict[str, ToolSpec] = {
     spec.name: spec
     for spec in (
@@ -91,6 +125,27 @@ TOOL_SPECS: dict[str, ToolSpec] = {
         ToolSpec("search_slack_history", "Search recent messages in Slack channels Knappy was invited to.", SearchSlackHistoryArgs),
         ToolSpec("add_commitment", "Record something the user will do, or asked to be reminded about.", AddCommitmentArgs),
         ToolSpec("complete_commitment", "Mark one of the user's commitments done or cancelled.", CompleteCommitmentArgs),
+        ToolSpec(
+            "remember",
+            "Save a lasting fact, preference, or correction about the user now. To correct a record, pass its id as about.",
+            RememberArgs,
+        ),
+        ToolSpec(
+            "forget",
+            "Forget memory records and everything derived from them. Returns what was forgotten; tell the user.",
+            ForgetArgs,
+        ),
+        ToolSpec(
+            "memory_search",
+            "Search what you know about the user: people, organizations, facts, preferences, decisions, workstreams, past days.",
+            MemorySearchArgs,
+        ),
+        ToolSpec(
+            "memory_read",
+            "Read one memory record in full, with the sources it came from and when. Use it to answer 'why do you think that?'.",
+            MemoryReadArgs,
+        ),
+        ToolSpec("search_conversations", "Search earlier conversations with the user by keywords.", SearchConversationsArgs),
     )
 }
 
@@ -102,6 +157,11 @@ TOOL_STATUS: dict[str, str] = {
     "search_slack_history": "searching Slack",
     "add_commitment": "saving that",
     "complete_commitment": "updating your commitments",
+    "remember": "remembering that",
+    "forget": "forgetting that",
+    "memory_search": "checking what I know",
+    "memory_read": "checking what I know",
+    "search_conversations": "searching past conversations",
 }
 
 
@@ -118,10 +178,17 @@ class StagedDraft:
 
 
 class ToolRegistry:
-    def __init__(self, repo: SqliteRepository, workspace_id: str, history: Any | None = None) -> None:
+    def __init__(
+        self,
+        repo: SqliteRepository,
+        workspace_id: str,
+        history: Any | None = None,
+        memory: MemoryEngine | None = None,
+    ) -> None:
         self.repo = repo
         self.workspace_id = workspace_id
         self.history = history
+        self.memory = memory
 
     def _owner(self) -> str | None:
         return current_owner.get()
@@ -155,13 +222,13 @@ class ToolRegistry:
             company=company,
             owner_user_id=self._owner(),
         )
-        if topic and not contacts:
-            matches = await self.repo.nearest_interactions(
-                generate_embedding(topic),
+        embedding = generate_embedding(topic) if topic and not contacts else None
+        if embedding is not None:
+            return await self.repo.nearest_interactions(
+                embedding,
                 workspace_id=self.workspace_id,
                 owner_user_id=self._owner(),
             )
-            return matches
         return contacts
 
     async def get_meeting_context(self, contact_name: str, limit: int = 5) -> list[dict[str, Any]]:
@@ -290,12 +357,41 @@ class ToolRegistry:
                     return hits
         return hits
 
+    async def remember(self, text: str, type: str = "fact", about: str | None = None) -> dict[str, Any]:
+        if self.memory is None:
+            return _NO_MEMORY
+        return await self.memory.remember(self._owner() or "", text, type, about, current_turn.get())
+
+    async def forget(self, query_or_id: str) -> dict[str, Any]:
+        if self.memory is None:
+            return _NO_MEMORY
+        return await self.memory.forget(self._owner() or "", query_or_id, current_turn.get())
+
+    async def memory_search(self, query: str, types: list[str] | None = None, limit: int = 8) -> Any:
+        if self.memory is None:
+            return _NO_MEMORY
+        return await self.memory.store.search(self._owner() or "", query, types=types or [], limit=limit)
+
+    async def memory_read(self, id: str, history: bool = False) -> dict[str, Any]:
+        if self.memory is None:
+            return _NO_MEMORY
+        return await self.memory.read(self._owner() or "", id, history)
+
+    async def search_conversations(self, query: str, since: date | None = None) -> Any:
+        if self.memory is None:
+            return _NO_MEMORY
+        start = datetime.combine(since, time(0), timezone.utc) if since else None
+        return await self.memory.store.search_conversations(self._owner() or "", query, start)
+
     def specs(self) -> list[ToolSpec]:
         return list(TOOL_SPECS.values())
 
     async def call(self, name: str, arguments: dict[str, Any]) -> Any:
         method = getattr(self, name)
         return await method(**arguments)
+
+
+_NO_MEMORY = {"error": "Memory is not available in this context."}
 
 
 def _thread() -> SlackThread:

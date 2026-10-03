@@ -14,6 +14,9 @@ IDENTITY = """You are Knappy, a personal assistant that lives in Slack. You work
 Operating principles:
 - Answer, don't refuse. Every reasonable request gets a real attempt. Use your own knowledge when no tool applies. Never say you only handle certain topics.
 - Use tools when they help. The user's commitments, contacts, meeting notes, and Slack history live behind tools, not in your head. Call independent tools together in one turn. When a tool returns an error, decide whether to retry, try another route, or tell the user what you could not get.
+- You have long-term memory of this user. "About the user" below is your profile of them; use it without making them repeat themselves. For anything deeper, call memory_search (people, preferences, facts, decisions, workstreams, past days) and memory_read, or search_conversations for what was said in earlier conversations. Check memory before saying you don't know something about the user.
+- When the user asks you to remember something, states a lasting preference or fact about themselves, or corrects something you know, call remember. Things mentioned in passing are learned in the background, so don't call remember for every detail.
+- When the user asks you to forget something, call forget and tell them exactly what was forgotten. When they ask why you believe something, call memory_read and cite when they told you. If memory has nothing, say so plainly; never invent a memory.
 - Reads are free; anything that reaches another person is gated. To message someone, call stage_outbound_action. It only creates a draft card the user must approve. Never say a message was sent, delivered, or scheduled. Say it is drafted and waiting for their approval.
 - When the user says they will do something or asks to be reminded, record it with add_commitment. When they say something is done or no longer needed, call complete_commitment with the id from the open commitments below or from search_commitments.
 - Be direct. Lead with the answer. Ask a clarifying question only when no reasonable assumption exists; otherwise state the assumption and proceed.
@@ -31,19 +34,15 @@ FINAL_TURN_NOTE = (
 
 @dataclass(frozen=True)
 class MemoryContext:
-    """Per-owner memory slots. Spec 13 fills them; until then both stay empty."""
+    """Per-owner memory for one prompt (Spec 13 §4.1)."""
 
     profile: str | None = None
     recap: str | None = None
+    workstreams: tuple[dict[str, str], ...] = ()
 
 
 class MemoryProvider(Protocol):
     async def load(self, owner: str, conversation_key: str) -> MemoryContext: ...
-
-
-class NoMemory:
-    async def load(self, owner: str, conversation_key: str) -> MemoryContext:
-        return MemoryContext()
 
 
 def build_system_prompt(
@@ -56,7 +55,7 @@ def build_system_prompt(
     sections = [IDENTITY, current_time(now, timezone)]
     if memory.profile:
         sections.append(f"About the user:\n{memory.profile}")
-    sections.append(format_open_loops(open_loops))
+    sections.append(format_open_loops(open_loops, memory.workstreams))
     if memory.recap:
         sections.append(f"Earlier in this conversation:\n{memory.recap}")
     return "\n\n".join(sections)
@@ -74,12 +73,18 @@ def current_time(now: datetime, timezone: str) -> str:
     )
 
 
-def format_open_loops(rows: list[dict[str, Any]]) -> str:
-    if not rows:
-        return "Open commitments: none."
-    lines = []
-    for row in rows[:OPEN_LOOP_LIMIT]:
-        who = f" (for {row['contact_name']})" if row.get("contact_name") else ""
-        due = f", due {row['due_date']} UTC" if row.get("due_date") else ""
-        lines.append(f"- [{row['id']}] {row['commitment']}{who}{due}")
-    return "Open commitments (id in brackets):\n" + "\n".join(lines)
+def format_open_loops(rows: list[dict[str, Any]], workstreams: tuple[dict[str, str], ...] = ()) -> str:
+    if rows:
+        lines = []
+        for row in rows[:OPEN_LOOP_LIMIT]:
+            who = f" (for {row['contact_name']})" if row.get("contact_name") else ""
+            due = f", due {row['due_date']} UTC" if row.get("due_date") else ""
+            lines.append(f"- [{row['id']}] {row['commitment']}{who}{due}")
+        text = "Open commitments (id in brackets):\n" + "\n".join(lines)
+    else:
+        text = "Open commitments: none."
+    if workstreams:
+        text += "\n\nActive workstreams (memory id in brackets):\n" + "\n".join(
+            f"- [{item['id']}] {item['title']}" for item in workstreams[:OPEN_LOOP_LIMIT]
+        )
+    return text

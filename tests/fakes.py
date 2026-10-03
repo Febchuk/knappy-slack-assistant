@@ -2,8 +2,10 @@
 
 from __future__ import annotations
 
+import inspect
 import json
 import re
+from collections.abc import Awaitable, Callable
 from datetime import datetime, timedelta
 from typing import Any
 
@@ -12,6 +14,7 @@ from pydantic import BaseModel
 from knappy.heartbeat.triage import TriageJudgment
 from knappy.ingestion.extract import ExtractedInteraction
 from knappy.llm.types import Message, ModelTurn, SchemaT, Tier, ToolCall, ToolResult, ToolSpec, UserMessage
+from knappy.memory.types import EpisodeDraft, RecapDraft, ReconcileResult, RepassDraft
 
 WEEKDAYS = {
     "monday": 0,
@@ -78,6 +81,9 @@ def heuristic_extract(text: str, now: datetime | None = None) -> ExtractedIntera
 
 
 async def heuristic_triage(candidate: dict[str, Any]) -> dict[str, float | str]:
+    check = candidate.get("hours_until_check")
+    if isinstance(check, (int, float)) and check <= 0:
+        return {"interrupt_probability": 0.9, "strategy": "immediate_dm", "strategy_confidence": 0.9, "consequence_score": 2.0}
     hours = candidate.get("hours_until_due")
     if isinstance(hours, (int, float)) and hours <= 4:
         return {"interrupt_probability": 0.9, "strategy": "immediate_dm", "strategy_confidence": 0.9, "consequence_score": 2.0}
@@ -232,3 +238,49 @@ def dm(text: str, ts: str, *, user: str = "U1", channel: str = "D1", thread_ts: 
 
 def mention(text: str, ts: str, *, user: str = "U1", channel: str = "C1") -> dict:
     return {"type": "app_mention", "text": f"<@UBOT> {text}", "channel": channel, "user": user, "ts": ts}
+
+
+Reconcile = Callable[[dict[str, Any]], "ReconcileResult | dict[str, Any] | Awaitable[ReconcileResult | dict[str, Any]]"]
+
+
+def memory_structured(reconcile: Reconcile | None = None):
+    """Structured responder for FakeModel: a scripted reconciler plus deterministic memory drafts.
+
+    `reconcile` receives the reconciler's JSON payload (records, open_commitments, turns).
+    Episodes list their inputs, recaps join the turns, and re-passes drop lines that mention a forgotten word.
+    """
+
+    async def respond(schema: type[BaseModel], system: str, text: str) -> Any:
+        if schema is ReconcileResult:
+            if reconcile is None:
+                return ReconcileResult()
+            result = reconcile(json.loads(text))
+            return await result if inspect.isawaitable(result) else result
+        if schema is EpisodeDraft:
+            if text.startswith("{"):
+                return EpisodeDraft(body="\n".join(f"- {event['summary']}" for event in json.loads(text)["events"]))
+            return EpisodeDraft(body="\n".join(line for line in text.splitlines() if line.startswith("- ")))
+        if schema is RecapDraft:
+            return RecapDraft(body="\n".join(f"- {line}" for line in text.splitlines() if line.startswith(("user:", "assistant:"))))
+        if schema is RepassDraft:
+            data = json.loads(text)
+            words = {word for line in data["forget"] for word in re.findall(r"[a-z]{5,}", line.lower())}
+            kept = [line for line in data["record"]["body"].splitlines() if not words & set(re.findall(r"[a-z]{5,}", line.lower()))]
+            return RepassDraft(body="\n".join(kept))
+        if schema is TriageJudgment:
+            return TriageJudgment.model_validate(await heuristic_triage(json.loads(text)))
+        raise AssertionError(f"memory_structured has no answer for {schema.__name__}")
+
+    return respond
+
+
+def event(kind: str, summary: str, turns: list[str], score: float = 0.9, occurred_at: str = "2026-10-03T12:00:00Z") -> dict:
+    return {"kind": kind, "summary": summary, "occurred_at": occurred_at, "source_turn_ids": turns, "admission_score": score}
+
+
+def op(kind: str, *, events: list[int], score: float = 0.9, reason: str = "test", **fields: Any) -> dict:
+    return {"op": kind, "from_events": events, "admission_score": score, "reason": reason, **fields}
+
+
+def user_turns(payload: dict[str, Any]) -> list[dict[str, Any]]:
+    return [turn for turn in payload["turns"] if turn["role"] == "user"]

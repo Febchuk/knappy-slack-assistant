@@ -5,7 +5,7 @@ from __future__ import annotations
 from datetime import datetime, timezone
 from typing import Any, Awaitable, Callable
 
-from knappy.db.repository import SqliteRepository, format_ts
+from knappy.db.repository import SqliteRepository, format_ts, utc_now
 from knappy.heartbeat.triage import ProactiveAlertTriager
 from knappy.hitl.blocks import proactive_blocks
 
@@ -22,14 +22,16 @@ Sender = Callable[..., Awaitable[None]]
 Synthesizer = Callable[[dict[str, Any]], Awaitable[str]]
 
 
-def hours_until(due_date: str) -> float:
+def hours_until(due_date: str, now: datetime | None = None) -> float:
     due = datetime.strptime(due_date, "%Y-%m-%d %H:%M:%S").replace(tzinfo=timezone.utc)
-    now = datetime.now(timezone.utc)
-    return (due - now).total_seconds() / 3600
+    return (due - (now or datetime.now(timezone.utc))).total_seconds() / 3600
 
 
 def default_synthesis(candidate: dict[str, Any]) -> str:
     name = candidate.get("contact_name") or "someone"
+    if candidate.get("check_due") and candidate.get("on_no_progress"):
+        waiting = f" (waiting on {candidate['waiting_on']})" if candidate.get("waiting_on") else ""
+        return f"No progress on {candidate['commitment']}{waiting}. Suggested next step: {candidate['on_no_progress']}"
     if candidate.get("commitment"):
         return f"Deadline approaching for {name}: {candidate['commitment']}"
     days = candidate.get("days_since_last_contact")
@@ -46,6 +48,7 @@ class HeartbeatEngine:
         user_id: str,
         sender: Sender | None = None,
         synthesize: Synthesizer | None = None,
+        clock: Callable[[], datetime] = utc_now,
     ) -> None:
         self.repo = repo
         self.triager = triager
@@ -53,11 +56,12 @@ class HeartbeatEngine:
         self.user_id = user_id
         self.sender = sender
         self.synthesize = synthesize or _async_default
+        self.clock = clock
         self.classifier_calls = 0
 
     async def run_tick(self, *, include_cadence: bool = False, deliver_digest: bool = False) -> dict[str, int]:
         counts = {"scanned": 0, "immediate": 0, "queued": 0, "suppressed": 0, "digests": 0}
-        commitments = await self.repo.scan_due_commitments(self.workspace_id)
+        commitments = await self.repo.scan_due_commitments(self.workspace_id, now=self.clock())
         candidates = [self._commitment_candidate(row) for row in commitments]
         if include_cadence:
             for row in await self.repo.scan_dormant_contacts(self.workspace_id):
@@ -160,12 +164,13 @@ class HeartbeatEngine:
             await self.sender(channel=owner, text=summary, blocks=blocks)
 
     def _commitment_candidate(self, row: dict[str, Any]) -> dict[str, Any]:
-        return {
-            **row,
-            "kind": "COMMITMENT",
-            "hours_until_due": hours_until(row["due_date"]),
-            "summary": row.get("commitment"),
-        }
+        now = self.clock()
+        candidate = {**row, "kind": "COMMITMENT", "summary": row.get("commitment"), "check_due": bool(row.get("check_due"))}
+        if row.get("due_date"):
+            candidate["hours_until_due"] = hours_until(row["due_date"], now)
+        if candidate["check_due"]:
+            candidate["hours_until_check"] = hours_until(row["next_check_at"], now)
+        return candidate
 
     def _cadence_candidate(self, row: dict[str, Any]) -> dict[str, Any]:
         last = datetime.strptime(row["last_interaction_ts"], "%Y-%m-%d %H:%M:%S").replace(tzinfo=timezone.utc)

@@ -46,17 +46,14 @@ class Settings:
     model_agent: str = DEFAULT_MODEL_AGENT
     model_light: str = DEFAULT_MODEL_LIGHT
     daily_budget_usd: float = 1.00
+    admission_threshold: float = 0.4
+    raw_retention_days: int = 90
 
     @classmethod
     def from_env(cls) -> Settings:
         missing = [name for name in REQUIRED if not os.environ.get(name)]
         if missing:
             raise ConfigError(f"Missing required environment variables: {', '.join(missing)}")
-        budget = os.environ.get("KNAPPY_DAILY_BUDGET_USD", "1.00")
-        try:
-            daily_budget = float(budget)
-        except ValueError:
-            raise ConfigError(f"KNAPPY_DAILY_BUDGET_USD must be a number, got {budget!r}") from None
         return cls(
             slack_bot_token=os.environ["SLACK_BOT_TOKEN"],
             slack_app_token=os.environ["SLACK_APP_TOKEN"],
@@ -65,5 +62,15 @@ class Settings:
             database_url=os.environ.get("KNAPPY_DATABASE_URL", "sqlite:///knappy.db"),
             model_agent=os.environ.get("KNAPPY_MODEL_AGENT") or DEFAULT_MODEL_AGENT,
             model_light=os.environ.get("KNAPPY_MODEL_LIGHT") or DEFAULT_MODEL_LIGHT,
-            daily_budget_usd=daily_budget,
+            daily_budget_usd=_number("KNAPPY_DAILY_BUDGET_USD", "1.00", float),
+            admission_threshold=_number("KNAPPY_ADMISSION_THRESHOLD", "0.4", float),
+            raw_retention_days=_number("KNAPPY_RAW_RETENTION_DAYS", "90", int),
         )
+
+
+def _number(name: str, default: str, kind: type[float] | type[int]):
+    raw = os.environ.get(name) or default
+    try:
+        return kind(raw)
+    except ValueError:
+        raise ConfigError(f"{name} must be a number, got {raw!r}") from None

@@ -2,8 +2,12 @@
 
 from __future__ import annotations
 
+import asyncio
 import json
 import uuid
+from collections.abc import AsyncIterator
+from contextlib import asynccontextmanager
+from contextvars import ContextVar
 from datetime import datetime, timedelta, timezone
 from typing import Any
 
@@ -24,6 +28,51 @@ def format_ts(value: datetime | None = None) -> str:
     return current.strftime("%Y-%m-%d %H:%M:%S")
 
 
+# The repository whose transaction the current task is inside, if any.
+_transaction_owner: ContextVar[object | None] = ContextVar("knappy_transaction_owner", default=None)
+
+
+class _SerializedConnection:
+    """Wraps the single shared connection so a transaction() block is atomic.
+
+    Concurrent tool calls share one connection. Outside a transaction each statement,
+    commit, and rollback waits for any open transaction to finish, so no foreign
+    commit or rollback can land in the middle of one.
+    """
+
+    def __init__(self, repo: SqliteRepository, raw: Any) -> None:
+        self._repo = repo
+        self.raw = raw
+
+    def _inside(self) -> bool:
+        return _transaction_owner.get() is self._repo
+
+    async def execute(self, sql: str, params: Any = ()) -> Any:
+        if self._inside():
+            return await self.raw.execute(sql, params)
+        async with self._repo.lock:
+            return await self.raw.execute(sql, params)
+
+    async def executescript(self, script: str) -> None:
+        async with self._repo.lock:
+            await self.raw.executescript(script)
+
+    async def commit(self) -> None:
+        if self._inside():
+            return
+        async with self._repo.lock:
+            await self.raw.commit()
+
+    async def rollback(self) -> None:
+        if self._inside():
+            return
+        async with self._repo.lock:
+            await self.raw.rollback()
+
+    def __getattr__(self, name: str) -> Any:
+        return getattr(self.raw, name)
+
+
 class SqliteRepository:
     """Async repository. One connection owns an in-memory or file database."""
 
@@ -31,7 +80,8 @@ class SqliteRepository:
 
     def __init__(self, path: str = ":memory:") -> None:
         self.path = path
-        self._conn: aiosqlite.Connection | None = None
+        self._conn: Any = None
+        self.lock = asyncio.Lock()
 
     async def connect(self) -> None:
         self._conn = await aiosqlite.connect(self.path)
@@ -44,15 +94,37 @@ class SqliteRepository:
             self._conn = None
 
     @property
-    def connection(self) -> aiosqlite.Connection:
+    def connection(self) -> Any:
         if self._conn is None:
             raise RuntimeError("Repository is not connected")
-        return self._conn
+        return _SerializedConnection(self, self._conn)
+
+    @asynccontextmanager
+    async def transaction(self) -> AsyncIterator[None]:
+        """Run the block atomically. Nested blocks join the outer transaction.
+
+        Never await another task that touches this repository inside the block: it would wait on the lock.
+        """
+        if _transaction_owner.get() is self:
+            yield
+            return
+        async with self.lock:
+            token = _transaction_owner.set(self)
+            try:
+                yield
+            except BaseException:
+                await self._conn.rollback()
+                raise
+            else:
+                await self._conn.commit()
+            finally:
+                _transaction_owner.reset(token)
 
     async def init_schema(self) -> None:
         await self.connection.executescript(SQLITE_SCHEMA)
         await self.connection.execute("PRAGMA foreign_keys = ON")
         await self._migrate_owner_user_id()
+        await self._migrate_commitment_scratchpad()
         await self.connection.commit()
 
     async def table_names(self) -> set[str]:
@@ -378,7 +450,10 @@ class SqliteRepository:
         )
         await self.connection.commit()
 
-    async def scan_due_commitments(self, workspace_id: str, within_hours: int = 12) -> list[dict[str, Any]]:
+    async def scan_due_commitments(
+        self, workspace_id: str, within_hours: int = 12, now: datetime | None = None
+    ) -> list[dict[str, Any]]:
+        """Pending commitments due soon, plus scratchpad check-ins (Spec 13 §2) that saw no progress."""
         if self.dialect == "postgres":
             due_sql = "i.due_date <= NOW() + (? * INTERVAL '1 hour')"
             alert_sql = "i.last_alerted_at < NOW() - INTERVAL '24 hours'"
@@ -387,6 +462,14 @@ class SqliteRepository:
             due_sql = "i.due_date <= datetime('now', ?)"
             alert_sql = "i.last_alerted_at < datetime('now', '-24 hours')"
             due_param = f"+{within_hours} hours"
+        check_sql = """
+            i.next_check_at IS NOT NULL AND i.next_check_at <= ?
+            AND NOT EXISTS (
+                SELECT 1 FROM memory_events e
+                WHERE e.commitment_id = CAST(i.id AS TEXT)
+                  AND e.kind = 'commitment_progress' AND e.status = 'ACTIVE'
+            )
+        """
         return await self._all(
             f"""
             SELECT
@@ -398,17 +481,20 @@ class SqliteRepository:
                 i.id AS interaction_id,
                 i.commitment,
                 i.due_date,
-                i.summary
+                i.summary,
+                i.next_check_at,
+                i.on_no_progress,
+                i.waiting_on,
+                CASE WHEN {check_sql} THEN 1 ELSE 0 END AS check_due
             FROM interactions i
             LEFT JOIN contacts c ON i.contact_id = c.id
             WHERE i.workspace_id = ?
               AND i.status = 'PENDING'
               AND i.commitment IS NOT NULL
-              AND i.due_date IS NOT NULL
-              AND {due_sql}
+              AND ((i.due_date IS NOT NULL AND {due_sql}) OR ({check_sql}))
               AND (i.last_alerted_at IS NULL OR {alert_sql})
             """,
-            (workspace_id, due_param),
+            (format_ts(now), workspace_id, due_param, format_ts(now)),
         )
 
     async def scan_dormant_contacts(self, workspace_id: str) -> list[dict[str, Any]]:
@@ -615,6 +701,13 @@ class SqliteRepository:
         if self.dialect == "postgres":
             return "[" + ",".join(format(float(value), ".8g") for value in embedding) + "]"
         return pack_embedding(embedding)
+
+    async def _migrate_commitment_scratchpad(self) -> None:
+        cursor = await self.connection.execute("PRAGMA table_info(interactions)")
+        columns = {row["name"] for row in await cursor.fetchall()}
+        for column, kind in (("next_check_at", "DATETIME"), ("on_no_progress", "TEXT"), ("waiting_on", "TEXT")):
+            if column not in columns:
+                await self.connection.execute(f"ALTER TABLE interactions ADD COLUMN {column} {kind}")
 
     async def _migrate_owner_user_id(self) -> None:
         if self.dialect != "sqlite":

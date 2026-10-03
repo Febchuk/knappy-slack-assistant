@@ -10,8 +10,11 @@ from slack_bolt.adapter.socket_mode.async_handler import AsyncSocketModeHandler
 
 from knappy.config import Settings, load_dotenv
 from knappy.db.factory import open_repository
+from knappy.db.repository import utc_now
 from knappy.heartbeat.schedule import cadence_due
+from knappy.ingestion.embed import semantic
 from knappy.llm.client import GeminiClient, ModelIds
+from knappy.memory import MemoryConfig
 from knappy.runtime import KnappyRuntime, usage_recorder
 from knappy.slack.actions import register_actions
 from knappy.slack.app import create_app
@@ -48,6 +51,16 @@ async def _heartbeat_loop(engine) -> None:
         await asyncio.sleep(30 * 60)
 
 
+async def _memory_loop(engine) -> None:
+    """Idle reconciles and the nightly pass (Spec 13 §3.3). Every minute, so idleness is noticed promptly."""
+    while True:
+        try:
+            await engine.tick()
+        except Exception:
+            logging.getLogger("knappy").exception("memory tick failed")
+        await asyncio.sleep(60)
+
+
 async def _serve() -> None:
     load_dotenv()
     settings = Settings.from_env()
@@ -78,20 +91,29 @@ async def _serve() -> None:
         sender=say,
         executor=SlackActionExecutor(app.client),
         slack=app.client,
+        memory_config=MemoryConfig(
+            admission_threshold=settings.admission_threshold, raw_retention_days=settings.raw_retention_days
+        ),
     )
+    semantic()  # loads the embedder now, and logs a warning if it cannot
+    migrated = await runtime.store.migrate_contacts(utc_now())
+    if migrated:
+        logging.getLogger("knappy").info("memory migrated contacts=%d", migrated)
     holder["runtime"] = runtime
     register_actions(app, runtime)
     tick = asyncio.create_task(_heartbeat_loop(runtime.heartbeat))
+    memory = asyncio.create_task(_memory_loop(runtime.memory_engine))
     handler = AsyncSocketModeHandler(app, settings.slack_app_token)
     print("⚡️ Knappy is connected via Socket Mode!")
     try:
         await handler.start_async()
     finally:
-        tick.cancel()
-        try:
-            await tick
-        except asyncio.CancelledError:
-            pass
+        for task in (tick, memory):
+            task.cancel()
+            try:
+                await task
+            except asyncio.CancelledError:
+                pass
         await repo.close()
 
 

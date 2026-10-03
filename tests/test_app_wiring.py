@@ -269,6 +269,7 @@ async def test_socket_mode_serve(monkeypatch: pytest.MonkeyPatch, tmp_path) -> N
     monkeypatch.setenv("GEMINI_API_KEY", "test-key")
     monkeypatch.setenv("KNAPPY_DATABASE_URL", f"sqlite:///{tmp_path / 'knappy.db'}")
     monkeypatch.setenv("KNAPPY_WORKSPACE_ID", "T_SERVE")
+    monkeypatch.setenv("KNAPPY_ADMISSION_THRESHOLD", "0.55")
 
     from slack_bolt.adapter.socket_mode.async_handler import AsyncSocketModeHandler
     from slack_sdk.web.async_client import AsyncWebClient
@@ -295,8 +296,17 @@ async def test_socket_mode_serve(monkeypatch: pytest.MonkeyPatch, tmp_path) -> N
         return runtime
 
     monkeypatch.setattr(main_module, "KnappyRuntime", capture)
+    ticking: list = []
+
+    async def memory_loop(engine):
+        ticking.append(engine)
+
+    monkeypatch.setattr(main_module, "_memory_loop", memory_loop)
     await _serve()
     runtime = built[0]
+    assert ticking == [runtime.memory_engine]
+    assert runtime.memory_engine.model is runtime.loop.model
+    assert runtime.memory_engine.config.admission_threshold == 0.55
     assert isinstance(runtime.loop.model, GeminiClient)
     assert runtime.pipeline.extractor.model is runtime.loop.model
     assert runtime.tools.history is runtime.users.client is not None

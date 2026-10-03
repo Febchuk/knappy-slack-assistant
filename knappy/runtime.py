@@ -3,24 +3,19 @@
 from __future__ import annotations
 
 import asyncio
+import json
 import logging
 import re
 import uuid
-from datetime import datetime, timezone
+from collections.abc import Callable
+from datetime import datetime
 from typing import Any
 
 from knappy.agent.loop import AgentLoop, AgentReply, InboundMessage
-from knappy.agent.prompt import OPEN_LOOP_LIMIT, MemoryProvider, NoMemory, build_system_prompt
-from knappy.agent.session import (
-    ConversationLocks,
-    ConversationLog,
-    InMemoryConversationLog,
-    Turn,
-    as_messages,
-    conversation_key,
-)
-from knappy.agent.tools import SlackThread, ToolRegistry, current_owner, current_thread
-from knappy.db.repository import SqliteRepository
+from knappy.agent.prompt import OPEN_LOOP_LIMIT, MemoryProvider, build_system_prompt
+from knappy.agent.session import ConversationLocks, ConversationLog, Turn, as_messages, conversation_key
+from knappy.agent.tools import SlackThread, ToolRegistry, current_owner, current_thread, current_turn
+from knappy.db.repository import SqliteRepository, utc_now
 from knappy.heartbeat.engine import HeartbeatEngine
 from knappy.heartbeat.triage import ProactiveAlertTriager, model_triage
 from knappy.hitl.gateway import ActionExecutor, ApprovalGateway
@@ -28,7 +23,8 @@ from knappy.ingestion.extract import SlmExtractor
 from knappy.ingestion.gate import CompositeSystemOneGate, JevSystemOneAdapter, RegexFallbackAdapter
 from knappy.ingestion.pipeline import IngestionPipeline, acknowledgement
 from knappy.llm.client import OnUsage
-from knappy.llm.types import Model, Tier, Usage
+from knappy.llm.types import Model, Tier, ToolResult, Usage
+from knappy.memory import MemoryConfig, MemoryEngine, MemoryStore
 from knappy.slack.egress import Reply, SlackEgress, open_reply
 from knappy.slack.users import UserDirectory
 
@@ -60,17 +56,21 @@ class KnappyRuntime:
         sender: SlackEgress | None = None,
         slack: Any | None = None,
         memory: MemoryProvider | None = None,
-        conversations: ConversationLog | None = None,
+        memory_config: MemoryConfig | None = None,
+        clock: Callable[[], datetime] = utc_now,
     ) -> None:
         self.repo = repo
         self.workspace_id = workspace_id
         self.say = say
         self.daily_budget_usd = daily_budget_usd
-        self.memory = memory or NoMemory()
-        self.conversations = conversations or InMemoryConversationLog()
+        self.clock = clock
+        self.store = MemoryStore(repo, workspace_id, clock)
+        self.memory_engine = MemoryEngine(self.store, model, memory_config)
+        self.memory: MemoryProvider = memory or self.memory_engine
+        self.conversations: ConversationLog = self.store
         self.locks = ConversationLocks()
         self.users = UserDirectory(slack)
-        self.tools = ToolRegistry(repo, workspace_id, history=slack)
+        self.tools = ToolRegistry(repo, workspace_id, history=slack, memory=self.memory_engine)
         self.loop = AgentLoop(self.tools, model)
         gate = CompositeSystemOneGate(JevSystemOneAdapter(), RegexFallbackAdapter())
         self.pipeline = IngestionPipeline(repo, gate, SlmExtractor(model), workspace_id)
@@ -81,6 +81,7 @@ class KnappyRuntime:
             workspace_id=workspace_id,
             user_id="user",
             sender=sender,
+            clock=clock,
         )
 
     def bind_user(self, user_id: str) -> None:
@@ -119,19 +120,23 @@ class KnappyRuntime:
         text = event["text"]
         if await self._over_budget(owner):
             return AgentReply(text=BUDGET_TEXT)
-        if text.lower().startswith("note:"):
-            extracted = await self.pipeline.commit({**event, "workspace_id": self.workspace_id})
-            answer = AgentReply(text=acknowledgement(extracted))
-        else:
-            history, system = await asyncio.gather(
-                self.conversations.window(owner, key),
-                self._system_prompt(owner, key),
-            )
-            answer = await self.loop.run(
-                InboundMessage(text=text, system=system, history=as_messages(history)),
-                on_status=reply.status,
-            )
-        await self.conversations.append(owner, key, Turn("user", text))
+        history = await self.conversations.window(owner, key)
+        system = None if text.lower().startswith("note:") else await self._system_prompt(owner, key)
+        turn_id = await self.conversations.append(owner, key, Turn("user", text), slack_ts=event.get("ts"))
+        turn_token = current_turn.set(turn_id)
+        try:
+            if system is None:
+                extracted = await self.pipeline.commit({**event, "workspace_id": self.workspace_id})
+                answer = AgentReply(text=acknowledgement(extracted))
+            else:
+                answer = await self.loop.run(
+                    InboundMessage(text=text, system=system, history=as_messages(history)),
+                    on_status=reply.status,
+                )
+        finally:
+            current_turn.reset(turn_token)
+        for result in answer.tool_results:
+            await self.conversations.append(owner, key, Turn("tool", _tool_turn(result, turn_id)))
         await self.conversations.append(owner, key, Turn("assistant", answer.text))
         return answer
 
@@ -143,14 +148,21 @@ class KnappyRuntime:
                 self.workspace_id, query="", owner_user_id=owner, match_text=False, limit=OPEN_LOOP_LIMIT
             ),
         )
-        return build_system_prompt(
-            now=datetime.now(timezone.utc), timezone=zone, memory=memory, open_loops=open_loops
-        )
+        await self.store.set_timezone(owner, zone)
+        return build_system_prompt(now=self.clock(), timezone=zone, memory=memory, open_loops=open_loops)
 
     async def _over_budget(self, owner: str) -> bool:
         if self.daily_budget_usd is None:
             return False
         return await self.repo.spend_today(self.workspace_id, owner) >= self.daily_budget_usd
+
+
+def _tool_turn(result: ToolResult, turn_id: str) -> str:
+    """What a tool turn stores: enough to replay remember and forget on rebuild (Spec 13 §3.5)."""
+    output = json.dumps(result.result, default=str)
+    return json.dumps(
+        {"tool": result.call.name, "args": result.call.args, "turn": turn_id, "result": output[:2000]}, default=str
+    )
 
 
 class _RefusingExecutor:

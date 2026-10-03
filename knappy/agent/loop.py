@@ -33,6 +33,7 @@ class AgentReply:
     text: str
     blocks: list[dict[str, Any]] | None = None
     draft_id: str | None = None
+    tool_results: list[ToolResult] = field(default_factory=list)
 
 
 class AgentLoop:
@@ -57,6 +58,7 @@ class AgentLoop:
         deadline = started + self.wall_clock_s
         contents: list[Message] = [*message.history, UserMessage(message.text)]
         drafts: list[StagedDraft] = []
+        ran: list[ToolResult] = []
         specs = self.tools.specs()
         steps = 0
         for steps in range(1, self.max_steps + 1):
@@ -72,18 +74,19 @@ class AgentLoop:
                 break
             if not turn.tool_calls:
                 logger.info("agent steps=%d stop=answer ms=%d", steps, _ms(started))
-                return _reply(turn.text, drafts)
+                return _reply(turn.text, drafts, ran)
             contents.append(turn)
             if on_status is not None:
                 await on_status(_status(turn.tool_calls))
             results = await self._run_tools(turn.tool_calls, deadline)
             drafts.extend(result.result for result in results if isinstance(result.result, StagedDraft))
+            ran.extend(_for_model(result) for result in results)
             contents.extend(_for_model(result) for result in results)
         final = await self.model.generate(
             tier="agent", system=f"{message.system}\n\n{FINAL_TURN_NOTE}", contents=contents, tools=None
         )
         logger.info("agent steps=%d stop=limit ms=%d", steps, _ms(started))
-        return _reply(final.text, drafts)
+        return _reply(final.text, drafts, ran)
 
     async def _run_tools(self, calls: list[ToolCall], deadline: float) -> list[ToolResult]:
         tasks = [asyncio.ensure_future(self._run_tool(call)) for call in calls]
@@ -131,12 +134,12 @@ def _status(calls: list[ToolCall]) -> str:
     return ", ".join(labels)
 
 
-def _reply(text: str | None, drafts: list[StagedDraft]) -> AgentReply:
+def _reply(text: str | None, drafts: list[StagedDraft], ran: list[ToolResult]) -> AgentReply:
     answer = (text or "").strip() or EMPTY_ANSWER
     if not drafts:
-        return AgentReply(text=answer)
+        return AgentReply(text=answer, tool_results=ran)
     blocks = [block for draft in drafts for block in draft.blocks]
-    return AgentReply(text=answer, blocks=blocks, draft_id=drafts[-1].draft_id)
+    return AgentReply(text=answer, blocks=blocks, draft_id=drafts[-1].draft_id, tool_results=ran)
 
 
 def _ms(started: float) -> int:
