@@ -11,6 +11,7 @@ from typing import Any
 
 from slack_bolt.adapter.socket_mode.async_handler import AsyncSocketModeHandler
 
+from knappy.awareness.ingest import Awareness, Pacing
 from knappy.config import Settings, load_dotenv
 from knappy.db.factory import open_repository
 from knappy.db.repository import utc_now
@@ -69,6 +70,38 @@ async def _memory_loop(engine) -> None:
         await asyncio.sleep(60)
 
 
+AWARENESS_EVERY_S = 30
+
+
+async def _awareness_loop(awareness: Awareness) -> None:
+    """Catch-up and buffer flushes (Spec 18 §2-§3). Every 30 seconds, so a quiet conversation flushes on time."""
+    while True:
+        try:
+            await awareness.tick()
+        except Exception:
+            logging.getLogger("knappy").exception("awareness tick failed")
+        await asyncio.sleep(AWARENESS_EVERY_S)
+
+
+def user_web_client(token: str) -> Any:
+    """The owner's own Web API client. Retries on rate limits, since catch-up reads many conversations."""
+    from slack_sdk.http_retry.builtin_async_handlers import AsyncRateLimitErrorRetryHandler
+    from slack_sdk.web.async_client import AsyncWebClient
+
+    client = AsyncWebClient(token=token)
+    client.retry_handlers.append(AsyncRateLimitErrorRetryHandler(max_retry_count=3))
+    return client
+
+
+async def _identity(client: Any) -> str | None:
+    try:
+        auth = await client.auth_test()
+    except Exception as exc:
+        logging.getLogger("knappy").warning("auth.test failed error=%s", type(exc).__name__)
+        return None
+    return auth.get("user_id")
+
+
 async def open_runtime(
     settings: Settings,
     *,
@@ -78,8 +111,22 @@ async def open_runtime(
     clock: Callable[[], datetime] = utc_now,
     fetcher: WebFetcher | None = None,
     downloader: SlackDownloader | None = None,
+    user_client: Any | None = None,
+    awareness_pacing: Pacing | None = None,
 ) -> KnappyRuntime:
-    """Open the database and build the runtime the process serves. Without a model, Gemini with usage recording."""
+    """Open the database and build the runtime the process serves. Without a model, Gemini with usage recording.
+
+    With a user token (or a `user_client`), workspace awareness reads the token owner's conversations (Spec 18).
+    """
+    log = logging.getLogger("knappy")
+    if user_client is None and settings.slack_user_token:
+        user_client = user_web_client(settings.slack_user_token)
+    owner = await _identity(user_client) if user_client is not None else None
+    if owner is None:
+        user_client = None
+        log.info("workspace awareness off: SLACK_USER_TOKEN is not set or not valid")
+    else:
+        log.info("workspace awareness on owner=%s", owner)
     repo = await open_repository(settings.database_url)
     await repo.init_schema()
     await repo.upsert_workspace(workspace_id, "Knappy", settings.slack_bot_token)
@@ -96,7 +143,7 @@ async def open_runtime(
         daily_budget_usd=settings.daily_budget_usd,
         say=say,
         sender=say,
-        executor=SlackActionExecutor(client, DocumentStore(repo, workspace_id)),
+        executor=SlackActionExecutor(client, DocumentStore(repo, workspace_id), user_client=user_client, user_id=owner),
         slack=client,
         memory_config=MemoryConfig(
             admission_threshold=settings.admission_threshold, raw_retention_days=settings.raw_retention_days
@@ -104,6 +151,11 @@ async def open_runtime(
         clock=clock,
         fetcher=fetcher,
         downloader=downloader or SlackDownloader(settings.slack_bot_token),
+        user_client=user_client,
+        awareness_owner=owner,
+        bot_user_id=await _identity(client) if owner else None,
+        awareness_threshold=settings.awareness_threshold,
+        awareness_pacing=awareness_pacing,
     )
     migrated = await runtime.store.migrate_contacts(clock())
     if migrated:
@@ -115,26 +167,29 @@ async def _serve() -> None:
     load_dotenv()
     settings = Settings.from_env()
     holder: dict[str, KnappyRuntime] = {}
+    listener: dict = {}
 
     async def process(event):
         runtime = holder.get("runtime")
         if runtime is not None:
             await runtime.handle_event(event)
 
-    app = create_app(settings, processor=process)
+    app = create_app(settings, processor=process, awareness=listener)
     workspace_id = await _workspace_id(app.client)
     runtime = await open_runtime(settings, workspace_id=workspace_id, client=app.client)
     semantic()  # loads the embedder now, and logs a warning if it cannot
     holder["runtime"] = runtime
     register_actions(app, runtime)
-    tick = asyncio.create_task(_heartbeat_loop(runtime.heartbeat))
-    memory = asyncio.create_task(_memory_loop(runtime.memory_engine))
+    tasks = [asyncio.create_task(_heartbeat_loop(runtime.heartbeat)), asyncio.create_task(_memory_loop(runtime.memory_engine))]
+    if runtime.awareness is not None:
+        listener["listener"] = runtime.awareness
+        tasks.append(asyncio.create_task(_awareness_loop(runtime.awareness)))
     handler = AsyncSocketModeHandler(app, settings.slack_app_token)
     print("⚡️ Knappy is connected via Socket Mode!")
     try:
         await handler.start_async()
     finally:
-        for task in (tick, memory):
+        for task in tasks:
             task.cancel()
             try:
                 await task

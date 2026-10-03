@@ -21,11 +21,28 @@ oauth_config:
       - reactions:write
       - users:read
       - users:read.email
+    # Spec 18 workspace awareness: read the installer's own conversations, and post replies as them after approval.
+    user:
+      - channels:history
+      - groups:history
+      - im:history
+      - mpim:history
+      - channels:read
+      - groups:read
+      - im:read
+      - mpim:read
+      - users:read
+      - chat:write
 settings:
   socket_mode_enabled: true
   event_subscriptions:
     bot_events:
       - message.im
       - app_mention
+    user_events:
+      - message.channels
+      - message.groups
+      - message.im
+      - message.mpim
   interactivity:
     is_enabled: true

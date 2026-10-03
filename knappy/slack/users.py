@@ -24,26 +24,38 @@ class UserDirectory:
     def __init__(self, client: Any | None, ttl_s: float = CACHE_TTL_S) -> None:
         self.client = client
         self.ttl_s = ttl_s
-        self._timezones: dict[str, tuple[str, float]] = {}
+        self._users: dict[str, tuple[dict[str, Any], float]] = {}
         self._members: tuple[list[dict[str, Any]], float] | None = None
 
     async def timezone(self, user_id: str) -> str:
-        cached = self._timezones.get(user_id)
+        return (await self._info(user_id)).get("tz") or DEFAULT_TIMEZONE
+
+    async def names(self, user_id: str) -> list[str]:
+        """How a person is known: display name, real name, and handle, most familiar first. Empty when unknown."""
+        user = await self._info(user_id)
+        return [name for name in dict.fromkeys(_names(user)) if name]
+
+    async def name(self, user_id: str) -> str:
+        names = await self.names(user_id)
+        return names[0] if names else user_id
+
+    async def _info(self, user_id: str) -> dict[str, Any]:
+        cached = self._users.get(user_id)
         if cached is not None and time.monotonic() - cached[1] < self.ttl_s:
             return cached[0]
-        zone = await self._fetch_timezone(user_id)
-        self._timezones[user_id] = (zone, time.monotonic())
-        return zone
+        user = await self._fetch(user_id)
+        self._users[user_id] = (user, time.monotonic())
+        return user
 
-    async def _fetch_timezone(self, user_id: str) -> str:
+    async def _fetch(self, user_id: str) -> dict[str, Any]:
         if self.client is None or not user_id:
-            return DEFAULT_TIMEZONE
+            return {}
         try:
             response = await self.client.users_info(user=user_id)
         except Exception as exc:
             logger.info("users.info failed user=%s error=%s", user_id, type(exc).__name__)
-            return DEFAULT_TIMEZONE
-        return (response.get("user") or {}).get("tz") or DEFAULT_TIMEZONE
+            return {}
+        return response.get("user") or {}
 
     async def by_email(self, email: str) -> str | None:
         """users.lookupByEmail. Needs the users:read.email scope."""

@@ -14,10 +14,16 @@ def approval_blocks(
     *,
     recipient_id: str | None = None,
     problem: str | None = None,
+    post_as_user: bool = False,
 ) -> list[dict]:
-    """The approval card. Without a draft there is nobody to send to: the card shows why and offers no send button."""
-    headline = "Staged File Share" if file_name else "Staged Outbound Message"
+    """The approval card. Without a draft there is nobody to send to: the card shows why and offers no send button.
+
+    A reply posted as the user (Spec 18 §5) says so: it will appear under their name, not Knappy's.
+    """
+    headline = "Staged Reply" if post_as_user else "Staged File Share" if file_name else "Staged Outbound Message"
     target = f"{recipient_name} (<@{recipient_id}>)" if recipient_id else recipient_name
+    if post_as_user:
+        target = f"Post as you in {recipient_name}"
     attached = f"\n*File:* {file_name}" if file_name else ""
     blocks: list[dict] = [
         {
@@ -42,7 +48,7 @@ def approval_blocks(
                 {
                     "type": "button",
                     "action_id": "btn_approve_action",
-                    "text": {"type": "plain_text", "text": "Approve & Send"},
+                    "text": {"type": "plain_text", "text": "Approve & Post" if post_as_user else "Approve & Send"},
                     "style": "primary",
                     "value": draft_id,
                 },
@@ -82,6 +88,8 @@ def _done(action_type: str | None, recipient_name: str, file_name: str | None) -
         return f"shared {f'*{file_name}*' if file_name else 'the file'} with *{recipient_name}*"
     if action_type == "SEND_SLACK_DM":
         return f"sent the message to *{recipient_name}*"
+    if action_type == "POST_THREAD_REPLY":
+        return f"posted your reply as you in {recipient_name}"
     return f"dispatched to *{recipient_name}*"
 
 
@@ -122,6 +130,8 @@ def failed_blocks(recipient_name: str, *, action_type: str | None = None, file_n
         what = f"share {f'*{file_name}*' if file_name else 'the file'} with *{recipient_name}*"
     elif action_type == "SEND_SLACK_DM":
         what = f"send the message to *{recipient_name}*"
+    elif action_type == "POST_THREAD_REPLY":
+        what = f"post your reply in {recipient_name}"
     else:
         what = f"dispatch to *{recipient_name}*"
     return [
@@ -166,6 +176,8 @@ class ProactiveCard:
     draft_id: str | None = None
     message: str | None = None
     problem: str | None = None
+    attention_id: str | None = None
+    permalink: str | None = None
 
 
 def proactive_blocks(text: str, cards: list[ProactiveCard]) -> list[dict]:
@@ -178,6 +190,8 @@ def proactive_blocks(text: str, cards: list[ProactiveCard]) -> list[dict]:
 
 def _card_blocks(card: ProactiveCard) -> list[dict]:
     body = f"*{card.label}*"
+    if card.permalink:
+        body += f" <{card.permalink}|Open in Slack>"
     if card.draft_id and card.message:
         body += f"\nDraft to *{card.recipient}* (<@{card.recipient_id}>):\n> {card.message}"
     blocks: list[dict] = [{"type": "section", "text": {"type": "mrkdwn", "text": body[:3000]}}]
@@ -218,6 +232,11 @@ def _card_blocks(card: ProactiveCard) -> list[dict]:
                 "action_id": "btn_snooze_commitment",
                 "value": card.interaction_id,
             },
+        ]
+    if card.attention_id:
+        buttons += [
+            {"type": "button", "text": {"type": "plain_text", "text": text}, "action_id": action, "value": card.attention_id}
+            for text, action in (("Done", "btn_attention_done"), ("Snooze (24h)", "btn_attention_snooze"), ("Draft reply", "btn_attention_reply"))
         ]
     if buttons:
         blocks.append({"type": "actions", "elements": buttons})

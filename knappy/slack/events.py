@@ -6,12 +6,20 @@ import logging
 import time
 from collections import OrderedDict
 from collections.abc import Awaitable, Callable
-from typing import Any
+from typing import Any, Protocol
 
 Processor = Callable[[dict[str, Any]], Awaitable[None]]
 # Subtypes that are a person's new message. Edits, deletions, joins, and bot posts are not.
 USER_SUBTYPES = frozenset({None, "file_share", "thread_broadcast"})
 logger = logging.getLogger("knappy")
+
+
+class Listener(Protocol):
+    """Workspace awareness (Spec 18): takes the owner's conversations the agent loop never sees."""
+
+    async def wants(self, event: dict[str, Any], authorizations: list[dict[str, Any]] | None = None) -> bool: ...
+
+    async def accept(self, event: dict[str, Any]) -> bool: ...
 
 
 class EventDeduplicator:
@@ -42,11 +50,19 @@ async def on_message(
     *,
     processor: Processor | None = None,
     deduper: EventDeduplicator | None = None,
+    awareness: Listener | None = None,
+    authorizations: list[dict[str, Any]] | None = None,
 ) -> float:
-    """Acknowledge, then optionally process. Returns seconds spent before ack returns."""
+    """Acknowledge, then route: the owner's own conversations to awareness, Knappy's DMs to the processor.
+
+    Returns seconds spent before ack returns.
+    """
     started = time.perf_counter()
     await ack()
     elapsed = time.perf_counter() - started
+    if awareness is not None and not _from_bot(event) and await awareness.wants(event, authorizations):
+        await awareness.accept(event)
+        return elapsed
     if event.get("channel_type") not in (None, "im"):
         return elapsed
     if _from_bot(event) or event.get("subtype") not in USER_SUBTYPES:

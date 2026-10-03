@@ -276,3 +276,126 @@ async def test_j11_proactive_live(journey, live_model) -> None:
         [use.name for use in reply.tools]
     assert len(await j.rows("SELECT id FROM interactions WHERE commitment IS NOT NULL")) == 1, "no second commitment"
     assert [post for post in j.slack.posts if post["channel"] == "UALEX"] == [], "nothing sent without approval"
+
+
+# Spec 18 §3: a hand-labelled 40-message workspace. Each message's expected observation kind, or None.
+WORKSPACE_SAMPLE: list[tuple[str, str, str, str | None]] = [
+    ("U_JO", "C_RANDOM", "anyone tried the new ramen place on 5th street?", None),
+    ("U_LEE", "C_RANDOM", "the coffee machine on floor three is broken again", None),
+    ("U_PAT", "C_RANDOM", "who's in for friday climbing after work?", None),
+    ("U_JO", "C_RANDOM", "count me in for climbing, I need the exercise", None),
+    ("U_SAM", "C_RANDOM", "happy birthday Lee, hope it's a good one!", None),
+    ("U_LEE", "C_RANDOM", "thanks everyone, cake is in the kitchen", None),
+    ("U_JO", "C_RANDOM", "does anyone have a spare phone charger I can borrow", None),
+    ("U_PAT", "C_RANDOM", "the parking garage closes early on friday this week", None),
+    ("U_ALEX", "C_RANDOM", "great article on remote work culture, worth a read", None),
+    ("U_SAM", "C_RANDOM", "lunch order is going in at noon, add yours to the sheet", None),
+    ("U_SAM", "C_DESIGN", "<@U1> can you review the launch deck before Thursday's sync?", "asks_user"),
+    ("U_JO", "C_DESIGN", "I updated the color tokens in figma this morning", None),
+    ("U_SAM", "C_DESIGN", "Jo, can you export the new icons by tomorrow?", None),
+    ("U_JO", "C_DESIGN", "on it, will have the icons exported by noon", None),
+    ("U_LEE", "C_DESIGN", "the hover states on the settings page look great now", None),
+    ("U_SAM", "C_DESIGN", "let's keep the old illustration style for the onboarding flow", None),
+    ("U_PAT", "C_LAUNCH", "heads up: the Atlas launch moves from Oct 14 to Oct 20, QA needs another week", "workstream_update"),
+    ("U_PAT", "C_LAUNCH", "<@U1> you own the release notes for Atlas, please have a draft by Friday", "assigns_user"),
+    ("U_JO", "C_LAUNCH", "I'll update the status page once we have the new date", None),
+    ("U1", "C_LAUNCH", "Got it, I'll send the release notes draft to Pat by Thursday", "user_committed"),
+    ("U_LEE", "C_LAUNCH", "load testing for the launch environment starts tonight", None),
+    ("U_PAT", "C_LAUNCH", "FYI finance approved the Atlas budget this morning", "fyi"),
+    ("U_SAM", "D_SAM", "hey, are you free to pair on the pricing page tomorrow afternoon?", "asks_user"),
+    ("U_SAM", "D_SAM", "also I'm blocked on your API review before I can merge the billing PR", "waiting_on_user"),
+    ("U_ALEX", "D_ALEX", "here you go, the signed contract is attached", "commitment_moved"),
+    ("U_ALEX", "D_ALEX", "have a nice weekend when it comes", None),
+    ("U_LEE", "C_ENG", "deploy of the billing service finished, no errors", None),
+    ("U_LEE", "C_ENG", "rotating the staging certificates, expect a short blip", None),
+    ("U_JO", "C_ENG", "flaky test in the auth suite again, I'm looking into it", None),
+    ("U_ALEX", "C_ENG", "bumped the node version on CI to 22 for all repos", None),
+    ("U_LEE", "C_ENG", "Jo can you pair with me on the cache bug later today?", None),
+    ("U_JO", "C_ENG", "sure, ping me after standup and we can dig in", None),
+    ("U_PAT", "C_ENG", "reminder: code freeze for the mobile app starts next Monday", None),
+    ("U_LEE", "C_ENG", "the logging dashboard now has a dark mode toggle", None),
+    ("U_ALEX", "C_GENERAL", "welcome to our new designer Morgan, say hi!", None),
+    ("U_SAM", "C_GENERAL", "all hands recording is up on the wiki", None),
+    ("U_PAT", "C_GENERAL", "office will be closed on the 24th for the holiday", None),
+    ("U_JO", "C_GENERAL", "the book club is reading Project Hail Mary this month", None),
+    ("U_LEE", "C_GENERAL", "please update your emergency contact info in the HR portal", None),
+    ("U_ALEX", "C_GENERAL", "quarterly survey closes Friday, two minutes to fill in", None),
+]
+
+
+async def test_relevance_precision_recall_live(journey, live_model, capsys) -> None:
+    from conftest import LIVE_COST_USD
+
+    from fakes import member
+    from knappy.agent.tools import current_owner
+
+    people = [member("U1", "Febe Chukwuma", display_name="febe")] + [
+        member(user, f"{user[2:].title()} Smith") for user in ("U_SAM", "U_JO", "U_PAT", "U_LEE", "U_ALEX")
+    ]
+    j: Journey = await journey(live_model, slack=FakeSlack(tz="UTC", members=people), owner="U1")
+    contact = await j.repo.upsert_contact("T_JOURNEY", "Alex", slack_user_id="U_ALEX", owner_user_id="U1")
+    chase = await j.repo.insert_interaction(
+        workspace_id="T_JOURNEY", contact_id=contact, source_type="DIRECT_DM", channel_id="DU1",
+        raw_text="Chase Alex for the signed contract", summary="Chase Alex for the signed contract",
+        commitment="Chase Alex for the signed contract", owner_user_id="U1",
+    )
+    await j.runtime.store.set_commitment_plan(chase, next_check_at=None, on_no_progress=None, waiting_on="Alex")
+    async with j.repo.transaction():
+        await j.runtime.store.create_record(
+            "U1", record_id="workstream:atlas-launch", type="workstream", title="Atlas launch",
+            body="- The user is writing the release notes", source="remember", now=j.clock(), sources=[],
+        )
+    expected: dict[str, str | None] = {}
+    said: dict[str, str] = {}
+    for user, channel, text, kind in WORKSPACE_SAMPLE:
+        sent = await j.workspace(user, channel, text)
+        expected[f"{channel}:{sent.event['ts']}"] = kind
+        said[f"{channel}:{sent.event['ts']}"] = text
+    spent_before = sum(LIVE_COST_USD)
+    token = current_owner.set("U1")
+    await j.advance(minutes=10, step=timedelta(minutes=10))
+    current_owner.reset(token)
+    spent = sum(LIVE_COST_USD) - spent_before
+
+    rows = await j.rows(
+        "SELECT p.source_id, e.metadata FROM memory_provenance p JOIN memory_events e ON e.id = p.target_id "
+        "WHERE p.source_type = 'slack_message'"
+    )
+    got = {row["source_id"]: json.loads(row["metadata"])["observation"] for row in rows}
+    kinds = sorted({kind for kind in expected.values() if kind} | set(got.values()))
+    with capsys.disabled():
+        print(f"\nrelevance live: {len(WORKSPACE_SAMPLE)} messages, ${spent:.5f} (${spent / len(WORKSPACE_SAMPLE):.6f}/message)")
+        for kind in kinds:
+            predicted = {key for key, value in got.items() if value == kind}
+            actual = {key for key, value in expected.items() if value == kind}
+            hits = len(predicted & actual)
+            print(f"  {kind:18} precision {hits}/{len(predicted)}  recall {hits}/{len(actual)}")
+        relevant = {key for key, value in expected.items() if value}
+        print(f"  {'any (admitted)':18} precision {len(set(got) & relevant)}/{len(got)}  recall {len(set(got) & relevant)}/{len(relevant)}")
+        for key in sorted(set(got) | relevant):
+            if got.get(key) != expected.get(key):
+                print(f"  mismatch: expected {expected.get(key)} got {got.get(key)}: {said[key]}")
+    relevant = {key for key, value in expected.items() if value}
+    assert len(set(got) & relevant) / max(len(got), 1) >= 0.8, "chatter is not admitted"
+    assert len(set(got) & relevant) / len(relevant) >= 0.75, "what concerns the user is kept"
+    [status] = await j.rows("SELECT status FROM interactions WHERE commitment LIKE 'Chase Alex%'")
+    assert status["status"] in ("FULFILLED", "PENDING")
+
+
+async def test_brief_needs_you_live(journey, live_model) -> None:
+    """Spec 18 §6: the brief's Needs you and Worth knowing sections, each item with its link."""
+    j: Journey = await journey(live_model)
+    now = datetime(2026, 10, 7, 12, 0, tzinfo=timezone.utc)
+    deck, budget, launch = (f"https://slack.test/archives/{path}" for path in ("C_DESIGN/p1", "D_PAT/p2", "C_LAUNCH/p3"))
+    items = [
+        Item(kind="ATTENTION", owner="U1", attention_id="a1", summary="Sam asked you to review the launch deck",
+             permalink=deck, urgency="today", due=now + timedelta(days=1)),
+        Item(kind="ATTENTION", owner="U1", attention_id="a2", summary="Pat asked for the Q4 budget numbers",
+             permalink=budget, urgency="low"),
+        Item(kind="UPDATE", owner="U1", event_id="e1", summary="The Atlas launch moved from Oct 14 to Oct 20", permalink=launch),
+    ]
+    written = await j.runtime.heartbeat.writer.write("U1", "brief", items, now, ZoneInfo("UTC"))
+
+    assert "needs you" in written.text.lower() and "worth knowing" in written.text.lower(), written.text
+    assert all(link in written.text for link in (deck, budget, launch)), written.text
+    assert written.messages == {}

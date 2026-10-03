@@ -12,9 +12,12 @@ from datetime import datetime
 from typing import Any
 
 from knappy.agent.loop import AgentLoop, AgentReply, InboundMessage
-from knappy.agent.prompt import OPEN_LOOP_LIMIT, MemoryProvider, build_system_prompt
+from knappy.agent.prompt import ATTENTION_LIMIT, OPEN_LOOP_LIMIT, MemoryProvider, build_system_prompt
 from knappy.agent.session import ConversationLocks, ConversationLog, Turn, as_messages, conversation_key
 from knappy.agent.tools import SlackThread, ToolRegistry, current_owner, current_thread, current_turn
+from knappy.awareness.ingest import Awareness, Pacing
+from knappy.awareness.relevance import RelevancePass
+from knappy.awareness.store import AwarenessStore
 from knappy.db.repository import SqliteRepository, utc_now
 from knappy.files.service import FileService, Shared, SlackDownloader, open_dm
 from knappy.files.store import DocumentStore
@@ -65,6 +68,11 @@ class KnappyRuntime:
         clock: Callable[[], datetime] = utc_now,
         fetcher: WebFetcher | None = None,
         downloader: SlackDownloader | None = None,
+        user_client: Any | None = None,
+        awareness_owner: str | None = None,
+        bot_user_id: str | None = None,
+        awareness_threshold: float = 0.5,
+        awareness_pacing: Pacing | None = None,
     ) -> None:
         self.repo = repo
         self.workspace_id = workspace_id
@@ -80,9 +88,22 @@ class KnappyRuntime:
         self.recipients = RecipientResolver(repo, workspace_id, self.users)
         self.documents = DocumentStore(repo, workspace_id)
         self.files = FileService(self.documents, self.store, model, downloader, slack)
+        self.attention = AwarenessStore(repo, workspace_id)
+        self.user_client = user_client
+        self.awareness: Awareness | None = None
+        if user_client is not None and awareness_owner:
+            relevance = RelevancePass(
+                model, self.memory_engine, self.attention, name=self.users.name, permalink=self._permalink,
+                context=self._relevance_context, threshold=awareness_threshold,
+            )
+            self.awareness = Awareness(
+                owner=awareness_owner, user_client=user_client, bot_client=slack, bot_user_id=bot_user_id,
+                store=self.attention, relevance=relevance, memory=self.memory_engine, clock=clock,
+                over_budget=self._over_budget, pacing=awareness_pacing,
+            )
         self.tools = ToolRegistry(
             repo, workspace_id, history=slack, memory=self.memory_engine, searcher=model, fetcher=fetcher,
-            files=self.files, recipients=self.recipients,
+            files=self.files, recipients=self.recipients, attention=self.attention, awareness=self.awareness, clock=clock,
         )
         self.loop = AgentLoop(self.tools, model)
         gate = CompositeSystemOneGate(JevSystemOneAdapter(), RegexFallbackAdapter())
@@ -96,6 +117,7 @@ class KnappyRuntime:
             recipients=self.recipients,
             timezone=self.users.timezone,
             channel=DirectMessages(slack, poster) if slack is not None and poster is not None else None,
+            attention=self.attention,
         )
 
     async def handle_event(self, event: dict[str, Any]) -> AgentReply:
@@ -159,15 +181,43 @@ class KnappyRuntime:
         return answer
 
     async def _system_prompt(self, owner: str, key: str) -> str:
-        zone, memory, open_loops = await asyncio.gather(
+        zone, memory, open_loops, attention = await asyncio.gather(
             self.users.timezone(owner),
             self.memory.load(owner, key),
             self.repo.search_commitments(
                 self.workspace_id, query="", owner_user_id=owner, match_text=False, limit=OPEN_LOOP_LIMIT
             ),
+            self.attention.items(owner, self.clock(), limit=ATTENTION_LIMIT),
         )
         await self.store.set_timezone(owner, zone)
-        return build_system_prompt(now=self.clock(), timezone=zone, memory=memory, open_loops=open_loops)
+        return build_system_prompt(
+            now=self.clock(), timezone=zone, memory=memory, open_loops=open_loops,
+            attention=[item.for_model() for item in attention], awareness=self.awareness is not None,
+        )
+
+    async def _permalink(self, channel: str, ts: str) -> str | None:
+        if self.user_client is None:
+            return None
+        try:
+            response = await self.user_client.chat_getPermalink(channel=channel, message_ts=ts)
+        except Exception as exc:
+            logger.info("chat.getPermalink failed channel=%s error=%s", channel, type(exc).__name__)
+            return None
+        return response.get("permalink")
+
+    async def _relevance_context(self, owner: str) -> dict[str, Any]:
+        """Spec 18 §3: who the user is and what they are working on, compactly, for the relevance pass."""
+        workstreams = await self.store.active_records(owner, ["workstream"])
+        people = await self.store.active_records(owner, ["person"])
+        return {
+            "user": {"slack_id": owner, "names": await self.users.names(owner)},
+            "workstreams": [record["title"] for record in workstreams[:15]],
+            "people": [record["title"] for record in people[:30]],
+            "open_commitments": [
+                {key: row[key] for key in ("id", "commitment", "person", "waiting_on", "due_date") if row.get(key)}
+                for row in await self.store.open_commitments(owner, 30)
+            ],
+        }
 
     async def _over_budget(self, owner: str) -> bool:
         if self.daily_budget_usd is None:

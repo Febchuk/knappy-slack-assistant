@@ -221,6 +221,7 @@ class FakeSlack:
         tz: str = "America/New_York",
         ephemeral_error: BaseException | None = None,
         members: list[dict] | None = None,
+        user_id: str = "UBOT",
     ) -> None:
         self.posts: list[dict] = []
         self.updates: list[dict] = []
@@ -235,6 +236,14 @@ class FakeSlack:
         # The workspace directory: users.list members, each optionally with profile.email.
         self.members = members or []
         self.directory_calls: list[str] = []
+        # Who this token is (auth.test). The bot by default; the owner for a user-token client.
+        self.user_id = user_id
+        # Channels this token can open with conversations.info. For the bot: only its own DMs.
+        self.visible: set[str] = set()
+        # The workspace as this token sees it: users.conversations, and each conversation's messages.
+        self.conversations: list[dict] = []
+        self.history: dict[str, list[dict]] = {}
+        self.api_calls: list[str] = []
 
     async def chat_postMessage(self, **kwargs):
         self.posts.append(kwargs)
@@ -268,7 +277,8 @@ class FakeSlack:
 
     async def users_info(self, *, user):
         self.users_info_calls += 1
-        return {"ok": True, "user": {"id": user, "tz": self.tz}}
+        known = next((member for member in self.members if member["id"] == user), {})
+        return {"ok": True, "user": {**known, "id": user, "tz": self.tz}}
 
     async def users_list(self, *, limit=200, cursor=None):
         self.directory_calls.append("users.list")
@@ -281,11 +291,35 @@ class FakeSlack:
                 return {"ok": True, "user": member}
         raise RuntimeError("users_not_found")
 
-    async def conversations_history(self, *, channel, limit=20):
-        return {"messages": self.messages}
+    async def auth_test(self):
+        return {"ok": True, "user_id": self.user_id, "team_id": "T_TEST"}
+
+    async def conversations_history(self, *, channel, limit=20, oldest=None, cursor=None):
+        self.api_calls.append(f"conversations.history {channel}")
+        if channel not in self.history:
+            return {"messages": self.messages}
+        after = float(oldest or 0)
+        top = [m for m in self.history[channel] if float(m["ts"]) > after and m.get("thread_ts") in (None, m["ts"])]
+        return {"messages": sorted(top, key=lambda m: -float(m["ts"]))[:limit]}
+
+    async def conversations_replies(self, *, channel, ts, oldest=None, limit=200):
+        self.api_calls.append(f"conversations.replies {channel} {ts}")
+        thread = [m for m in self.history.get(channel, []) if m.get("thread_ts") == ts or m["ts"] == ts]
+        return {"messages": sorted(thread, key=lambda m: float(m["ts"]))}
+
+    async def conversations_info(self, *, channel):
+        self.api_calls.append(f"conversations.info {channel}")
+        known = next((c for c in self.conversations if c["id"] == channel), None)
+        if channel not in self.visible and known is None:
+            raise RuntimeError("channel_not_found")
+        return {"ok": True, "channel": known or {"id": channel, "is_im": channel.startswith("D")}}
 
     async def users_conversations(self, **kwargs):
-        return {"channels": []}
+        self.api_calls.append("users.conversations")
+        return {"channels": list(self.conversations)}
+
+    async def chat_getPermalink(self, *, channel, message_ts):
+        return {"ok": True, "permalink": f"https://slack.test/archives/{channel}/p{message_ts.replace('.', '')}"}
 
     def shown(self, ts: str) -> dict:
         """The message at ts as the user now sees it: the post, overlaid by its latest update."""
@@ -390,7 +424,41 @@ def agent(script: dict[str, ToolPlan | list[ToolPlan]] | None = None):
 Reconcile = Callable[[dict[str, Any]], "ReconcileResult | dict[str, Any] | Awaitable[ReconcileResult | dict[str, Any]]"]
 
 
-def memory_structured(reconcile: Reconcile | None = None):
+Observe = Callable[[str, str, str, dict[str, Any]], "dict[str, Any] | None"]
+_LINE = re.compile(r"^(?P<sender>.+?)(?P<owner> \(the user\))?(?: \[reply in thread [\d.]+\])?: (?P<text>.*) \((?P<ts>[\d.]+)\)$")
+
+
+def observer(rules: dict[str, dict[str, Any] | Callable[[dict[str, Any]], dict[str, Any]]]) -> Observe:
+    """A relevance pass by keyword: the first rule whose key appears in a message's text gives its observation.
+
+    A rule may be a function of the pass's context (open_commitments, workspaces, the user's names).
+    """
+
+    def observe(sender: str, text: str, ts: str, context: dict[str, Any]) -> dict[str, Any] | None:
+        for key, fields in rules.items():
+            if key in text.lower():
+                return {"ts": ts, "relevance": 0.9, "urgency": "low", **(fields(context) if callable(fields) else fields)}
+        return None
+
+    return observe
+
+
+def relevance_reply(observe: Observe | None, text: str) -> dict[str, Any]:
+    from knappy.awareness.relevance import Relevance
+
+    found = []
+    head, lines = text.split("\n\nMessages:\n", 1)
+    context = json.loads(head)
+    for line in lines.splitlines():
+        match = _LINE.match(line)
+        assert match, f"unparsed message line {line!r}"
+        result = observe(match["sender"], match["text"], match["ts"], context) if observe else None
+        if result is not None:
+            found.append(result)
+    return Relevance(observations=found).model_dump()
+
+
+def memory_structured(reconcile: Reconcile | None = None, observe: Observe | None = None):
     """Structured responder for FakeModel: a scripted reconciler plus deterministic memory drafts.
 
     `reconcile` receives the reconciler's JSON payload (records, open_commitments, turns).
@@ -398,6 +466,8 @@ def memory_structured(reconcile: Reconcile | None = None):
     """
 
     async def respond(schema: type[BaseModel], system: str, text: str) -> Any:
+        if schema.__name__ == "Relevance":
+            return relevance_reply(observe, text)
         if schema is ReconcileResult:
             if reconcile is None:
                 return ReconcileResult()

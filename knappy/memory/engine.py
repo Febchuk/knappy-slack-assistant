@@ -18,6 +18,7 @@ from knappy.db.repository import format_ts
 from knappy.ingestion.embed import generate_embedding
 from knappy.llm.types import Model
 from knappy.memory.store import (
+    Cascade,
     LoggedTurn,
     MemoryStore,
     LINK,
@@ -197,34 +198,9 @@ class MemoryEngine:
             cascade = await self.store.cascade_forget(owner, targets, now)
             await self.store.rebuild_profile(owner, now)
             await self.store.drop_recaps(owner)
-        drafts: dict[str, str] = {}
-        for record_id, removed in cascade.repass.items():
-            record = await self.store.get_record(owner, record_id)
-            try:
-                draft = await self.model.generate_structured(
-                    tier="light",
-                    system=REPASS_PROMPT,
-                    text=json.dumps({"record": {"title": record["title"], "body": record["body"]}, "forget": removed}),
-                    schema=RepassDraft,
-                )
-                drafts[record_id] = draft.body.strip()
-            except Exception:
-                logger.exception("memory re-pass failed owner=%s record=%s; forgetting it instead", owner, record_id)
-                drafts[record_id] = ""
-        derived_forgotten = [record_id for record_id in cascade.forgotten if record_id not in targets]
-        updated: list[str] = []
+        drafts = await self._repass(owner, cascade)
         async with self._tx:
-            for record_id, body in drafts.items():
-                if body:
-                    await self.store.revise_record(
-                        owner, record_id, body=body, now=now, sources=cascade.surviving[record_id],
-                        keep_sources=False, old_status="FORGOTTEN",
-                    )
-                    updated.append(record_id)
-                else:
-                    versions = [version["id"] for version in await self.store.versions(owner, record_id)]
-                    await self.store.set_status(owner, versions, "FORGOTTEN", now)
-                    derived_forgotten.append(record_id)
+            derived_forgotten, updated = await self._settle(owner, cascade, drafts, targets, now)
             count = len(targets) + len(derived_forgotten)
             await self.store.add_event(
                 owner, kind="forgotten", summary=f"Forgot {count} record(s) at the user's request", occurred_at=now,
@@ -243,6 +219,59 @@ class MemoryEngine:
         if cascade.cancelled:
             result["cancelled_commitments"] = cascade.cancelled
         return result
+
+    async def retract(self, owner: str, event_ids: list[str], now: datetime | None = None) -> dict[str, Any]:
+        """Forget ledger events and everything compiled from them, as forget does for records (Spec 18 §7)."""
+        now = now or self.store.clock()
+        async with self._tx:
+            cascade = await self.store.cascade_forget(owner, [], now, events=event_ids)
+            await self.store.drop_recaps(owner)
+        drafts = await self._repass(owner, cascade)
+        async with self._tx:
+            forgotten, updated = await self._settle(owner, cascade, drafts, [], now)
+            await self.store.rebuild_profile(owner, now)
+        logger.info(
+            "memory retract owner=%s events=%d forgotten=%d repassed=%d cancelled=%d",
+            owner, len(cascade.retracted), len(forgotten), len(updated), len(cascade.cancelled),
+        )
+        return {"retracted": len(cascade.retracted), "forgotten": forgotten, "updated": updated, "cancelled": cascade.cancelled}
+
+    async def _repass(self, owner: str, cascade: Cascade) -> dict[str, str]:
+        """New bodies for records that still cite forgotten content; empty when nothing is left. Model calls only."""
+        drafts: dict[str, str] = {}
+        for record_id, removed in cascade.repass.items():
+            record = await self.store.get_record(owner, record_id)
+            try:
+                draft = await self.model.generate_structured(
+                    tier="light",
+                    system=REPASS_PROMPT,
+                    text=json.dumps({"record": {"title": record["title"], "body": record["body"]}, "forget": removed}),
+                    schema=RepassDraft,
+                )
+                drafts[record_id] = draft.body.strip()
+            except Exception:
+                logger.exception("memory re-pass failed owner=%s record=%s; forgetting it instead", owner, record_id)
+                drafts[record_id] = ""
+        return drafts
+
+    async def _settle(
+        self, owner: str, cascade: Cascade, drafts: dict[str, str], targets: list[str], now: datetime
+    ) -> tuple[list[str], list[str]]:
+        """Apply re-passed bodies inside the caller's transaction. Returns (records forgotten, records rewritten)."""
+        derived_forgotten = [record_id for record_id in cascade.forgotten if record_id not in targets]
+        updated: list[str] = []
+        for record_id, body in drafts.items():
+            if body:
+                await self.store.revise_record(
+                    owner, record_id, body=body, now=now, sources=cascade.surviving[record_id],
+                    keep_sources=False, old_status="FORGOTTEN",
+                )
+                updated.append(record_id)
+            else:
+                versions = [version["id"] for version in await self.store.versions(owner, record_id)]
+                await self.store.set_status(owner, versions, "FORGOTTEN", now)
+                derived_forgotten.append(record_id)
+        return derived_forgotten, updated
 
     async def _forget_targets(self, owner: str, query_or_id: str) -> list[str]:
         """Matching active records, plus superseded versions that still say it ("forget that I used to eat meat")."""
@@ -285,7 +314,10 @@ class MemoryEngine:
 
     async def _sources(self, owner: str, record_id: str) -> list[dict[str, Any]]:
         events = [
-            {"said": event["summary"], "kind": event["kind"], "when": str(event["occurred_at"])[:16] + " UTC"}
+            {
+                "said": event["summary"], "kind": event["kind"], "when": str(event["occurred_at"])[:16] + " UTC",
+                **({"link": link} if (link := json.loads(event["metadata"] or "{}").get("permalink")) else {}),
+            }
             for event in await self.store.source_events(owner, record_id)
             if event["status"] == "ACTIVE"
         ]

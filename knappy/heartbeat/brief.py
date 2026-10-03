@@ -17,6 +17,7 @@ from zoneinfo import ZoneInfo
 from pydantic import BaseModel, Field
 
 from knappy.agent.tools import current_owner
+from knappy.awareness.store import AttentionItem, Update
 from knappy.llm.types import Model
 from knappy.memory.store import MemoryStore
 from knappy.slack.users import Recipient
@@ -37,7 +38,10 @@ Use these sections, each only when it has content:
 *Today:* what is due and what is overdue, most important first.
 *Follow-ups:* people to get back to, and why.
 *Carryover:* at most 2 open loops from yesterday's recap, only ones not already listed.
-Under 150 words. Slack mrkdwn: *bold*, bullets with •. No greeting, no sign-off, no filler.
+*Needs you:* the ATTENTION items: people asking the user for something or waiting on them, in the order given.
+*Worth knowing:* the UPDATE items: changes in the user's work since the last brief.
+Give every ATTENTION and UPDATE item its link as <link|label>.
+Under 200 words. Slack mrkdwn: *bold*, bullets with •. No greeting, no sign-off, no filler.
 Times are in the user's timezone. Never invent items that are not in the input.
 
 {_VOICE}
@@ -54,9 +58,11 @@ Slack mrkdwn. No greeting, no filler. Times are in the user's timezone.
 
 @dataclass
 class Item:
-    """One thing worth surfacing: a commitment that is due or saw no progress, or a contact gone quiet."""
+    """One thing worth surfacing: a commitment that is due or saw no progress, a contact gone quiet, or, from
+    workspace awareness (Spec 18 §6), something waiting on the user (ATTENTION) or a change in their work (UPDATE).
+    """
 
-    kind: Literal["COMMITMENT", "CADENCE"]
+    kind: Literal["COMMITMENT", "CADENCE", "ATTENTION", "UPDATE"]
     owner: str
     interaction_id: str | None = None
     contact_id: str | None = None
@@ -70,11 +76,27 @@ class Item:
     days_quiet: int | None = None
     briefing_id: str | None = None
     recipient: Recipient | None = None
+    attention_id: str | None = None
+    event_id: str | None = None
+    summary: str | None = None
+    permalink: str | None = None
+    urgency: str | None = None
 
     @property
     def key(self) -> str | None:
         """Briefing dedupe: one item per commitment; a cadence item per contact."""
-        return self.interaction_id or self.contact_id
+        return self.interaction_id or self.contact_id or self.attention_id or self.event_id
+
+    @classmethod
+    def attention(cls, owner: str, item: AttentionItem) -> Item:
+        return cls(
+            kind="ATTENTION", owner=owner, attention_id=item.id, summary=item.summary, permalink=item.permalink,
+            urgency=item.urgency, due=_ts(item.due_at),
+        )
+
+    @classmethod
+    def update(cls, owner: str, update: Update) -> Item:
+        return cls(kind="UPDATE", owner=owner, event_id=update.event_id, summary=update.summary, permalink=update.permalink)
 
     @property
     def person(self) -> str | None:
@@ -105,6 +127,12 @@ class Item:
 
     def triage_view(self, now: datetime) -> dict[str, Any]:
         """What the triage gate sees (knappy.heartbeat.triage)."""
+        if self.kind in ("ATTENTION", "UPDATE"):
+            view = {"kind": self.kind, "summary": self.summary, "urgency": self.urgency}
+            if self.due:
+                view["due_date"] = self.due.strftime("%Y-%m-%d %H:%M:%S")
+                view["hours_until_due"] = (self.due - now).total_seconds() / 3600
+            return view
         view: dict[str, Any] = {
             "kind": self.kind, "contact_name": self.contact_name, "commitment": self.commitment,
             "waiting_on": self.waiting_on, "on_no_progress": self.on_no_progress,
@@ -121,6 +149,9 @@ class Item:
         """The item in one plain sentence: the fallback text, and its card's label."""
         if self.kind == "CADENCE":
             return f"You haven't been in touch with {self.contact_name} for {self.days_quiet} days."
+        if self.kind in ("ATTENTION", "UPDATE"):
+            when = f", due {self.due.astimezone(zone).strftime('%a %H:%M')}" if self.due else ""
+            return f"{self.summary}{when}"
         if self.check_due and self.on_no_progress:
             waiting = f" (waiting on {self.waiting_on})" if self.waiting_on else ""
             return f"No progress yet on {self.commitment}{waiting}. You asked me to: {self.on_no_progress}"
@@ -145,6 +176,8 @@ class Item:
                 view[name] = getattr(self, name)
         if self.recipient and self.recipient.user_id:
             view["recipient"] = self.recipient.name
+        if self.permalink:
+            view["link"] = self.permalink
         return view
 
 
@@ -216,10 +249,19 @@ class ProactiveWriter:
 
 
 def fallback_text(kind: Kind, items: list[Item], now: datetime, zone: ZoneInfo) -> str:
-    lines = [item.line(now, zone) for item in items]
+    def line(item: Item) -> str:
+        text = item.line(now, zone)
+        return f"{text} <{item.permalink}|link>" if item.permalink else text
+
     if kind == "nudge":
-        return lines[0]
-    return "*Your morning brief*\n" + "\n".join(f"• {line}" for line in lines)
+        return line(items[0])
+    sections = [
+        ("", [item for item in items if item.kind in ("COMMITMENT", "CADENCE")]),
+        ("*Needs you:*\n", [item for item in items if item.kind == "ATTENTION"]),
+        ("*Worth knowing:*\n", [item for item in items if item.kind == "UPDATE"]),
+    ]
+    body = "\n".join(title + "\n".join(f"• {line(item)}" for item in chosen) for title, chosen in sections if chosen)
+    return "*Your morning brief*\n" + body
 
 
 def _reachable(item: Item) -> bool:

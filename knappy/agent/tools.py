@@ -2,14 +2,16 @@
 
 from __future__ import annotations
 
+from collections.abc import Callable
 from contextvars import ContextVar
 from dataclasses import dataclass
-from datetime import date, datetime, time, timezone
+from datetime import date, datetime, time, timedelta, timezone
 from typing import TYPE_CHECKING, Any, Literal
 
 from pydantic import AwareDatetime, BaseModel, Field
 
-from knappy.db.repository import SqliteRepository, format_ts
+from knappy.awareness.store import AwarenessStore
+from knappy.db.repository import SqliteRepository, format_ts, utc_now
 from knappy.hitl.blocks import approval_blocks
 from knappy.ingestion.embed import generate_embedding
 from knappy.llm.types import Model, Recency, ToolSpec
@@ -18,6 +20,7 @@ from knappy.slack.users import RecipientResolver, UserDirectory
 from knappy.web import WebFetcher
 
 if TYPE_CHECKING:
+    from knappy.awareness.ingest import Awareness
     from knappy.files.service import DocumentFormat, FileService
     from knappy.memory.engine import MemoryEngine
 
@@ -58,8 +61,12 @@ class GetMeetingContextArgs(BaseModel):
 
 
 class StageOutboundActionArgs(BaseModel):
-    action_type: Literal["SEND_SLACK_DM", "SHARE_FILE"] = Field(
-        ..., description="SEND_SLACK_DM for a message; SHARE_FILE to send one of the user's documents"
+    action_type: Literal["SEND_SLACK_DM", "SHARE_FILE", "POST_THREAD_REPLY"] = Field(
+        ...,
+        description=(
+            "SEND_SLACK_DM for a message; SHARE_FILE to send one of the user's documents; "
+            "POST_THREAD_REPLY to answer an attention item in its own conversation, posted as the user"
+        ),
     )
     recipient: str = Field(..., description="Name of the person to message, or their <@U...> mention")
     summary: str = Field(..., description="One line describing the action, shown on the approval card")
@@ -68,6 +75,7 @@ class StageOutboundActionArgs(BaseModel):
         default=None, description="Their Slack user id (from a <@U...> mention) or email, if known; never guess one"
     )
     document_id: str | None = Field(default=None, description="Required for SHARE_FILE: the document to send")
+    attention_id: str | None = Field(default=None, description="Required for POST_THREAD_REPLY: the attention item answered")
 
 
 class SearchSlackHistoryArgs(BaseModel):
@@ -147,6 +155,21 @@ class ListFilesArgs(BaseModel):
     limit: int = Field(default=10, ge=1, le=25)
 
 
+class ListAttentionArgs(BaseModel):
+    status: Literal["OPEN", "ANSWERED", "DONE", "DISMISSED", "SNOOZED"] = "OPEN"
+
+
+class ResolveAttentionArgs(BaseModel):
+    id: str = Field(..., description="Attention id from the list in the prompt or list_attention")
+    status: Literal["DONE", "DISMISSED", "SNOOZED", "ANSWERED"] = Field(
+        default="DONE", description="DONE when handled, DISMISSED when it doesn't need them, SNOOZED for 24 hours"
+    )
+
+
+class StopWatchingArgs(BaseModel):
+    conversation: str = Field(..., description="The channel as the user named it, e.g. #random, or a <#C...> link")
+
+
 class CreateDocumentArgs(BaseModel):
     title: str = Field(..., description="Short title, also used for the file name")
     content_markdown: str = Field(..., description="The full document")
@@ -212,6 +235,18 @@ TOOL_SPECS: dict[str, ToolSpec] = {
             "Use it for answers over about 3,000 characters or when they ask for a doc, plan, or file.",
             CreateDocumentArgs,
         ),
+        ToolSpec(
+            "list_attention",
+            "What is waiting on the user from their Slack conversations (requests, assignments, people blocked on them), "
+            "and recent updates in their work, each with a link.",
+            ListAttentionArgs,
+        ),
+        ToolSpec("resolve_attention", "Mark an attention item done, dismissed, answered, or snoozed.", ResolveAttentionArgs),
+        ToolSpec(
+            "stop_watching",
+            "Stop reading one Slack conversation for the user, and forget what was learned from it.",
+            StopWatchingArgs,
+        ),
     )
 }
 
@@ -234,6 +269,9 @@ TOOL_STATUS: dict[str, str] = {
     "read_file": "reading the file",
     "list_files": "looking through your files",
     "create_document": "writing the document",
+    "list_attention": "checking what's waiting on you",
+    "resolve_attention": "updating that",
+    "stop_watching": "updating what I watch",
 }
 
 
@@ -272,8 +310,14 @@ class ToolRegistry:
         fetcher: WebFetcher | None = None,
         files: FileService | None = None,
         recipients: RecipientResolver | None = None,
+        attention: AwarenessStore | None = None,
+        awareness: Awareness | None = None,
+        clock: Callable[[], datetime] = utc_now,
     ) -> None:
         self.repo = repo
+        self.clock = clock
+        self.attention = attention or AwarenessStore(repo, workspace_id)
+        self.awareness = awareness
         self.files = files
         self.recipients = recipients or RecipientResolver(repo, workspace_id, UserDirectory(history))
         self.workspace_id = workspace_id
@@ -341,9 +385,12 @@ class ToolRegistry:
         staged_content: str,
         recipient_identifier: str | None = None,
         document_id: str | None = None,
+        attention_id: str | None = None,
     ) -> StagedDraft | dict[str, str]:
         thread = _thread()
         owner = self._owner() or ""
+        if action_type == "POST_THREAD_REPLY":
+            return await self._stage_reply(owner, thread, attention_id, summary, staged_content or summary)
         metadata: dict[str, str] = {}
         file_name = None
         if action_type == "SHARE_FILE":
@@ -375,6 +422,51 @@ class ToolRegistry:
         )
         blocks = approval_blocks(draft_id, who.name, content, file_name, recipient_id=who.user_id)
         return StagedDraft(draft_id, who.name, blocks)
+
+    async def _stage_reply(
+        self, owner: str, thread: SlackThread, attention_id: str | None, summary: str, content: str
+    ) -> StagedDraft | dict[str, str]:
+        """Spec 18 §5: a reply in the attention item's own conversation, posted as the user once approved."""
+        item = await self.attention.get(owner, attention_id or "")
+        if item is None:
+            return {"error": f"No attention item with id {attention_id}. Find it with list_attention."}
+        reply_in = item.thread_ts or (None if item.channel_id.startswith("D") else item.source_ts)
+        staged = {
+            "action_type": "POST_THREAD_REPLY",
+            "recipient_identifier": item.channel_id,
+            "recipient_name": item.where,
+            "preview_summary": summary,
+            "staged_content": content,
+            "metadata": {"attention_id": item.id, "reply_thread_ts": reply_in or ""},
+        }
+        draft_id = await self.repo.create_draft(
+            workspace_id=self.workspace_id, user_id=owner, channel_id=thread.channel_id, thread_ts=thread.thread_ts,
+            action_type="POST_THREAD_REPLY", payload=staged,
+        )
+        blocks = approval_blocks(draft_id, item.where, content, post_as_user=True)
+        return StagedDraft(draft_id, item.where, blocks)
+
+    async def list_attention(self, status: str = "OPEN") -> dict[str, Any]:
+        owner = self._owner() or ""
+        now = self.clock()
+        items = await self.attention.items(owner, now, status)  # type: ignore[arg-type]
+        updates = await self.attention.updates(owner, now - timedelta(days=3))
+        return {
+            "items": [item.for_model() for item in items],
+            "recent_updates": [update.for_model() for update in updates],
+            **({} if self.awareness else {"note": "Workspace awareness is off: no SLACK_USER_TOKEN is configured."}),
+        }
+
+    async def resolve_attention(self, id: str, status: str = "DONE") -> dict[str, Any]:
+        owner = self._owner() or ""
+        if not await self.attention.resolve(owner, id, status, self.clock()):  # type: ignore[arg-type]
+            return {"error": f"No attention item with id {id}"}
+        return {"id": id, "status": status}
+
+    async def stop_watching(self, conversation: str) -> dict[str, Any]:
+        if self.awareness is None:
+            return {"error": "Workspace awareness is off, so no conversations are being read."}
+        return await self.awareness.stop_watching(self._owner() or "", conversation)
 
     async def add_commitment(
         self,

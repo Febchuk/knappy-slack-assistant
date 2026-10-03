@@ -78,6 +78,33 @@ def register_actions(app, runtime: KnappyRuntime) -> None:
         await _settle(client, body, ":zzz: Snoozed for 24 hours.", "Snoozed")
 
 
+    @app.action("btn_attention_done")
+    async def attention_done(ack, body, client):
+        await ack()
+        if await runtime.attention.resolve(_user_id(body), _action_value(body), "DONE", runtime.clock()):
+            await _settle(client, body, ":white_check_mark: Done.", "Done")
+
+    @app.action("btn_attention_snooze")
+    async def attention_snooze(ack, body, client):
+        await ack()
+        if await runtime.attention.resolve(_user_id(body), _action_value(body), "SNOOZED", runtime.clock()):
+            await _settle(client, body, ":zzz: Snoozed for 24 hours.", "Snoozed")
+
+    @app.action("btn_attention_reply")
+    async def attention_reply(ack, body, client):
+        """Draft reply: ask the agent, in the brief's thread, as if the user had typed it."""
+        await ack()
+        owner, item_id = _user_id(body), _action_value(body)
+        if await runtime.attention.get(owner, item_id) is None:
+            return
+        channel = body.get("channel", {}).get("id")
+        thread = body.get("message", {}).get("thread_ts") or body.get("message", {}).get("ts")
+        await runtime.handle_event({
+            "type": "message", "channel": channel, "channel_type": "im", "user": owner, "thread_ts": thread,
+            "text": f"Draft a reply to attention item {item_id} for me to approve.",
+        })
+
+
 def _shown(body: dict) -> list[dict]:
     return (body.get("message") or {}).get("blocks") or []
 

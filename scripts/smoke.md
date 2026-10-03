@@ -69,8 +69,30 @@ Use a scratch database. Your Slack profile's timezone decides when the brief com
 
 Result: ____
 
+## J-18 Workspace awareness (Spec 18)
+
+Setup, once per workspace:
+
+1. In the Slack app config, paste the updated `slack/manifest.yml`. It adds the user scopes `channels:history`, `groups:history`, `im:history`, `mpim:history`, `channels:read`, `groups:read`, `im:read`, `mpim:read`, `users:read`, and `chat:write`, and the user events `message.channels`, `message.groups`, `message.im`, and `message.mpim` under *Subscribe to events on behalf of users*.
+2. Reinstall the app (*OAuth & Permissions → Reinstall to Workspace*). If the workspace restricts app installs, an admin approves the new user scopes first.
+3. Copy *OAuth & Permissions → User OAuth Token* (`xoxp-…`) into `.env` as `SLACK_USER_TOKEN=xoxp-…`. Optionally set `KNAPPY_AWARENESS_THRESHOLD` (default `0.5`).
+4. Restart Knappy. The log shows `workspace awareness on owner=U…`, then `awareness catch-up owner=… conversations=N`. Without the token it shows `workspace awareness off` once and behaves as before.
+
+| Step | Do | Expect |
+| :--- | :--- | :--- |
+| 1 | As the second user, in a channel the owner is in and Knappy is not, post `@owner can you review the deck by Thursday?` | Knappy posts nothing anywhere. Within about 6 minutes the log shows `awareness flush ... admitted=1`. |
+| 2 | As the second user, DM the owner `can you send me the budget numbers?` | Nothing from Knappy. A second item after the next flush. |
+| 3 | As the owner, DM Knappy `what's waiting on me?` | Both items, each with a working Slack link. |
+| 4 | As the owner, reply in the step-1 thread. Wait for the next flush, then ask `what's waiting on me?` again. | Only the budget request is left. |
+| 5 | DM Knappy `reply to <second user> that I'll send the numbers tomorrow`. | An approval card saying *Post as you in DM with …*. Nothing posted yet. Approve it: the reply appears in the owner's DM with the second user, under the owner's name, once. |
+| 6 | DM Knappy `stop watching #<some channel>`. Post a message there. | Knappy confirms. The log shows no flush for that channel. |
+| 7 | DM Knappy as usual, and @-mention it in a channel. | Both answered as before, and neither shows up as an awareness flush. |
+| 8 | Next morning after 08:00 your time. | The brief has *Needs you* with Done, Snooze, and Draft reply buttons, and *Worth knowing* when something changed in your work. A quiet day sends nothing. |
+
+Result: ____
+
 ## Results
 
-| Date | Commit | Model ids | J-01 | J-02 | J-07 | J-10 | J-11 | Who ran it | Notes |
-| :--- | :--- | :--- | :--- | :--- | :--- | :--- | :--- | :--- | :--- |
-| | | | | | | | | | |
+| Date | Commit | Model ids | J-01 | J-02 | J-07 | J-10 | J-11 | J-18 | Who ran it | Notes |
+| :--- | :--- | :--- | :--- | :--- | :--- | :--- | :--- | :--- | :--- | :--- |
+| | | | | | | | | | | |

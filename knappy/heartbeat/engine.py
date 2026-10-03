@@ -17,6 +17,7 @@ from typing import Any, Literal, Protocol
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 from knappy.agent.session import Turn
+from knappy.awareness.store import AwarenessStore
 from knappy.db.repository import format_ts
 from knappy.heartbeat.brief import Item, Kind, ProactiveWriter
 from knappy.heartbeat.triage import ProactiveAlertTriager
@@ -33,6 +34,9 @@ NUDGES_PER_DAY = 2
 URGENT_CONSEQUENCE = 2.0
 BRIEF_ITEMS = 10
 DORMANT_PER_BRIEF = 3
+NEEDS_YOU = 5
+WORTH_KNOWING = 3
+UPDATES_WITHIN = timedelta(hours=36)
 
 Route = Literal["send", "queue", "drop"]
 
@@ -96,8 +100,10 @@ class HeartbeatEngine:
         recipients: RecipientResolver,
         timezone: Callable[[str], Awaitable[str]],
         channel: ProactiveChannel | None = None,
+        attention: AwarenessStore | None = None,
     ) -> None:
         self.store = store
+        self.attention = attention
         self.repo = store.repo
         self.workspace_id = store.workspace_id
         self.clock = store.clock
@@ -145,6 +151,10 @@ class HeartbeatEngine:
         if BRIEF_HOUR <= local.hour < BRIEF_UNTIL_HOUR and profile.get("brief_on") != today:
             await self._brief(tick, now, zone)
             return
+        # Spec 18 §6: only urgency-now items that need the user may interrupt; each is decided once.
+        urgent = [Item.attention(owner, row) for row in await self.attention.urgent_undecided(owner)] if self.attention else []
+        items = items + urgent
+        tick.candidates = len(items)
         if not items:
             return
         nudges = int(profile.get("nudges_sent") or 0) if profile.get("nudges_on") == today else 0
@@ -157,7 +167,12 @@ class HeartbeatEngine:
                 await self.store.count_nudge(owner, today)
                 nudges += 1
                 tick.sent += 1
-            elif choice == "queue":
+            if item.attention_id:
+                # Open attention items are in every brief anyway; nothing to enqueue.
+                await self.attention.mark_surfaced([item.attention_id], now)
+                tick.queued += choice == "queue"
+                continue
+            if choice == "queue":
                 if item.key not in queued:
                     await self.repo.enqueue_briefing(
                         workspace_id=self.workspace_id, user_id=owner, kind=item.kind, summary=item.line(now, zone),
@@ -195,6 +210,10 @@ class HeartbeatEngine:
                 items.append(contact)
         # The rest stay queued or unsurfaced for tomorrow; a brief is short.
         items = items[:BRIEF_ITEMS]
+        if self.attention is not None:
+            items += [Item.attention(owner, row) for row in await self.attention.items(owner, now, limit=NEEDS_YOU)]
+            updates = await self.attention.updates(owner, now - UPDATES_WITHIN, unbriefed=True, limit=WORTH_KNOWING)
+            items += [Item.update(owner, update) for update in updates]
         tick.candidates = len(items)
         if items:
             await self._deliver(owner, "brief", items, now, zone)
@@ -203,6 +222,9 @@ class HeartbeatEngine:
                     await self.repo.mark_briefing_delivered(item.briefing_id)
                 if item.interaction_id:
                     await self.repo.mark_alerted(item.interaction_id, now)
+            if self.attention is not None:
+                await self.attention.mark_surfaced([item.attention_id for item in items if item.attention_id], now)
+                await self.attention.mark_briefed([item.event_id for item in items if item.event_id])
             tick.sent = 1
         await self.store.set_brief_on(owner, local.date().isoformat())
 
@@ -225,6 +247,8 @@ class HeartbeatEngine:
     async def _card(
         self, owner: str, dm: str, item: Item, message: str | None, now: datetime, zone: ZoneInfo
     ) -> ProactiveCard | None:
+        if item.kind in ("ATTENTION", "UPDATE"):
+            return ProactiveCard(label=item.line(now, zone), attention_id=item.attention_id, permalink=item.permalink)
         recipient = item.recipient
         if not item.interaction_id and not recipient:
             return None
@@ -271,6 +295,7 @@ def _transcript(text: str, cards: list[ProactiveCard]) -> str:
     lines = [text]
     for card in cards:
         ref = f" (commitment id {card.interaction_id})" if card.interaction_id else ""
+        ref = f" (attention id {card.attention_id})" if card.attention_id else ref
         lines.append(f"- {card.label}{ref}")
         if card.draft_id:
             lines.append(f"  Draft to {card.recipient}, waiting for approval: {card.message}")

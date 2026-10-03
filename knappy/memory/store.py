@@ -654,14 +654,19 @@ class MemoryStore:
         now: datetime,
         sources: list[tuple[str, str]],
         commitment_id: str | None = None,
+        metadata: dict[str, Any] | None = None,
     ) -> str:
         event_id = uuid.uuid4().hex
         await self._run(
             """
-            INSERT INTO memory_events (id, workspace_id, owner_user_id, kind, summary, occurred_at, admission_score, commitment_id, created_at)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+            INSERT INTO memory_events
+                (id, workspace_id, owner_user_id, kind, summary, occurred_at, admission_score, commitment_id, created_at, metadata)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
-            (event_id, self.workspace_id, owner, kind, redact(summary), format_ts(occurred_at), score, commitment_id, format_ts(now)),
+            (
+                event_id, self.workspace_id, owner, kind, redact(summary), format_ts(occurred_at), score, commitment_id,
+                format_ts(now), json.dumps(metadata) if metadata else None,
+            ),
         )
         await self.add_provenance(owner, "event", event_id, sources)
         return event_id
@@ -690,7 +695,7 @@ class MemoryStore:
     async def source_events(self, owner: str, record_id: str) -> list[dict[str, Any]]:
         return await self._all(
             """
-            SELECT e.id, e.kind, e.summary, e.occurred_at, e.status, e.created_at FROM memory_provenance p
+            SELECT e.id, e.kind, e.summary, e.occurred_at, e.status, e.created_at, e.metadata FROM memory_provenance p
             JOIN memory_events e ON e.id = p.source_id
             WHERE p.owner_user_id = ? AND p.target_type = 'record' AND p.target_id = ? AND p.source_type = 'event'
             ORDER BY e.occurred_at
@@ -709,12 +714,28 @@ class MemoryStore:
             (self.workspace_id, owner, format_ts(start), format_ts(end)),
         )
 
-    async def cascade_forget(self, owner: str, record_ids: list[str], now: datetime) -> Cascade:
-        """Steps 1-3 of the forget cascade (Spec 13 §3.2). Re-passing bodies needs the model, so the caller does it."""
+    async def cascade_forget(
+        self, owner: str, record_ids: list[str], now: datetime, *, events: Iterable[str] = ()
+    ) -> Cascade:
+        """Steps 1-3 of the forget cascade (Spec 13 §3.2). Re-passing bodies needs the model, so the caller does it.
+
+        `events` are retracted directly, for memory that came from somewhere other than a record (Spec 18 §7).
+        """
         cascade = Cascade()
         dead_events: set[str] = set()
         dead_records: set[str] = set()
         summaries: dict[str, str] = {}
+        for event_id in events:
+            row = await self._one(
+                "SELECT summary, status FROM memory_events WHERE owner_user_id = ? AND id = ?", (owner, event_id)
+            )
+            if row is None:
+                continue
+            if row["status"] == "ACTIVE":
+                await self._run("UPDATE memory_events SET status = 'RETRACTED' WHERE id = ?", (event_id,))
+                cascade.retracted.append(event_id)
+            dead_events.add(event_id)
+            summaries[event_id] = row["summary"]
 
         async def forget(record_id: str) -> None:
             for version in await self.versions(owner, record_id):

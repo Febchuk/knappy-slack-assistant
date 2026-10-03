@@ -6,6 +6,7 @@ Assertions are on behavior: which tools ran with which arguments, what reached S
 from __future__ import annotations
 
 import ipaddress
+from pathlib import Path
 import json
 import logging
 import re
@@ -14,7 +15,7 @@ from datetime import datetime, timedelta, timezone
 import httpx
 import pytest
 
-from fakes import FakeSlack, agent, event, member, memory_structured, op, pdf_with, user_turns
+from fakes import FakeSlack, agent, event, member, memory_structured, observer, op, pdf_with, user_turns
 from journey import FakeFile, dm_channel, placeholder_replaced
 from knappy.agent.prompt import IDENTITY
 from knappy.llm.fake import FakeModel, GenerateRequest
@@ -604,3 +605,99 @@ async def test_j17_follow_through(journey) -> None:
     to_alex = [post["text"] for post in sent.to("UALEX")]
     assert to_alex == [payload["staged_content"]], "Alex gets the chase drafted for him"
     assert nudge.posts[0]["text"] not in to_alex[0] and "asked me to" not in to_alex[0], "not the reminder to the user"
+
+
+WORKSPACE_PEOPLE = [
+    member("U1", "Febe Chukwuma", display_name="febe"), member("U_SAM", "Sam Lee"), member("U_ALEX", "Alex Kim"),
+    member("U_PAT", "Pat Doe"), member("U_JO", "Jo Park"),
+]
+CHATTER = [
+    ("U_JO", "C_RANDOM", "anyone tried the new ramen place on 5th street"),
+    ("U_PAT", "C_RANDOM", "the coffee machine on floor three is broken again"),
+    ("U_SAM", "C_GENERAL", "reminder that the all hands recording is up on the wiki"),
+    ("U_JO", "C_DESIGN", "I pushed new icons to the shared figma file for the mobile team"),
+    ("U_ALEX", "C_RANDOM", "who wants to join the friday climbing session"),
+]
+BUSY = {
+    "review the launch deck": {"kind": "asks_user", "summary": "Sam asked the user to review the launch deck by Thursday",
+                               "who": "Sam", "due": "2026-10-08T17:00:00+00:00"},
+    "budget numbers": {"kind": "asks_user", "summary": "Pat asked the user for the Q4 budget numbers", "who": "Pat"},
+    "launch moves": {"kind": "workstream_update", "summary": "The Atlas launch moved from Oct 14 to Oct 20", "who": "Pat"},
+    "contract attached": lambda context: {
+        "kind": "commitment_moved", "summary": "Alex sent the contract", "who": "Alex", "completed": True,
+        "commitment_id": next(row["id"] for row in context["open_commitments"] if "contract" in row["commitment"].lower()),
+    },
+}
+
+
+async def chatter(j, day: int) -> None:
+    for user, channel, text in CHATTER:
+        await j.workspace(user, channel, f"{text} (day {day})")
+
+
+def card_labels(posts: list[dict], action: str | None) -> list[str]:
+    """The bold label of each card in these posts, for cards with (or, with None, without) the given button."""
+    labels = []
+    for post in posts:
+        blocks = post.get("blocks") or []
+        for index, block in enumerate(blocks[1:], 1):
+            text = (block.get("text") or {}).get("text", "")
+            if block["type"] != "section" or "Open in Slack" not in text:
+                continue
+            following = blocks[index + 1] if index + 1 < len(blocks) else {}
+            buttons = [element["action_id"] for element in following.get("elements") or []] if following.get("type") == "actions" else []
+            if (action in buttons) if action else not buttons:
+                labels.append(text.split("*")[1])
+    return labels
+
+
+async def test_j18_aware_of_a_busy_workspace(journey) -> None:
+    model = FakeModel(agent(), structured=memory_structured(chase_alex, observer(BUSY)))
+    j = await journey(model, slack=FakeSlack(tz="UTC", members=WORKSPACE_PEOPLE), owner="U1")
+    await j.dm("U1", "I asked Alex for the contract. If he hasn't sent it by Thursday, help me chase him.")
+    await chatter(j, 1)
+    await j.workspace("U_SAM", "C_DESIGN", "<@U1> could you review the launch deck before Thursday's sync?")
+    await j.workspace("U_PAT", "C_LAUNCH", "heads up team, the Atlas launch moves to Oct 20, QA needs another week")
+    await chatter(j, 1)
+    day_one = await j.advance(hours=20)
+    await chatter(j, 2)
+    await j.workspace("U_ALEX", "D_ALEX", "here you go, contract attached, let me know if anything is off")
+    await j.workspace("U_PAT", "D_PAT", "can you send me the Q4 budget numbers when you get a chance?")
+    await chatter(j, 2)
+    rest = await j.advance(days=2, hours=23)
+
+    briefs = day_one.posts + rest.posts
+    assert [post["channel"] for post in briefs] == [dm_channel("U1")] * 4, "a brief each morning, Tue to Fri; no interrupts"
+    assert set(card_labels(briefs, "btn_attention_done")) == {
+        "Sam asked the user to review the launch deck by Thursday, due Thu 17:00",
+        "Pat asked the user for the Q4 budget numbers",
+    }
+    assert card_labels(briefs, None) == ["The Atlas launch moved from Oct 14 to Oct 20"]
+    [chase] = await j.rows("SELECT status FROM interactions WHERE commitment LIKE 'Chase Alex%'")
+    assert chase["status"] == "FULFILLED", "the chase closed itself when the contract arrived"
+    assert "chase" not in json.dumps(rest.posts).lower()
+    summaries = [row["summary"] for row in await j.rows("SELECT summary FROM memory_events")]
+    assert not [line for line in summaries if any(word in line.lower() for word in ("ramen", "coffee", "climbing", "icons"))]
+    stored = Path(j.settings.database_url.removeprefix("sqlite:///")).read_bytes()
+    assert not [text for _user, _channel, text in CHATTER if text.encode() in stored], "chatter leaves no trace"
+    assert b"could you review the launch deck" not in stored
+
+
+async def test_j19_busy_workspace_quiet_week(journey, caplog: pytest.LogCaptureFixture) -> None:
+    model = FakeModel(agent(), structured=memory_structured(observe=observer({})))
+    j = await journey(model, slack=FakeSlack(tz="UTC", members=WORKSPACE_PEOPLE), owner="U1")
+    await j.dm("U1", "haha that meeting was wild")
+    caplog.set_level(logging.INFO, logger="knappy")
+    posts: list[dict] = []
+    for day in range(5):
+        for _round in range(3):
+            await chatter(j, day)
+            posts += (await j.advance(hours=1)).posts
+        posts += (await j.advance(hours=21)).posts
+
+    assert posts == [], "zero interrupts and no brief"
+    ticks = [record.getMessage() for record in caplog.records if record.getMessage().startswith("heartbeat tick")]
+    assert len(ticks) == 5 * 48 and all("outcome=silent" in line for line in ticks)
+    flushes = [record.getMessage() for record in caplog.records if record.getMessage().startswith("awareness flush")]
+    assert flushes and all("admitted=0" in line for line in flushes)
+    assert await j.rows("SELECT * FROM attention_items") == []

@@ -48,6 +48,9 @@ class Settings:
     daily_budget_usd: float = 1.00
     admission_threshold: float = 0.4
     raw_retention_days: int = 90
+    # Spec 18: the installer's User OAuth Token. Without it, workspace awareness is off.
+    slack_user_token: str | None = None
+    awareness_threshold: float = 0.5
 
     @classmethod
     def from_env(cls) -> Settings:
@@ -65,6 +68,8 @@ class Settings:
             daily_budget_usd=_number("KNAPPY_DAILY_BUDGET_USD", "1.00", float),
             admission_threshold=_number("KNAPPY_ADMISSION_THRESHOLD", "0.4", float),
             raw_retention_days=_number("KNAPPY_RAW_RETENTION_DAYS", "90", int),
+            slack_user_token=os.environ.get("SLACK_USER_TOKEN") or None,
+            awareness_threshold=_number("KNAPPY_AWARENESS_THRESHOLD", "0.5", float),
         )
 
 

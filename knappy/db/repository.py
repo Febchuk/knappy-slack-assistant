@@ -13,7 +13,7 @@ from typing import Any
 
 import aiosqlite
 
-from knappy.db.schema import EXPECTED_TABLES, SQLITE_ACTION_DRAFTS, SQLITE_SCHEMA
+from knappy.db.schema import EXPECTED_TABLES, SQLITE_ACTION_DRAFTS, SQLITE_MEMORY_PROVENANCE, SQLITE_SCHEMA
 from knappy.db.vectors import cosine_distance, pack_embedding
 
 
@@ -24,7 +24,20 @@ ADDED_COLUMNS = {
     ),
     "contacts": (("last_alerted_at", "DATETIME"),),
     "user_profile": (("brief_on", "TEXT"), ("nudges_on", "TEXT"), ("nudges_sent", "INTEGER NOT NULL DEFAULT 0")),
+    "memory_events": (("metadata", "TEXT"),),
 }
+
+# Tables whose CHECK constraint grew after they shipped: (table, a value the current CHECK names, its DDL, its indexes).
+WIDENED_CHECKS = (
+    (
+        "action_drafts", "POST_THREAD_REPLY", SQLITE_ACTION_DRAFTS,
+        "CREATE INDEX IF NOT EXISTS idx_action_drafts_pending ON action_drafts (user_id, status) WHERE status = 'PENDING';",
+    ),
+    (
+        "memory_provenance", "slack_message", SQLITE_MEMORY_PROVENANCE,
+        "CREATE INDEX IF NOT EXISTS idx_prov_source ON memory_provenance (owner_user_id, source_type, source_id);",
+    ),
+)
 
 
 def utc_now() -> datetime:
@@ -135,7 +148,7 @@ class SqliteRepository:
         await self.connection.execute("PRAGMA foreign_keys = ON")
         await self._migrate_owner_user_id()
         await self._migrate_added_columns()
-        await self._migrate_action_types()
+        await self._migrate_checks()
         await self.connection.commit()
 
     async def table_names(self) -> set[str]:
@@ -585,8 +598,9 @@ class SqliteRepository:
             UNION SELECT owner_user_id FROM interactions WHERE workspace_id = ? AND status = 'PENDING'
             UNION SELECT owner_user_id FROM briefing_items WHERE workspace_id = ? AND status = 'QUEUED'
             UNION SELECT owner_user_id FROM contacts WHERE workspace_id = ?
+            UNION SELECT owner_user_id FROM attention_items WHERE workspace_id = ? AND status IN ('OPEN', 'SNOOZED')
             """,
-            (workspace_id,) * 5,
+            (workspace_id,) * 6,
         )
         return sorted(row["owner_user_id"] for row in rows if row["owner_user_id"])
 
@@ -816,22 +830,18 @@ class SqliteRepository:
                 if column not in columns:
                     await self.connection.execute(f"ALTER TABLE {table} ADD COLUMN {column} {kind}")
 
-    async def _migrate_action_types(self) -> None:
-        """Databases created before SHARE_FILE carry the old CHECK constraint; rebuild the table to widen it."""
-        row = await self._one("SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'action_drafts'", ())
-        if row is None or "SHARE_FILE" in row["sql"]:
-            return
-        await self.connection.execute("PRAGMA foreign_keys = OFF")
-        await self.connection.executescript(
-            "ALTER TABLE action_drafts RENAME TO action_drafts_old;\n"
-            + SQLITE_ACTION_DRAFTS
-            + """
-            INSERT INTO action_drafts SELECT * FROM action_drafts_old;
-            DROP TABLE action_drafts_old;
-            CREATE INDEX IF NOT EXISTS idx_action_drafts_pending ON action_drafts (user_id, status) WHERE status = 'PENDING';
-            """
-        )
-        await self.connection.execute("PRAGMA foreign_keys = ON")
+    async def _migrate_checks(self) -> None:
+        """SQLite cannot alter a CHECK constraint. A table created before it widened is rebuilt from today's DDL."""
+        for table, marker, ddl, indexes in WIDENED_CHECKS:
+            row = await self._one("SELECT sql FROM sqlite_master WHERE type = 'table' AND name = ?", (table,))
+            if row is None or marker in row["sql"]:
+                continue
+            await self.connection.execute("PRAGMA foreign_keys = OFF")
+            await self.connection.executescript(
+                f"ALTER TABLE {table} RENAME TO {table}_old;\n{ddl}\n"
+                f"INSERT INTO {table} SELECT * FROM {table}_old;\nDROP TABLE {table}_old;\n{indexes}"
+            )
+            await self.connection.execute("PRAGMA foreign_keys = ON")
 
     async def _migrate_owner_user_id(self) -> None:
         if self.dialect != "sqlite":

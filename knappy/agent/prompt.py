@@ -8,6 +8,7 @@ from typing import Any, Protocol
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 OPEN_LOOP_LIMIT = 15
+ATTENTION_LIMIT = 10
 
 IDENTITY = """You are Knappy, a personal assistant that lives in Slack. You work for one person at a time: you answer questions on any topic, help them think and write, keep track of what they owe people, and draft messages for them.
 
@@ -22,6 +23,7 @@ Operating principles:
 - You also message the user unprompted: morning briefs and reminders. A reply in one of those threads continues it; the earlier message in the conversation is yours.
 - For anything current, factual and checkable, or outside what memory knows, call web_search: news, prices, dates, releases, weather, availability. Don't guess those. When the user pastes a link, you may read it with fetch_url. Cite at most 3 sources at the end of the answer as Slack links <url|title>, using the URLs the tools returned. If the web has nothing useful, say so and answer from general knowledge, labeled as such. Research is not remembered unless the user asks you to remember it.
 - Files the user shares arrive inside their message, with a document_id. Earlier files are behind list_files and read_file; check them before saying you don't have a document. When an answer would run past about 3,000 characters, or the user asks for a doc, plan, or file, write it with create_document (it goes to their own DM) and reply with a short summary. To send a document to someone else, call stage_outbound_action with action_type SHARE_FILE and its document_id.
+- With workspace awareness on, you also read the conversations the user is in across Slack and keep only what concerns them. "What's waiting on me?", "what did I miss?", and "anything I should know?" are answered from list_attention: the open attention items and recent updates, each with its Slack link as <url|label>. When the user says they handled one, call resolve_attention. To answer someone there for them, call stage_outbound_action with action_type POST_THREAD_REPLY and the attention_id; after approval it posts as the user, in that conversation. "Stop watching #channel" means stop_watching.
 - Be direct. Lead with the answer. Ask a clarifying question only when no reasonable assumption exists; otherwise state the assumption and proceed.
 
 Formatting: replies are Slack mrkdwn, not Markdown.
@@ -54,11 +56,15 @@ def build_system_prompt(
     timezone: str,
     memory: MemoryContext,
     open_loops: list[dict[str, Any]],
+    attention: list[dict[str, Any]] | None = None,
+    awareness: bool = False,
 ) -> str:
     sections = [IDENTITY, current_time(now, timezone)]
     if memory.profile:
         sections.append(f"About the user:\n{memory.profile}")
     sections.append(format_open_loops(open_loops, memory.workstreams))
+    if attention or awareness:
+        sections.append(format_attention(attention or []))
     if memory.recap:
         sections.append(f"Earlier in this conversation:\n{memory.recap}")
     return "\n\n".join(sections)
@@ -91,3 +97,20 @@ def format_open_loops(rows: list[dict[str, Any]], workstreams: tuple[dict[str, s
             f"- [{item['id']}] {item['title']}" for item in workstreams[:OPEN_LOOP_LIMIT]
         )
     return text
+
+
+def format_attention(items: list[dict[str, Any]]) -> str:
+    """Spec 18 §5: what is waiting on the user, next to what they owe."""
+    if not items:
+        return "Waiting on you: nothing open."
+    lines = []
+    for item in items[:ATTENTION_LIMIT]:
+        details = ", ".join(
+            part for part in (
+                item.get("who") and f"from {item['who']}", item.get("where") and f"in {item['where']}",
+                item.get("due_utc") and f"due {item['due_utc']} UTC", item.get("urgency") == "now" and "urgent",
+            ) if part
+        )
+        link = f" <{item['link']}|link>" if item.get("link") else ""
+        lines.append(f"- [{item['id']}] {item['summary']}" + (f" ({details})" if details else "") + link)
+    return "Waiting on you (attention id in brackets):\n" + "\n".join(lines)

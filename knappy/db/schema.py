@@ -1,6 +1,61 @@
 """SQLite and PostgreSQL DDL for the dual-memory store."""
 
-ACTION_TYPES = "'SEND_SLACK_DM', 'SHARE_FILE', 'GMAIL_DRAFT', 'CALENDAR_INVITE', 'POST_CHANNEL'"
+ACTION_TYPES = "'SEND_SLACK_DM', 'SHARE_FILE', 'POST_THREAD_REPLY', 'GMAIL_DRAFT', 'CALENDAR_INVITE', 'POST_CHANNEL'"
+PROVENANCE_SOURCES = "'turn', 'document', 'event', 'record', 'migration', 'slack_message'"
+
+
+SQLITE_MEMORY_PROVENANCE = f"""CREATE TABLE IF NOT EXISTS memory_provenance (
+    target_type TEXT NOT NULL CHECK(target_type IN ('event', 'record')),
+    target_id TEXT NOT NULL,
+    source_type TEXT NOT NULL CHECK(source_type IN ({PROVENANCE_SOURCES})),
+    source_id TEXT NOT NULL,
+    owner_user_id TEXT NOT NULL,
+    PRIMARY KEY (owner_user_id, target_type, target_id, source_type, source_id)
+);"""
+
+# Spec 18. Raw message text is never stored: attention items and observations keep a summary and a permalink.
+AWARENESS_TABLES = """
+CREATE TABLE IF NOT EXISTS attention_items (
+    id TEXT PRIMARY KEY,
+    workspace_id TEXT NOT NULL,
+    owner_user_id TEXT NOT NULL,
+    kind TEXT NOT NULL CHECK(kind IN ('asks_user', 'assigns_user', 'waiting_on_user')),
+    summary TEXT NOT NULL,
+    who TEXT,
+    who_slack_id TEXT,
+    channel_id TEXT NOT NULL,
+    channel_name TEXT,
+    thread_ts TEXT,
+    source_ts TEXT NOT NULL,
+    permalink TEXT,
+    due_at TEXT,
+    urgency TEXT NOT NULL CHECK(urgency IN ('low', 'today', 'now')),
+    status TEXT NOT NULL DEFAULT 'OPEN' CHECK(status IN ('OPEN', 'ANSWERED', 'DONE', 'DISMISSED', 'SNOOZED')),
+    snoozed_until TEXT,
+    last_surfaced_at TEXT,
+    created_at TEXT NOT NULL,
+    resolved_at TEXT,
+    UNIQUE (owner_user_id, channel_id, source_ts)
+);
+CREATE INDEX IF NOT EXISTS idx_attention_open ON attention_items (workspace_id, owner_user_id, status);
+
+CREATE TABLE IF NOT EXISTS awareness_excluded (
+    workspace_id TEXT NOT NULL,
+    owner_user_id TEXT NOT NULL,
+    channel_id TEXT NOT NULL,
+    channel_name TEXT,
+    created_at TEXT NOT NULL,
+    PRIMARY KEY (workspace_id, owner_user_id, channel_id)
+);
+
+CREATE TABLE IF NOT EXISTS awareness_cursors (
+    workspace_id TEXT NOT NULL,
+    owner_user_id TEXT NOT NULL,
+    channel_id TEXT NOT NULL,
+    last_ts TEXT NOT NULL,
+    PRIMARY KEY (workspace_id, owner_user_id, channel_id)
+);
+"""
 
 # SQLite cannot alter a CHECK constraint, so the migration rebuilds the table from this definition.
 SQLITE_ACTION_DRAFTS = f"""CREATE TABLE IF NOT EXISTS action_drafts (
@@ -186,14 +241,7 @@ CREATE TABLE IF NOT EXISTS memory_events (
 CREATE INDEX IF NOT EXISTS idx_events_owner_time ON memory_events (owner_user_id, occurred_at);
 CREATE INDEX IF NOT EXISTS idx_events_commitment ON memory_events (commitment_id) WHERE commitment_id IS NOT NULL;
 
-CREATE TABLE IF NOT EXISTS memory_provenance (
-    target_type TEXT NOT NULL CHECK(target_type IN ('event', 'record')),
-    target_id TEXT NOT NULL,
-    source_type TEXT NOT NULL CHECK(source_type IN ('turn', 'document', 'event', 'record', 'migration')),
-    source_id TEXT NOT NULL,
-    owner_user_id TEXT NOT NULL,
-    PRIMARY KEY (owner_user_id, target_type, target_id, source_type, source_id)
-);
+""" + SQLITE_MEMORY_PROVENANCE + """
 CREATE INDEX IF NOT EXISTS idx_prov_source ON memory_provenance (owner_user_id, source_type, source_id);
 
 CREATE TABLE IF NOT EXISTS documents (
@@ -225,7 +273,7 @@ CREATE INDEX IF NOT EXISTS idx_interactions_due ON interactions (status, due_dat
 CREATE INDEX IF NOT EXISTS idx_interactions_contact ON interactions (contact_id);
 CREATE INDEX IF NOT EXISTS idx_action_drafts_pending ON action_drafts (user_id, status) WHERE status = 'PENDING';
 CREATE INDEX IF NOT EXISTS idx_briefing_items_queued ON briefing_items (workspace_id, status) WHERE status = 'QUEUED';
-"""
+""" + AWARENESS_TABLES
 
 POSTGRES_SCHEMA = """
 CREATE EXTENSION IF NOT EXISTS "uuid-ossp";
@@ -409,12 +457,16 @@ CREATE INDEX IF NOT EXISTS idx_events_commitment ON memory_events (commitment_id
 CREATE TABLE IF NOT EXISTS memory_provenance (
     target_type TEXT NOT NULL CHECK(target_type IN ('event', 'record')),
     target_id TEXT NOT NULL,
-    source_type TEXT NOT NULL CHECK(source_type IN ('turn', 'document', 'event', 'record', 'migration')),
+    source_type TEXT NOT NULL CHECK(source_type IN (""" + PROVENANCE_SOURCES + """)),
     source_id TEXT NOT NULL,
     owner_user_id TEXT NOT NULL,
     PRIMARY KEY (owner_user_id, target_type, target_id, source_type, source_id)
 );
 CREATE INDEX IF NOT EXISTS idx_prov_source ON memory_provenance (owner_user_id, source_type, source_id);
+
+ALTER TABLE memory_events ADD COLUMN IF NOT EXISTS metadata TEXT;
+ALTER TABLE memory_provenance DROP CONSTRAINT IF EXISTS memory_provenance_source_type_check;
+ALTER TABLE memory_provenance ADD CONSTRAINT memory_provenance_source_type_check CHECK(source_type IN (""" + PROVENANCE_SOURCES + """));
 
 ALTER TABLE action_drafts DROP CONSTRAINT IF EXISTS action_drafts_action_type_check;
 ALTER TABLE action_drafts ADD CONSTRAINT action_drafts_action_type_check CHECK(action_type IN (""" + ACTION_TYPES + """));
@@ -442,12 +494,13 @@ CREATE TABLE IF NOT EXISTS document_chunks (
     embedding BYTEA,
     PRIMARY KEY (document_id, seq)
 );
-"""
+""" + AWARENESS_TABLES
 
 EXPECTED_TABLES = frozenset(
     {
         "workspaces", "contacts", "interactions", "action_drafts", "briefing_items", "model_usage",
         "conversation_turns", "memory_records", "user_profile", "conversation_recaps",
         "memory_events", "memory_provenance", "documents", "document_chunks",
+        "attention_items", "awareness_excluded", "awareness_cursors",
     }
 )

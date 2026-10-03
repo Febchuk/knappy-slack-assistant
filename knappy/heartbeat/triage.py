@@ -17,6 +17,7 @@ Interrupt only when acting soon matters: a deadline within hours, or a real cost
 Prefer the morning digest for anything that can wait until tomorrow.
 Suppress items with little value. Silence is a good outcome.
 A check-in (hours_until_check at or below zero) means the user asked to be told if nothing moved by then; on_no_progress says what they wanted done.
+An ATTENTION item is someone in Slack waiting on the user; urgency "now" means they said they need it within hours.
 """.strip()
 
 
@@ -43,7 +44,7 @@ def model_triage(model: Model) -> ClassifyFn:
 def _triage_view(candidate: dict[str, Any]) -> dict[str, Any]:
     keys = (
         "kind", "contact_name", "commitment", "summary", "due_date", "hours_until_due", "days_since_last_contact",
-        "hours_until_check", "waiting_on", "on_no_progress",
+        "hours_until_check", "waiting_on", "on_no_progress", "urgency",
     )
     return {key: candidate[key] for key in keys if candidate.get(key) is not None}
 

@@ -15,10 +15,12 @@ from fakes import FakeApp, FakeClock, FakeSlack
 from knappy.config import Settings
 from knappy.files.service import SlackDownloader
 from knappy.llm.types import Model
+from knappy.awareness.ingest import Pacing
 from knappy.main import heartbeat_tick, open_runtime
 from knappy.runtime import KnappyRuntime
 from knappy.slack.actions import register_actions
 from knappy.slack.egress import PLACEHOLDER
+from knappy.slack.events import on_message
 from knappy.web import WebFetcher
 
 WORKSPACE = "T_JOURNEY"
@@ -55,6 +57,8 @@ class SlackCapture:
     reactions: list[tuple[str, dict[str, Any]]] = field(default_factory=list)
     post_ts: list[str] = field(default_factory=list)
     tools: list[ToolUse] = field(default_factory=list)
+    # For a workspace message: the event as Slack delivered it.
+    event: dict[str, Any] | None = None
 
     @property
     def reply(self) -> dict[str, Any]:
@@ -84,8 +88,11 @@ class Journey:
         clock: FakeClock,
         slack: FakeSlack | None = None,
         fetcher: WebFetcher | None = None,
+        owner: str | None = None,
     ) -> None:
         self.model = model
+        # Spec 18: with an owner, Knappy holds that person's user token and reads their conversations.
+        self.owner = owner
         self.fetcher = fetcher
         self.clock = clock
         self.slack = slack or FakeSlack(tz="UTC")
@@ -104,12 +111,13 @@ class Journey:
         self.app = FakeApp()
         self._ts = itertools.count(1)
         self._heartbeat_at: datetime | None = None
+        self.user_slack = FakeSlack(tz="UTC", user_id=owner, members=self.slack.members) if owner else None
 
     async def start(self) -> Journey:
         downloader = SlackDownloader(self.settings.slack_bot_token, transport=httpx.MockTransport(self._file_server))
         runtime = await open_runtime(
             self.settings, workspace_id=WORKSPACE, client=self.slack, model=self.model, clock=self.clock,
-            fetcher=self.fetcher, downloader=downloader,
+            fetcher=self.fetcher, downloader=downloader, user_client=self.user_slack, awareness_pacing=Pacing(call_gap_s=0),
         )
         self._record_tools(runtime)
         self.app = FakeApp()
@@ -142,6 +150,7 @@ class Journey:
         """
         ts = f"{int(self.clock().timestamp())}.{next(self._ts):06d}"
         event = {"text": text, "channel": dm_channel(user), "channel_type": "im", "user": user, "ts": ts}
+        self.slack.visible.add(dm_channel(user))
         if files:
             event["subtype"] = "file_share"
             event["files"] = [self._share(file) for file in files]
@@ -150,6 +159,58 @@ class Journey:
         with self._capture() as capture:
             await self._running.handle_event(event)
         return capture.result
+
+    async def workspace(
+        self, user: str, channel: str, text: str, *, thread: str | None = None, edit_of: str | None = None,
+        bot: bool = False,
+    ) -> SlackCapture:
+        """A message in one of the owner's conversations, delivered as a user-scoped event over Socket Mode.
+
+        Channel ids name their kind: C_DESIGN is #design, G_... a private channel, D_SAM the owner's DM with
+        U_SAM, M_... a group DM. The message also lands in the conversation's history, for catch-up to read.
+        """
+        assert self.user_slack is not None and self.owner, "this journey has no user token"
+        ts = edit_of or f"{int(self.clock().timestamp())}.{next(self._ts):06d}"
+        kind = {"C": "channel", "G": "group", "D": "im", "M": "mpim"}[channel[0]]
+        message: dict[str, Any] = {"type": "message", "user": user, "text": text, "ts": ts}
+        if thread:
+            message["thread_ts"] = thread
+        if bot:
+            message = {**message, "subtype": "bot_message", "bot_id": "B_OTHER"}
+        self._register(channel, kind, user)
+        history = self.user_slack.history.setdefault(channel, [])
+        history[:] = [old for old in history if old["ts"] != ts] + [message]
+        event = {**message, "channel": channel, "channel_type": kind}
+        if edit_of:
+            event = {"type": "message", "subtype": "message_changed", "channel": channel, "channel_type": kind,
+                     "message": message, "ts": f"{ts}9"}
+        with self._capture() as capture:
+            await self.deliver(event)
+        capture.result.event = {**message, "channel": channel, "channel_type": kind}
+        return capture.result
+
+    async def deliver(self, event: dict[str, Any], *, is_bot: bool = False) -> None:
+        """Slack's delivery of one message event to the app, through the same routing the Bolt handler uses."""
+        async def ack() -> None:
+            return None
+
+        runtime = self._running
+        authorization = {"is_bot": is_bot, "user_id": "UBOT" if is_bot else self.owner}
+        await on_message(event, ack, processor=runtime.handle_event, awareness=runtime.awareness, authorizations=[authorization])
+
+    def _register(self, channel: str, kind: str, user: str) -> None:
+        assert self.user_slack is not None
+        if any(known["id"] == channel for known in self.user_slack.conversations):
+            return
+        name = channel.split("_", 1)[-1].lower()
+        described: dict[str, Any] = {"id": channel}
+        if kind == "im":
+            described.update(is_im=True, user=user if user != self.owner else f"U_{channel.split('_', 1)[-1]}")
+        elif kind == "mpim":
+            described.update(is_mpim=True, name=f"mpdm-{name}")
+        else:
+            described.update(name=name, is_private=kind == "group")
+        self.user_slack.conversations.append(described)
 
     async def click(self, user: str, action_id: str, value: str) -> SlackCapture:
         """Press the button carrying `value`, on the message where it was last shown."""
@@ -181,6 +242,8 @@ class Journey:
     async def tick(self) -> None:
         runtime = self._running
         now = self.clock()
+        if runtime.awareness is not None:
+            await runtime.awareness.tick()
         if self._heartbeat_at is None or now - self._heartbeat_at >= HEARTBEAT_EVERY:
             await heartbeat_tick(runtime.heartbeat)
             self._heartbeat_at = now
