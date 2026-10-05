@@ -66,6 +66,8 @@ Start with [00_gap_analysis.md](./00_gap_analysis.md): it explains why specs 01â
 | [16_proactive_v2.md](./16_proactive_v2.md) | Proactive fixes | Monitor pattern, amended | Correct follow-up drafts, per-timezone briefs, deliberate silence, follow-through checks; state-diff design for wave 2 |
 | [17_end_to_end_acceptance.md](./17_end_to_end_acceptance.md) | Acceptance | Journeys at three levels | J-01â€¦J-17, the definition of done for wave 1, memory journeys weighted highest |
 | [18_workspace_awareness.md](./18_workspace_awareness.md) | Workspace awareness | Event stream + state diff | User-token reading of your conversations, relevance pass, attention items, *Needs you* brief section |
+| [19_mcp_connections.md](./19_mcp_connections.md) | MCP connections | Per-user OAuth + MCP client | Server registry, four auth modes, encrypted tokens, OAuth callback, `McpHub` |
+| [20_acting_through_mcp.md](./20_acting_through_mcp.md) | Acting through MCP | ReAct + HITL | App tools per user, reads run, writes become `APP_ACTION` approval cards |
 
 ---
 

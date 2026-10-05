@@ -59,7 +59,7 @@ These parts are sound and stay:
 | Wave | Contents | Specs |
 | :--- | :--- | :--- |
 | **1 — Talk, remember, research, read** | Gemini brain, agent loop, Instinct-style memory, web search and fetch, files in and out, proactive fixes, acceptance journeys. | 11–17 |
-| **2 — Act in your accounts** | Google Workspace: Gmail read, draft, send; Calendar read and schedule. All writes through HITL. | Not yet written |
+| **2 — Act in your accounts** | Each user connects their own apps over MCP (Lorikeet, Grain, Gmail, Calendar, BigQuery). Reads run freely; every write goes through HITL. | 19–21 |
 | **3 — Act anywhere** | Sandboxed browser for sites without an API, with a monitor that screens planned actions (Muse's Sentinel). | Not yet written |
 
 ---
