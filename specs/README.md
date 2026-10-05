@@ -68,6 +68,7 @@ Start with [00_gap_analysis.md](./00_gap_analysis.md): it explains why specs 01â
 | [18_workspace_awareness.md](./18_workspace_awareness.md) | Workspace awareness | Event stream + state diff | User-token reading of your conversations, relevance pass, attention items, *Needs you* brief section |
 | [19_mcp_connections.md](./19_mcp_connections.md) | MCP connections | Per-user OAuth + MCP client | Server registry, four auth modes, encrypted tokens, OAuth callback, `McpHub` |
 | [20_acting_through_mcp.md](./20_acting_through_mcp.md) | Acting through MCP | ReAct + HITL | App tools per user, reads run, writes become `APP_ACTION` approval cards |
+| [21_launch_connections.md](./21_launch_connections.md) | Launch connections | Config as data + live acceptance | Lorikeet, Grain, Gmail, Calendar, BigQuery entries, `tools` lever, negative list cache, `$ref` guard, live checklist |
 
 ---
 
