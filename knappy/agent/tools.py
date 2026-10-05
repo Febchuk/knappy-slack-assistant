@@ -14,6 +14,9 @@ from typing import TYPE_CHECKING, Any, Literal
 
 from jsonschema import SchemaError, validators
 from pydantic import AwareDatetime, BaseModel, Field
+from referencing import Registry
+from referencing.exceptions import Unresolvable
+from referencing.jsonschema import DRAFT202012, specification_with
 
 from knappy.awareness.store import AwarenessStore
 from knappy.db.repository import SqliteRepository, format_ts, utc_now
@@ -318,16 +321,46 @@ def app_specs(servers: dict[str, str]) -> list[ToolSpec]:
     ]
 
 
+def _refs(node: Any) -> Any:
+    if isinstance(node, dict):
+        for key, value in node.items():
+            if key == "$ref" and isinstance(value, str):
+                yield value
+            elif key not in ("enum", "const", "default", "examples"):
+                yield from _refs(value)
+    elif isinstance(node, list):
+        for value in node:
+            yield from _refs(value)
+
+
+def app_tool_problem(name: str, schema: dict[str, Any]) -> Literal["name", "schema"] | None:
+    """Why Gemini would refuse this declaration, or None.
+
+    Measured 2026-10-04 (Spec 21 §4.2): the only schema Gemini rejected was a `$ref` that does not resolve inside the
+    schema, and it failed the whole request, every other tool with it.
+    """
+    if not APP_TOOL_NAME.match(name):
+        return "name"
+    try:
+        validators.validator_for(schema).check_schema(schema)
+    except SchemaError:
+        return "schema"
+    resource = specification_with(str(schema.get("$schema", "")), default=DRAFT202012).create_resource(schema)
+    resolver = Registry().resolver_with_root(resource)
+    for ref in _refs(schema):
+        try:
+            resolver.lookup(ref)
+        except Unresolvable:
+            return "schema"
+    return None
+
+
 def app_tool_spec(tool: McpTool, app: str) -> ToolSpec | None:
     """One connected tool as `<server>__<tool>` with the server's schema verbatim (Spec 20 §2.2). None when unusable."""
     name = f"{tool.server}__{tool.name}"
-    if not APP_TOOL_NAME.match(name):
-        logger.warning("mcp tool skipped name=%s reason=name", name)
-        return None
-    try:
-        validators.validator_for(tool.input_schema).check_schema(tool.input_schema)
-    except SchemaError:
-        logger.warning("mcp tool skipped name=%s reason=schema", name)
+    problem = app_tool_problem(name, tool.input_schema)
+    if problem is not None:
+        logger.warning("mcp tool skipped name=%s reason=%s", name, problem)
         return None
     description = f"[{app}] {tool.title or tool.name}. {tool.description}".strip()
     return ToolSpec(name, description + (WRITE_NOTE if tool.access == "write" else ""), tool.input_schema)

@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import logging
 import os
 from collections.abc import AsyncIterator, Callable, Mapping
@@ -35,6 +36,10 @@ logger = logging.getLogger(__name__)
 
 Access = Literal["read", "write"]
 TOOLS_TTL = timedelta(minutes=10)
+# A server that failed or timed out is not retried for this long, so a down server cannot cost every turn.
+FAILED_TTL = timedelta(minutes=2)
+# Under the turn's 10-second budget (Spec 20 §2.4), so a slow server is cached as failed before the turn gives up.
+LIST_TIMEOUT_S = 8.0
 
 
 @dataclass(frozen=True)
@@ -179,38 +184,50 @@ class McpHub:
             del self._cache[key]
 
     async def tools(self, owner: str) -> list[McpTool]:
-        found: list[McpTool] = []
-        for server in self.servers.values():
-            cached = self._cache.get((owner, server.name))
-            if cached and cached[0] > self.clock():
-                found.extend(cached[1])
-                continue
-            headers = await self.auth[server.auth_group].headers(owner)
-            if headers is None:
-                continue
-            try:
-                listed = await self._list(server, headers)
-            except _Unauthorized:
-                await self._rejected(owner, server)
-                continue
-            except Exception as exc:
-                logger.warning("mcp list_tools failed server=%s error=%s", server.name, type(exc).__name__)
-                continue
-            tools = [
-                McpTool(
-                    server=server.name,
-                    name=tool.name,
-                    title=tool.title or (tool.annotations.title if tool.annotations else None),
-                    description=tool.description or "",
-                    input_schema=tool.input_schema,
-                    access=self.classify(server.name, tool),
-                )
-                for tool in listed
-                if server.exposes(tool.name)
-            ]
-            self._cache[(owner, server.name)] = (self.clock() + TOOLS_TTL, tools)
-            found.extend(tools)
-        return found
+        listed = await asyncio.gather(*(self._server_tools(owner, server) for server in self.servers.values()))
+        return [tool for tools in listed for tool in tools]
+
+    async def _server_tools(self, owner: str, server: ServerConfig) -> list[McpTool]:
+        cached = self._cache.get((owner, server.name))
+        if cached and cached[0] > self.clock():
+            return cached[1]
+        headers = await self.auth[server.auth_group].headers(owner)
+        if headers is None:
+            return []
+        try:
+            listed = await asyncio.wait_for(self._list(server, headers), LIST_TIMEOUT_S)
+        except _Unauthorized:
+            await self._rejected(owner, server)
+            return []
+        except Exception as exc:
+            logger.warning("mcp list_tools failed server=%s error=%s", server.name, type(exc).__name__)
+            self._cache[(owner, server.name)] = (self.clock() + FAILED_TTL, [])
+            return []
+        tools = [
+            McpTool(
+                server=server.name,
+                name=tool.name,
+                title=tool.title or (tool.annotations.title if tool.annotations else None),
+                description=tool.description or "",
+                input_schema=tool.input_schema,
+                access=self.classify(server.name, tool),
+            )
+            for tool in listed
+            if server.exposes(tool.name)
+        ]
+        self._cache[(owner, server.name)] = (self.clock() + TOOLS_TTL, tools)
+        return tools
+
+    async def list_server(self, owner: str, server: str) -> list[mcp_types.Tool] | NotConnected:
+        """Every tool the server lists for this owner, unfiltered and uncached: for `python -m knappy.mcp tools`."""
+        config = self._server(server)
+        headers = await self.auth[config.auth_group].headers(owner)
+        if headers is None:
+            return await self._not_connected(owner, config)
+        try:
+            return await self._list(config, headers)
+        except _Unauthorized:
+            return await self._rejected(owner, config)
 
     async def _list(self, server: ServerConfig, headers: dict[str, str]) -> list[mcp_types.Tool]:
         listed: list[mcp_types.Tool] = []
