@@ -51,6 +51,10 @@ class Settings:
     # Spec 18: the installer's User OAuth Token. Without it, workspace awareness is off.
     slack_user_token: str | None = None
     awareness_threshold: float = 0.5
+    # Spec 19: MCP connections need both a public HTTPS origin for the OAuth redirect and a secret for token encryption.
+    public_url: str | None = None
+    secret_key: str | None = None
+    callback_port: int = 8080
 
     @classmethod
     def from_env(cls) -> Settings:
@@ -70,6 +74,9 @@ class Settings:
             raw_retention_days=_number("KNAPPY_RAW_RETENTION_DAYS", "90", int),
             slack_user_token=os.environ.get("SLACK_USER_TOKEN") or None,
             awareness_threshold=_number("KNAPPY_AWARENESS_THRESHOLD", "0.5", float),
+            public_url=os.environ.get("KNAPPY_PUBLIC_URL") or None,
+            secret_key=os.environ.get("KNAPPY_SECRET_KEY") or None,
+            callback_port=_number("KNAPPY_CALLBACK_PORT", "8080", int),
         )
 
 

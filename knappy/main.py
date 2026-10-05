@@ -20,6 +20,9 @@ from knappy.files.store import DocumentStore
 from knappy.ingestion.embed import semantic
 from knappy.llm.client import GeminiClient, ModelIds
 from knappy.llm.types import Model
+from knappy.mcp.callback import start_callback
+from knappy.mcp.hub import McpHub
+from knappy.mcp.servers import load_servers
 from knappy.memory import MemoryConfig
 from knappy.runtime import KnappyRuntime, usage_recorder
 from knappy.slack.actions import register_actions
@@ -130,6 +133,14 @@ async def open_runtime(
     repo = await open_repository(settings.database_url)
     await repo.init_schema()
     await repo.upsert_workspace(workspace_id, "Knappy", settings.slack_bot_token)
+    mcp = None
+    if settings.public_url and settings.secret_key:
+        mcp = McpHub(
+            repo, workspace_id, load_servers(), public_url=settings.public_url, secret_key=settings.secret_key, clock=clock
+        )
+        log.info("mcp on servers=%d", len(mcp.servers))
+    else:
+        log.info("mcp off: KNAPPY_PUBLIC_URL or KNAPPY_SECRET_KEY is not set")
     say = build_say(client)
     model = model or GeminiClient(
         settings.gemini_api_key,
@@ -156,11 +167,17 @@ async def open_runtime(
         bot_user_id=await _identity(client) if owner else None,
         awareness_threshold=settings.awareness_threshold,
         awareness_pacing=awareness_pacing,
+        mcp=mcp,
     )
     migrated = await runtime.store.migrate_contacts(clock())
     if migrated:
         logging.getLogger("knappy").info("memory migrated contacts=%d", migrated)
     return runtime
+
+
+async def _connected(user_id: str, auth_group: str) -> None:
+    """Spec 20 replaces this with a Slack DM."""
+    logging.getLogger("knappy").info("mcp connection ready owner=%s auth_group=%s", user_id, auth_group)
 
 
 async def _serve() -> None:
@@ -184,11 +201,16 @@ async def _serve() -> None:
     if runtime.awareness is not None:
         listener["listener"] = runtime.awareness
         tasks.append(asyncio.create_task(_awareness_loop(runtime.awareness)))
+    callback = None
+    if runtime.mcp is not None:
+        callback = await start_callback(runtime.mcp, _connected, settings.callback_port)
     handler = AsyncSocketModeHandler(app, settings.slack_app_token)
     print("⚡️ Knappy is connected via Socket Mode!")
     try:
         await handler.start_async()
     finally:
+        if callback is not None:
+            await callback.cleanup()
         for task in tasks:
             task.cancel()
             try:

@@ -57,6 +57,31 @@ CREATE TABLE IF NOT EXISTS awareness_cursors (
 );
 """
 
+# Spec 19. Secrets are Fernet ciphertext; one connection per (workspace, user, auth group).
+MCP_TABLES = """
+CREATE TABLE IF NOT EXISTS mcp_clients (
+    auth_group TEXT PRIMARY KEY,
+    issuer TEXT NOT NULL,
+    redirect_uri TEXT NOT NULL,
+    client_id TEXT NOT NULL,
+    client_secret TEXT,
+    created_at TEXT NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS mcp_connections (
+    workspace_id TEXT NOT NULL,
+    owner_user_id TEXT NOT NULL,
+    auth_group TEXT NOT NULL,
+    access_token TEXT NOT NULL,
+    refresh_token TEXT,
+    expires_at TEXT,
+    scopes TEXT NOT NULL DEFAULT '',
+    status TEXT NOT NULL CHECK(status IN ('connected', 'needs_reauth')),
+    updated_at TEXT NOT NULL,
+    PRIMARY KEY (workspace_id, owner_user_id, auth_group)
+);
+"""
+
 # SQLite cannot alter a CHECK constraint, so the migration rebuilds the table from this definition.
 SQLITE_ACTION_DRAFTS = f"""CREATE TABLE IF NOT EXISTS action_drafts (
     id TEXT PRIMARY KEY,
@@ -273,7 +298,7 @@ CREATE INDEX IF NOT EXISTS idx_interactions_due ON interactions (status, due_dat
 CREATE INDEX IF NOT EXISTS idx_interactions_contact ON interactions (contact_id);
 CREATE INDEX IF NOT EXISTS idx_action_drafts_pending ON action_drafts (user_id, status) WHERE status = 'PENDING';
 CREATE INDEX IF NOT EXISTS idx_briefing_items_queued ON briefing_items (workspace_id, status) WHERE status = 'QUEUED';
-""" + AWARENESS_TABLES
+""" + AWARENESS_TABLES + MCP_TABLES
 
 POSTGRES_SCHEMA = """
 CREATE EXTENSION IF NOT EXISTS "uuid-ossp";
@@ -494,13 +519,13 @@ CREATE TABLE IF NOT EXISTS document_chunks (
     embedding BYTEA,
     PRIMARY KEY (document_id, seq)
 );
-""" + AWARENESS_TABLES
+""" + AWARENESS_TABLES + MCP_TABLES
 
 EXPECTED_TABLES = frozenset(
     {
         "workspaces", "contacts", "interactions", "action_drafts", "briefing_items", "model_usage",
         "conversation_turns", "memory_records", "user_profile", "conversation_recaps",
         "memory_events", "memory_provenance", "documents", "document_chunks",
-        "attention_items", "awareness_excluded", "awareness_cursors",
+        "attention_items", "awareness_excluded", "awareness_cursors", "mcp_clients", "mcp_connections",
     }
 )

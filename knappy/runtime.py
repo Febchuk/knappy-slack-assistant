@@ -9,7 +9,7 @@ import re
 import uuid
 from collections.abc import Callable
 from datetime import datetime
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 from knappy.agent.loop import AgentLoop, AgentReply, InboundMessage
 from knappy.agent.prompt import ATTENTION_LIMIT, OPEN_LOOP_LIMIT, MemoryProvider, build_system_prompt
@@ -34,6 +34,9 @@ from knappy.memory import MemoryConfig, MemoryEngine, MemoryStore
 from knappy.slack.egress import Reply, SlackEgress, open_reply
 from knappy.slack.users import RecipientResolver, UserDirectory
 from knappy.web import WebFetcher
+
+if TYPE_CHECKING:
+    from knappy.mcp.hub import McpHub
 
 logger = logging.getLogger("knappy")
 
@@ -73,6 +76,7 @@ class KnappyRuntime:
         bot_user_id: str | None = None,
         awareness_threshold: float = 0.5,
         awareness_pacing: Pacing | None = None,
+        mcp: McpHub | None = None,
     ) -> None:
         self.repo = repo
         self.workspace_id = workspace_id
@@ -91,6 +95,7 @@ class KnappyRuntime:
         self.attention = AwarenessStore(repo, workspace_id)
         self.user_client = user_client
         self.awareness: Awareness | None = None
+        self.mcp = mcp
         if user_client is not None and awareness_owner:
             relevance = RelevancePass(
                 model, self.memory_engine, self.attention, name=self.users.name, permalink=self._permalink,

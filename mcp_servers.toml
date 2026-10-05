@@ -1,0 +1,24 @@
+# MCP servers Knappy can act through (Spec 19 §2). One [[server]] table per server.
+# `python -m knappy.mcp probe <url>` prints an entry from the server's live OAuth metadata.
+# MCP is off unless KNAPPY_PUBLIC_URL and KNAPPY_SECRET_KEY are set.
+#
+# [[server]]
+# name = "lorikeet"                       # tools reach the model as lorikeet__<tool>
+# title = "Lorikeet"
+# url = "https://mcp.lorikeetcx.ai"
+# auth = "oauth_dcr"                      # oauth_dcr | oauth_static | api_key | service
+# scopes = ["tickets:read", "tickets:write", "customers:read", "manage:read"]
+# tools = { allow = ["*"], deny = [] }
+# read = ["get_*", "list_*"]              # reads whatever the annotations say
+# write = []                              # writes even when the tool claims readOnlyHint
+# body_field = { "send_*" = "body" }      # the argument the approval card edits
+#
+# [[server]]
+# name = "gmail"
+# title = "Gmail"
+# url = "https://gmailmcp.googleapis.com/mcp"
+# auth = "oauth_static"
+# auth_group = "google"                   # one consent covers every server in the group
+# client_id_env = "GOOGLE_OAUTH_CLIENT_ID"
+# client_secret_env = "GOOGLE_OAUTH_CLIENT_SECRET"
+# scopes = ["https://www.googleapis.com/auth/gmail.readonly", "https://www.googleapis.com/auth/gmail.compose"]

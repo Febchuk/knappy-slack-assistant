@@ -213,6 +213,29 @@ MCP is **off** when either of the first two is unset. Knappy then builds no hub,
 | **TEST-MCP-09** | `service` and `api_key` servers. | Service is connected from env. API key is `not_connected` until saved, then calls carry it. |
 | **TEST-MCP-10** | No `KNAPPY_PUBLIC_URL` or `KNAPPY_SECRET_KEY`. | No hub, no callback server. |
 | **TEST-MCP-11** | Invalid entries. | The error names the entry. |
-| **TEST-MCP-12** | Probe against recorded Lorikeet, Grain and Gmail metadata. | `oauth_dcr`, `oauth_dcr` with a no-refresh note, `oauth_static` in group `google`. Each output loads as a valid entry. |
+| **TEST-MCP-12** | `tests/test_19_mcp_probe.py`: probe against recorded Lorikeet, Grain and Gmail metadata. | `oauth_dcr`, `oauth_dcr` with a no-refresh note, `oauth_static` in group `google`. Each output loads as a valid entry. |
 
 `tests/test_19_mcp_conformance.py` is parametrized over every entry in `mcp_servers.toml`: the entry validates, its globs compile, and the env vars its mode needs are present or the test skips naming them.
+
+---
+
+## 11. Implementation Notes and Deviations
+
+Recorded while building (2026-10-04). Code: `knappy/mcp/` (`servers.py`, `auth.py`, `store.py`, `hub.py`, `callback.py`, `__main__.py`).
+
+| Topic | Plan said | Built | Why |
+| :--- | :--- | :--- | :--- |
+| OAuth module | `knappy/mcp/oauth.py` | `knappy/mcp/auth.py` | It holds all four modes, not only OAuth. |
+| `AuthStrategy` | `authorize_url`, `exchange`, `refresh`, `headers` | `headers`, `status`, `connect_url`. Exchange and refresh are inside `OAuthAuth`. | Service and API-key modes have no exchange or refresh. Forcing them to implement both would add dead methods. |
+| Pending authorizations | Not specified | No table. The sealed `state` carries the PKCE verifier. | Fernet authenticates, encrypts, and timestamps it, which covers "signed, bound, expires in 10 minutes". |
+| `mcp_clients` key | `server` | `auth_group`, reused only while the issuer and redirect URI match | The registered client belongs to the authorization, which is per group. A new `KNAPPY_PUBLIC_URL` re-registers automatically. |
+| Store | `knappy/db/repository.py` | `knappy/mcp/store.py`, on `repo.connection` like `AwarenessStore` | It keeps encryption next to the only code that reads the tables. |
+| Google env vars | `GOOGLE_OAUTH_CLIENT_ID` and `GOOGLE_OAUTH_CLIENT_SECRET` in `Settings` | Each `oauth_static` entry names its env vars. | A new non-DCR provider needs no Python change. |
+| `resource` parameter | Always | `oauth_dcr` only | MCP auth servers expect RFC 8707. Google's endpoint is not an MCP auth server and gets `access_type` and `prompt` instead. To confirm in the Spec 21 live run. |
+| 401 from an MCP server | Not specified | Marks the connection `needs_reauth` and returns `NotConnected`. | The SDK folds the HTTP 401 into a generic `MCPError`, so the hub records response statuses with an httpx event hook. |
+| SDK | `FastMCP` | `mcp` 2.3, where `FastMCP` is `MCPServer`. The hub uses `mcp.Client` over `streamable_http_client` with `create_mcp_http_client` for headers. | Current major version. `create_mcp_http_client` lives in a private module (`mcp.shared._httpx_utils`). |
+| Callback logging | Not specified | No aiohttp access log. | The query string carries the authorization code. |
+
+**Verified.** The Postgres DDL, its upserts, and the decrypt round trip ran against a local PostgreSQL 14. The probe ran against the live Lorikeet, Grain, and Gmail endpoints, and its recorded metadata is in `tests/fixtures/mcp_discovery.json`.
+
+**Known gaps.** The `Dockerfile` neither copies `mcp_servers.toml` nor exposes the callback port (Spec 21). `state` is not single-use within its 10 minutes. Replaying it also needs an unused code, and authorization servers make codes single-use. Each tool call opens a fresh MCP session. Tokens are not revoked at the provider.
