@@ -43,9 +43,11 @@ class ApprovalGateway:
         if not await self.repo.cas_approve(draft_id):
             return HitlResult(ok=False, status="ignored")
         payload = draft["payload"]
+        metadata = payload.get("metadata") or {}
         described = {
             "action_type": draft.get("action_type"),
-            "file_name": (payload.get("metadata") or {}).get("file_name"),
+            "file_name": metadata.get("file_name"),
+            "tool_title": metadata.get("tool_title"),
         }
         try:
             await self.executor.execute(draft)

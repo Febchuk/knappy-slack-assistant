@@ -62,9 +62,14 @@ Message = Union[UserMessage, ModelTurn, ToolResult]
 
 @dataclass(frozen=True)
 class ToolSpec:
+    """A tool the model may call. `args` is a Pydantic model, or an MCP server's own JSON schema kept verbatim."""
+
     name: str
     description: str
-    args_model: type[BaseModel]
+    args: type[BaseModel] | dict[str, Any]
+
+    def json_schema(self) -> dict[str, Any]:
+        return self.args if isinstance(self.args, dict) else self.args.model_json_schema()
 
 
 class Source(BaseModel):

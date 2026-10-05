@@ -10,6 +10,7 @@ import pytest
 os.environ["KNAPPY_EMBEDDER"] = "hash"
 
 from knappy.db.repository import SqliteRepository
+from mcp_fakes import world  # noqa: F401  (Spec 19 and 20's fake OAuth and MCP servers)
 
 
 @pytest.fixture

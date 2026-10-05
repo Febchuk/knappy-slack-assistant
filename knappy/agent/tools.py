@@ -2,19 +2,25 @@
 
 from __future__ import annotations
 
+import asyncio
+import json
+import logging
+import re
 from collections.abc import Callable
 from contextvars import ContextVar
 from dataclasses import dataclass
 from datetime import date, datetime, time, timedelta, timezone
 from typing import TYPE_CHECKING, Any, Literal
 
+from jsonschema import SchemaError, validators
 from pydantic import AwareDatetime, BaseModel, Field
 
 from knappy.awareness.store import AwarenessStore
 from knappy.db.repository import SqliteRepository, format_ts, utc_now
-from knappy.hitl.blocks import approval_blocks
+from knappy.hitl.blocks import app_action_blocks, approval_blocks
 from knappy.ingestion.embed import generate_embedding
 from knappy.llm.types import Model, Recency, ToolSpec
+from knappy.mcp.hub import McpHub, McpTool, NotConnected
 from knappy.memory.types import RecordType, SavableType
 from knappy.slack.users import RecipientResolver, UserDirectory
 from knappy.web import WebFetcher
@@ -23,6 +29,8 @@ if TYPE_CHECKING:
     from knappy.awareness.ingest import Awareness
     from knappy.files.service import DocumentFormat, FileService
     from knappy.memory.engine import MemoryEngine
+
+logger = logging.getLogger("knappy")
 
 current_owner: ContextVar[str | None] = ContextVar("knappy_owner", default=None)
 # The logged user turn being answered. Memory written by tools cites it as provenance.
@@ -272,7 +280,57 @@ TOOL_STATUS: dict[str, str] = {
     "list_attention": "checking what's waiting on you",
     "resolve_attention": "updating that",
     "stop_watching": "updating what I watch",
+    "list_apps": "checking your apps",
+    "connect_app": "getting a connect link",
 }
+
+
+# Spec 20 §2. Gemini's function-name rule; an app tool whose `<server>__<tool>` breaks it is skipped, not renamed.
+APP_TOOL_NAME = re.compile(r"^[A-Za-z_][A-Za-z0-9_.:-]{0,63}$")
+APP_TOOLS_TIMEOUT_S = 10.0
+APP_RESULT_CHARS = 20_000
+WRITE_NOTE = " Changes data: creates a draft the user must approve."
+PERSONAL_LINK = "Connection links are personal: ask the user to DM Knappy to connect {app}."
+NO_LINK = {
+    "connected": "Already connected.",
+    "unavailable": "Not set up on this Knappy yet: an admin must add its credentials.",
+}
+
+
+def app_specs(servers: dict[str, str]) -> list[ToolSpec]:
+    """`list_apps` and `connect_app` over the configured servers, given as {name: title}."""
+    choices = ", ".join(f"{name} ({title})" for name, title in servers.items())
+    return [
+        ToolSpec(
+            "list_apps",
+            "List the apps the user can connect (Lorikeet, Gmail, and so on) and whether each is connected.",
+            {"type": "object", "properties": {}},
+        ),
+        ToolSpec(
+            "connect_app",
+            "Get the link the user opens to connect one of their apps to Knappy. Give them the link.",
+            {
+                "type": "object",
+                "properties": {"server": {"type": "string", "enum": list(servers), "description": f"One of: {choices}"}},
+                "required": ["server"],
+            },
+        ),
+    ]
+
+
+def app_tool_spec(tool: McpTool, app: str) -> ToolSpec | None:
+    """One connected tool as `<server>__<tool>` with the server's schema verbatim (Spec 20 §2.2). None when unusable."""
+    name = f"{tool.server}__{tool.name}"
+    if not APP_TOOL_NAME.match(name):
+        logger.warning("mcp tool skipped name=%s reason=name", name)
+        return None
+    try:
+        validators.validator_for(tool.input_schema).check_schema(tool.input_schema)
+    except SchemaError:
+        logger.warning("mcp tool skipped name=%s reason=schema", name)
+        return None
+    description = f"[{app}] {tool.title or tool.name}. {tool.description}".strip()
+    return ToolSpec(name, description + (WRITE_NOTE if tool.access == "write" else ""), tool.input_schema)
 
 
 @dataclass(frozen=True)
@@ -313,7 +371,9 @@ class ToolRegistry:
         attention: AwarenessStore | None = None,
         awareness: Awareness | None = None,
         clock: Callable[[], datetime] = utc_now,
+        mcp: McpHub | None = None,
     ) -> None:
+        self.mcp = mcp
         self.repo = repo
         self.clock = clock
         self.attention = attention or AwarenessStore(repo, workspace_id)
@@ -630,16 +690,116 @@ class ToolRegistry:
             return _NO_FILES
         return await self.files.create_document(self._owner() or "", _thread(), title, content_markdown, format)
 
-    def specs(self) -> list[ToolSpec]:
-        return list(TOOL_SPECS.values())
+    async def specs(self) -> list[ToolSpec]:
+        """The tools for this owner's turn: the static ones, plus their connected apps' tools when MCP is on."""
+        if self.mcp is None:
+            return list(TOOL_SPECS.values())
+        titles = {name: server.title for name, server in self.mcp.servers.items()}
+        connected = [app_tool_spec(tool, titles[tool.server]) for tool in await self._app_tools()]
+        return [*TOOL_SPECS.values(), *app_specs(titles), *(spec for spec in connected if spec is not None)]
 
     async def call(self, name: str, arguments: dict[str, Any]) -> Any:
+        # Before getattr: an app tool name is never an attribute, and `__`-names like `__init__` must not become one.
+        if "__" in name:
+            return await self._app_tool(name, arguments)
         method = getattr(self, name)
         return await method(**arguments)
+
+    async def _app_tools(self) -> list[McpTool]:
+        assert self.mcp is not None
+        try:
+            return await asyncio.wait_for(self.mcp.tools(self._owner() or ""), APP_TOOLS_TIMEOUT_S)
+        except asyncio.TimeoutError:
+            logger.warning("mcp tools timed out owner=%s", self._owner())
+            return []
+
+    async def list_apps(self) -> dict[str, Any]:
+        if self.mcp is None:
+            return _NO_APPS
+        status = await self.mcp.status(self._owner() or "")
+        return {
+            "apps": [{"server": name, "app": server.title, "status": status[name]} for name, server in self.mcp.servers.items()]
+        }
+
+    async def connect_app(self, server: str) -> dict[str, Any]:
+        if self.mcp is None:
+            return _NO_APPS
+        config = self.mcp.servers.get(server)
+        if config is None:
+            return {"error": f"No app named {server}. Call list_apps."}
+        owner = self._owner() or ""
+        status = (await self.mcp.status(owner))[server]
+        url = await self.mcp.connect_url(owner, server)
+        if url is None:
+            return {"app": config.title, "status": status, "connect_url": None, "note": NO_LINK.get(status, "It has no sign-in link.")}
+        return _personal({"app": config.title, "status": status, "connect_url": url})
+
+    async def _app_tool(self, name: str, arguments: dict[str, Any]) -> Any:
+        """Spec 20 §4: a read runs now with the owner's credential; a write only stages a draft."""
+        if self.mcp is None:
+            return _NO_APPS
+        owner = self._owner() or ""
+        server, _, tool_name = name.partition("__")
+        tool = next((tool for tool in await self._app_tools() if (tool.server, tool.name) == (server, tool_name)), None)
+        if tool is None:
+            return await self._unavailable(owner, server, name)
+        if tool.access == "write":
+            return await self._stage_app_action(owner, tool, arguments)
+        result = await self.mcp.call(owner, server, tool_name, arguments)
+        if isinstance(result, NotConnected):
+            return _personal(result.for_model())
+        content: Any = result.text[:APP_RESULT_CHARS] if result.text else result.structured
+        return {"app": self.mcp.servers[server].title, "tool": tool.title or tool.name, "content": content, "is_error": result.is_error}
+
+    async def _unavailable(self, owner: str, server: str, name: str) -> dict[str, Any]:
+        """A tool missing from the owner's own list is never called: its classification is unknown."""
+        assert self.mcp is not None
+        config = self.mcp.servers.get(server)
+        if config is not None:
+            status = (await self.mcp.status(owner))[server]
+            if status != "connected":
+                missing = NotConnected(server, config.title, status, await self.mcp.connect_url(owner, server))
+                return _personal(missing.for_model())
+        return {"error": f"No app tool {name}. Call list_apps to see what is connected."}
+
+    async def _stage_app_action(self, owner: str, tool: McpTool, arguments: dict[str, Any]) -> StagedDraft:
+        """An APP_ACTION draft (Spec 20 §4.1). The executor calls the tool once the owner approves; nothing else does."""
+        assert self.mcp is not None
+        thread = _thread()
+        server = self.mcp.servers[tool.server]
+        app, title = server.title, tool.title or tool.name
+        field = server.body_field_for(tool.name)
+        body_field = field if field and isinstance(arguments.get(field), str) else None
+        content = arguments[body_field] if body_field else json.dumps(arguments, indent=2, ensure_ascii=False)
+        staged = {
+            "action_type": "APP_ACTION",
+            "recipient_identifier": tool.server,
+            "recipient_name": app,
+            "preview_summary": f"{app}: {title}",
+            "staged_content": content,
+            "metadata": {
+                "server": tool.server, "tool": tool.name, "tool_title": title, "arguments": arguments, "body_field": body_field,
+            },
+        }
+        draft_id = await self.repo.create_draft(
+            workspace_id=self.workspace_id, user_id=owner, channel_id=thread.channel_id, thread_ts=thread.thread_ts,
+            action_type="APP_ACTION", payload=staged,
+        )
+        return StagedDraft(draft_id, app, app_action_blocks(draft_id, app, title, arguments, body_field, content))
 
 
 _NO_MEMORY = {"error": "Memory is not available in this context."}
 _NO_FILES = {"error": "Files are not available in this context."}
+_NO_APPS = {"error": "No apps are configured for Knappy."}
+
+
+def _personal(view: dict[str, Any]) -> dict[str, Any]:
+    """A connect link binds consent to the asking user, so it is shown only in their DM (Spec 20 §3)."""
+    thread = current_thread.get()
+    if not view.get("connect_url") or (thread is not None and thread.channel_id.startswith("D")):
+        return view
+    hidden = {key: value for key, value in view.items() if key != "connect_url"}
+    return {**hidden, "note": PERSONAL_LINK.format(app=view["app"])}
 
 
 def _thread() -> SlackThread:

@@ -165,7 +165,7 @@ def _declaration(spec: ToolSpec) -> types.FunctionDeclaration:
     return types.FunctionDeclaration(
         name=spec.name,
         description=spec.description,
-        parameters_json_schema=spec.args_model.model_json_schema(),
+        parameters_json_schema=spec.json_schema(),
     )
 
 

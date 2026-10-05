@@ -109,19 +109,21 @@ class KnappyRuntime:
         self.tools = ToolRegistry(
             repo, workspace_id, history=slack, memory=self.memory_engine, searcher=model, fetcher=fetcher,
             files=self.files, recipients=self.recipients, attention=self.attention, awareness=self.awareness, clock=clock,
+            mcp=mcp,
         )
         self.loop = AgentLoop(self.tools, model)
         gate = CompositeSystemOneGate(JevSystemOneAdapter(), RegexFallbackAdapter())
         self.pipeline = IngestionPipeline(repo, gate, SlmExtractor(model), workspace_id)
         self.gateway = ApprovalGateway(repo, executor or _RefusingExecutor())
         poster = sender or say
+        self.direct = DirectMessages(slack, poster) if slack is not None and poster is not None else None
         self.heartbeat = HeartbeatEngine(
             self.store,
             ProactiveAlertTriager(model_triage(model)),
             writer=ProactiveWriter(model, self.store, over_budget=self._over_budget),
             recipients=self.recipients,
             timezone=self.users.timezone,
-            channel=DirectMessages(slack, poster) if slack is not None and poster is not None else None,
+            channel=self.direct,
             attention=self.attention,
         )
 
@@ -198,7 +200,16 @@ class KnappyRuntime:
         return build_system_prompt(
             now=self.clock(), timezone=zone, memory=memory, open_loops=open_loops,
             attention=[item.for_model() for item in attention], awareness=self.awareness is not None,
+            apps=self.mcp is not None,
         )
+
+    async def app_connected(self, user_id: str, auth_group: str) -> None:
+        """The OAuth callback's `on_connected` (Spec 20 §7): tell the user in their DM which apps just connected."""
+        if self.mcp is None or self.direct is None:
+            return
+        titles = [server.title for server in self.mcp.servers.values() if server.auth_group == auth_group]
+        named = f"{', '.join(titles[:-1])} and {titles[-1]}" if len(titles) > 1 else titles[0] if titles else auth_group
+        await self.direct.post(await self.direct.open(user_id), f"{named} connected.", [])
 
     async def _permalink(self, channel: str, ts: str) -> str | None:
         if self.user_client is None:

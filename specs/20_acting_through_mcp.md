@@ -105,7 +105,7 @@ The loop validates an app tool's arguments against that schema with `jsonschema`
 
 The JSON fallback is the readable rendering that also survives an edit. A prettier rendering ("Priority: high") could not be turned back into arguments.
 
-`ACTION_TYPES` gains `APP_ACTION`. Postgres already drops and re-adds `action_drafts_action_type_check` from `ACTION_TYPES` at every start. SQLite's `WIDENED_CHECKS` marker for `action_drafts` moves from `POST_THREAD_REPLY` to `APP_ACTION`, so an existing table is rebuilt once with the wider CHECK.
+`ACTION_TYPES` gains `APP_ACTION`. Postgres already drops and re-adds `action_drafts_action_type_check` from `ACTION_TYPES` at every start. SQLite's `WIDENED_CHECKS` rebuilds a table whose stored CHECK lacks any value of the current list, so an existing table is rebuilt once with the wider CHECK.
 
 ---
 
@@ -190,3 +190,21 @@ The model reads text it did not write: tickets, emails, documents, calendar even
 | **TEST-ACT-09** | Full `KnappyRuntime.handle_event` with a fake model that calls `fake__whoami`, then `fake__send_note`. | Read result in the reply, card blocks attached, one draft, one server call (the read). |
 | **TEST-ACT-10** | Existing SQLite `action_drafts` without `APP_ACTION` in its CHECK. | `init_schema` rebuilds it; rows survive; an `APP_ACTION` draft inserts. |
 | **TEST-ACT-11** | `app_connected` for a two-server group. | One DM: `Mail and Cal connected.` |
+| **TEST-ACT-12** | A draft's connection is revoked before approval. | `FAILED`, no server call, the failure card offers to reconnect. |
+
+---
+
+## 11. Implementation Notes and Deviations
+
+Recorded while building (2026-10-04).
+
+| Topic | Plan said | Built | Why |
+| :--- | :--- | :--- | :--- |
+| Args representation | An args model built from `inputSchema` | `ToolSpec.args` is a Pydantic model or the raw schema dict; `ToolSpec.json_schema()` feeds Gemini | §2.2. Checked live against `gemini-3-flash-preview`: a schema with `anyOf`, `enum`, `default`, `$schema`, and `additionalProperties: false` was accepted and produced a correct `lorikeet__create_ticket` call; `list_apps` with empty `properties` and `connect_app` with an `enum` were called correctly. |
+| SQLite CHECK migration | Move the marker to `APP_ACTION` | Rebuild when any current value is missing from the stored CHECK | A single marker breaks when a list grows twice: Spec 18's migration test builds a table lacking `POST_THREAD_REPLY` but holding `APP_ACTION`, and the marker skipped the rebuild. Comparing every value needs no edit when a list grows again. |
+| `on_connected` | DM, then `hub.forget(owner)` | DM only, from `KnappyRuntime.app_connected` | `McpHub.complete` already forgets the owner before the callback calls `on_connected`. A second call would do nothing. The DM lives in the runtime because `DirectMessages` does; `main.py` passes it to `start_callback`. |
+| Connect links | Return the link | Only in a DM | §3. The `state` binds consent to the asking user, so a link posted in a channel would let anyone attach their account to that user. |
+| Shared fakes | Reuse Spec 19's | Moved to `tests/mcp_fakes.py`; `world` is a conftest fixture | The fake MCP server gained `create_ticket` (write-annotated), `close_ticket` (always errors), and a call log with the bearer token. |
+
+**Byte-identity with MCP off.** The Gemini function declarations from `specs()` hashed to the same SHA-256 before and after this change (21 tools).
+

@@ -1,6 +1,8 @@
 """SQLite and PostgreSQL DDL for the dual-memory store."""
 
-ACTION_TYPES = "'SEND_SLACK_DM', 'SHARE_FILE', 'POST_THREAD_REPLY', 'GMAIL_DRAFT', 'CALENDAR_INVITE', 'POST_CHANNEL'"
+ACTION_TYPES = (
+    "'SEND_SLACK_DM', 'SHARE_FILE', 'POST_THREAD_REPLY', 'GMAIL_DRAFT', 'CALENDAR_INVITE', 'POST_CHANNEL', 'APP_ACTION'"
+)
 PROVENANCE_SOURCES = "'turn', 'document', 'event', 'record', 'migration', 'slack_message'"
 
 

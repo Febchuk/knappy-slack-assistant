@@ -1,21 +1,30 @@
-"""Execute an approved draft: a Slack DM, a document shared to someone's DM, or a reply posted as the user.
+"""Execute an approved draft: a Slack DM, a document shared to someone's DM, a reply posted as the user, or an app
+tool call through MCP (Spec 20 §6).
 
 Other action types stay unconnected.
 """
 
 from __future__ import annotations
 
+import json
 from typing import Any
 
 from knappy.files.service import open_dm, share_filename
 from knappy.files.store import DocumentStore
+from knappy.mcp.hub import McpHub, NotConnected
 
 
 class SlackActionExecutor:
     def __init__(
-        self, client: Any, documents: DocumentStore | None = None, user_client: Any | None = None, user_id: str | None = None
+        self,
+        client: Any,
+        documents: DocumentStore | None = None,
+        user_client: Any | None = None,
+        user_id: str | None = None,
+        mcp: McpHub | None = None,
     ) -> None:
         self.client = client
+        self.mcp = mcp
         self.documents = documents
         # The owner's own token (Spec 18 §5). A reply in their conversations goes out under their name.
         self.user_client = user_client
@@ -41,8 +50,28 @@ class SlackActionExecutor:
             await self.user_client.chat_postMessage(
                 channel=recipient, text=payload.get("staged_content") or " ", **({"thread_ts": thread_ts} if thread_ts else {})
             )
+        elif action == "APP_ACTION":
+            await self._app_action(draft["user_id"], payload)
         else:
             raise RuntimeError(f"No provider for {action}")
+
+    async def _app_action(self, owner: str, payload: dict[str, Any]) -> None:
+        """Call the approved tool once with the owner's credential. Any failure raises, so the draft is FAILED."""
+        if self.mcp is None:
+            raise RuntimeError("APP_ACTION needs MCP, which is off")
+        metadata = payload["metadata"]
+        body_field = metadata.get("body_field")
+        if body_field:
+            arguments = {**metadata["arguments"], body_field: payload["staged_content"]}
+        else:
+            arguments = json.loads(payload["staged_content"])
+            if not isinstance(arguments, dict):
+                raise RuntimeError("Edited arguments must be a JSON object")
+        result = await self.mcp.call(owner, metadata["server"], metadata["tool"], arguments)
+        if isinstance(result, NotConnected):
+            raise RuntimeError(f"{metadata['server']} is not connected for {owner}")
+        if result.is_error:
+            raise RuntimeError(f"{metadata['server']}.{metadata['tool']} failed: {result.text[:500]}")
 
     async def _share(self, owner: str, recipient: str, payload: dict[str, Any]) -> None:
         document_id = (payload.get("metadata") or {}).get("document_id")

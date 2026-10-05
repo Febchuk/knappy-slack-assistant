@@ -154,7 +154,9 @@ async def open_runtime(
         daily_budget_usd=settings.daily_budget_usd,
         say=say,
         sender=say,
-        executor=SlackActionExecutor(client, DocumentStore(repo, workspace_id), user_client=user_client, user_id=owner),
+        executor=SlackActionExecutor(
+            client, DocumentStore(repo, workspace_id), user_client=user_client, user_id=owner, mcp=mcp
+        ),
         slack=client,
         memory_config=MemoryConfig(
             admission_threshold=settings.admission_threshold, raw_retention_days=settings.raw_retention_days
@@ -173,11 +175,6 @@ async def open_runtime(
     if migrated:
         logging.getLogger("knappy").info("memory migrated contacts=%d", migrated)
     return runtime
-
-
-async def _connected(user_id: str, auth_group: str) -> None:
-    """Spec 20 replaces this with a Slack DM."""
-    logging.getLogger("knappy").info("mcp connection ready owner=%s auth_group=%s", user_id, auth_group)
 
 
 async def _serve() -> None:
@@ -203,7 +200,7 @@ async def _serve() -> None:
         tasks.append(asyncio.create_task(_awareness_loop(runtime.awareness)))
     callback = None
     if runtime.mcp is not None:
-        callback = await start_callback(runtime.mcp, _connected, settings.callback_port)
+        callback = await start_callback(runtime.mcp, runtime.app_connected, settings.callback_port)
     handler = AsyncSocketModeHandler(app, settings.slack_app_token)
     print("⚡️ Knappy is connected via Socket Mode!")
     try:

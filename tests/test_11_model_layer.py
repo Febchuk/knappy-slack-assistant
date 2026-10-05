@@ -49,7 +49,7 @@ async def test_client_parses_tool_calls_and_skips_thoughts() -> None:
         ])
     ])
     client = GeminiClient("k", IDS, sdk=sdk)
-    turn = await client.generate(tier="agent", system="sys", contents=[UserMessage("hi")], tools=ToolRegistry(None, "T").specs())  # type: ignore[arg-type]
+    turn = await client.generate(tier="agent", system="sys", contents=[UserMessage("hi")], tools=await ToolRegistry(None, "T").specs())  # type: ignore[arg-type]
     assert turn.text is None
     assert turn.tool_calls == [ToolCall(id="c1", name="search_commitments", args={"query": "deck"})]
     config = sdk.calls[0]["config"]
@@ -243,7 +243,7 @@ async def test_llm_06_live_gemini_tool_turn() -> None:
         tier="agent",
         system="Use the search_commitments tool to answer questions about promises.",
         contents=[UserMessage("What did I promise Alex?")],
-        tools=ToolRegistry(None, "T").specs(),  # type: ignore[arg-type]
+        tools=await ToolRegistry(None, "T").specs(),  # type: ignore[arg-type]
     )
     assert [call.name for call in turn.tool_calls] == ["search_commitments"]
     assert turn.usage.input_tokens > 0 and turn.usage.cost_usd > 0

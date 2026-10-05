@@ -10,11 +10,12 @@ from collections.abc import Awaitable, Callable
 from dataclasses import dataclass, field
 from typing import Any
 
+from jsonschema import validators
 from pydantic import ValidationError
 
 from knappy.agent.prompt import FINAL_TURN_NOTE
-from knappy.agent.tools import TOOL_SPECS, TOOL_STATUS, StagedDraft, ToolRegistry
-from knappy.llm.types import Attachment, Message, Model, ToolCall, ToolResult, UserMessage
+from knappy.agent.tools import TOOL_STATUS, StagedDraft, ToolRegistry
+from knappy.llm.types import Attachment, Message, Model, ToolCall, ToolResult, ToolSpec, UserMessage
 from knappy.web import sources_of, with_citations
 
 logger = logging.getLogger("knappy")
@@ -70,7 +71,8 @@ class AgentLoop:
         contents: list[Message] = [*message.history, UserMessage(message.text, message.attachments)]
         drafts: list[StagedDraft] = []
         ran: list[ToolResult] = []
-        specs = self.tools.specs()
+        specs = await self.tools.specs()
+        offered = {spec.name: spec for spec in specs}
         empty: Counter[str] = Counter()
         withdrawn: set[str] = set()
         steps = 0
@@ -91,7 +93,7 @@ class AgentLoop:
             contents.append(turn)
             if on_status is not None:
                 await on_status(_status(turn.tool_calls))
-            results = await self._run_tools(turn.tool_calls, deadline, withdrawn)
+            results = await self._run_tools(turn.tool_calls, deadline, withdrawn, offered)
             drafts.extend(result.result for result in results if isinstance(result.result, StagedDraft))
             ran.extend(_for_model(result) for result in results)
             contents.extend(_for_model(result) for result in results)
@@ -108,8 +110,10 @@ class AgentLoop:
         logger.info("agent steps=%d stop=limit ms=%d", steps, _ms(started))
         return _reply(final.text, drafts, ran)
 
-    async def _run_tools(self, calls: list[ToolCall], deadline: float, withdrawn: set[str]) -> list[ToolResult]:
-        tasks = [asyncio.ensure_future(self._run_tool(call, call.name in withdrawn)) for call in calls]
+    async def _run_tools(
+        self, calls: list[ToolCall], deadline: float, withdrawn: set[str], offered: dict[str, ToolSpec]
+    ) -> list[ToolResult]:
+        tasks = [asyncio.ensure_future(self._run_tool(call, call.name in withdrawn, offered.get(call.name))) for call in calls]
         _done, pending = await asyncio.wait(tasks, timeout=max(deadline - time.monotonic(), 0))
         for task in pending:
             task.cancel()
@@ -118,12 +122,12 @@ class AgentLoop:
             for call, task in zip(calls, tasks)
         ]
 
-    async def _run_tool(self, call: ToolCall, withdrawn: bool) -> ToolResult:
+    async def _run_tool(self, call: ToolCall, withdrawn: bool, spec: ToolSpec | None) -> ToolResult:
         started = time.monotonic()
         if withdrawn:
             logger.info("tool name=%s outcome=withdrawn", call.name)
             return ToolResult(call, {"error": WITHDRAWN})
-        arguments = _validated(call)
+        arguments = _validated(call, spec)
         if isinstance(arguments, str):
             logger.info("tool name=%s outcome=invalid", call.name)
             return ToolResult(call, {"error": arguments})
@@ -136,12 +140,15 @@ class AgentLoop:
         return ToolResult(call, result)
 
 
-def _validated(call: ToolCall) -> dict[str, Any] | str:
-    spec = TOOL_SPECS.get(call.name)
+def _validated(call: ToolCall, spec: ToolSpec | None) -> dict[str, Any] | str:
     if spec is None:
         return f"Unknown tool {call.name}"
+    if isinstance(spec.args, dict):
+        validator = validators.validator_for(spec.args)(spec.args)
+        problems = [error.message for error in validator.iter_errors(call.args)]
+        return f"Invalid arguments for {call.name}: {problems}" if problems else dict(call.args)
     try:
-        return spec.args_model.model_validate(call.args).model_dump()
+        return spec.args.model_validate(call.args).model_dump()
     except ValidationError as exc:
         return f"Invalid arguments for {call.name}: {exc.errors(include_url=False)}"
 

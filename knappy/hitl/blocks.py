@@ -2,8 +2,13 @@
 
 from __future__ import annotations
 
+import json
 from dataclasses import dataclass
 from datetime import datetime, timezone
+from typing import Any
+
+KEY_ARGUMENTS = 8
+ARGUMENT_CHARS = 150
 
 
 def approval_blocks(
@@ -70,6 +75,54 @@ def approval_blocks(
     ]
 
 
+def app_action_blocks(
+    draft_id: str,
+    app: str,
+    tool_title: str,
+    arguments: dict[str, Any],
+    body_field: str | None,
+    staged_content: str,
+) -> list[dict]:
+    """Spec 20 §5: the app, the tool, its key arguments, and the editable body (or every argument as JSON)."""
+    lines = [f"*Action Required:* {app}: {tool_title}"]
+    if body_field is not None:
+        shown = [(name, value) for name, value in arguments.items() if name != body_field][:KEY_ARGUMENTS]
+        lines += [f"*{name}:* {_argument(value)}" for name, value in shown]
+        body = f"> {staged_content}"
+    else:
+        body = f"```{staged_content}```"
+    return [
+        {"type": "section", "text": {"type": "mrkdwn", "text": "\n".join(lines)[:3000]}},
+        {"type": "section", "text": {"type": "mrkdwn", "text": body[:3000]}},
+        {
+            "type": "actions",
+            "block_id": f"hitl_action_block_{draft_id}",
+            "elements": [
+                {
+                    "type": "button",
+                    "action_id": "btn_approve_action",
+                    "text": {"type": "plain_text", "text": "Approve & Run"},
+                    "style": "primary",
+                    "value": draft_id,
+                },
+                {"type": "button", "action_id": "btn_edit_draft", "text": {"type": "plain_text", "text": "Edit"}, "value": draft_id},
+                {
+                    "type": "button",
+                    "action_id": "btn_cancel_action",
+                    "text": {"type": "plain_text", "text": "Cancel"},
+                    "style": "danger",
+                    "value": draft_id,
+                },
+            ],
+        },
+    ]
+
+
+def _argument(value: Any) -> str:
+    text = value if isinstance(value, str) else json.dumps(value, ensure_ascii=False)
+    return text if len(text) <= ARGUMENT_CHARS else text[: ARGUMENT_CHARS - 1] + "…"
+
+
 def unreachable_block(recipient_name: str, problem: str | None) -> dict:
     reason = problem or f"I don't know who {recipient_name} is in Slack"
     return {
@@ -83,7 +136,9 @@ def unreachable_block(recipient_name: str, problem: str | None) -> dict:
     }
 
 
-def _done(action_type: str | None, recipient_name: str, file_name: str | None) -> str:
+def _done(action_type: str | None, recipient_name: str, file_name: str | None, tool_title: str | None) -> str:
+    if action_type == "APP_ACTION":
+        return f"ran *{tool_title}* in *{recipient_name}*"
     if action_type == "SHARE_FILE":
         return f"shared {f'*{file_name}*' if file_name else 'the file'} with *{recipient_name}*"
     if action_type == "SEND_SLACK_DM":
@@ -100,6 +155,7 @@ def receipt_blocks(
     *,
     action_type: str | None = None,
     file_name: str | None = None,
+    tool_title: str | None = None,
 ) -> list[dict]:
     when = timestamp or datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S")
     return [
@@ -109,7 +165,7 @@ def receipt_blocks(
                 "type": "mrkdwn",
                 "text": (
                     f":white_check_mark: *Done:* approved by <@{user_id}>; "
-                    f"{_done(action_type, recipient_name, file_name)} at {when} UTC."
+                    f"{_done(action_type, recipient_name, file_name, tool_title)} at {when} UTC."
                 ),
             },
         }
@@ -125,7 +181,15 @@ def cancelled_blocks() -> list[dict]:
     ]
 
 
-def failed_blocks(recipient_name: str, *, action_type: str | None = None, file_name: str | None = None) -> list[dict]:
+def failed_blocks(
+    recipient_name: str, *, action_type: str | None = None, file_name: str | None = None, tool_title: str | None = None
+) -> list[dict]:
+    if action_type == "APP_ACTION":
+        text = (
+            f":x: *Failed:* Could not run *{tool_title}* in *{recipient_name}*. "
+            f"If it needs reconnecting, ask me to connect {recipient_name}."
+        )
+        return [{"type": "section", "text": {"type": "mrkdwn", "text": text}}]
     if action_type == "SHARE_FILE":
         what = f"share {f'*{file_name}*' if file_name else 'the file'} with *{recipient_name}*"
     elif action_type == "SEND_SLACK_DM":

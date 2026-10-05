@@ -13,7 +13,14 @@ from typing import Any
 
 import aiosqlite
 
-from knappy.db.schema import EXPECTED_TABLES, SQLITE_ACTION_DRAFTS, SQLITE_MEMORY_PROVENANCE, SQLITE_SCHEMA
+from knappy.db.schema import (
+    ACTION_TYPES,
+    EXPECTED_TABLES,
+    PROVENANCE_SOURCES,
+    SQLITE_ACTION_DRAFTS,
+    SQLITE_MEMORY_PROVENANCE,
+    SQLITE_SCHEMA,
+)
 from knappy.db.vectors import cosine_distance, pack_embedding
 
 
@@ -27,14 +34,15 @@ ADDED_COLUMNS = {
     "memory_events": (("metadata", "TEXT"),),
 }
 
-# Tables whose CHECK constraint grew after they shipped: (table, a value the current CHECK names, its DDL, its indexes).
+# Tables whose CHECK constraint grew after they shipped: (table, every value the current CHECK names, its DDL, its
+# indexes). A table missing any value is rebuilt, so widening the list needs no migration edit.
 WIDENED_CHECKS = (
     (
-        "action_drafts", "POST_THREAD_REPLY", SQLITE_ACTION_DRAFTS,
+        "action_drafts", ACTION_TYPES, SQLITE_ACTION_DRAFTS,
         "CREATE INDEX IF NOT EXISTS idx_action_drafts_pending ON action_drafts (user_id, status) WHERE status = 'PENDING';",
     ),
     (
-        "memory_provenance", "slack_message", SQLITE_MEMORY_PROVENANCE,
+        "memory_provenance", PROVENANCE_SOURCES, SQLITE_MEMORY_PROVENANCE,
         "CREATE INDEX IF NOT EXISTS idx_prov_source ON memory_provenance (owner_user_id, source_type, source_id);",
     ),
 )
@@ -832,9 +840,9 @@ class SqliteRepository:
 
     async def _migrate_checks(self) -> None:
         """SQLite cannot alter a CHECK constraint. A table created before it widened is rebuilt from today's DDL."""
-        for table, marker, ddl, indexes in WIDENED_CHECKS:
+        for table, values, ddl, indexes in WIDENED_CHECKS:
             row = await self._one("SELECT sql FROM sqlite_master WHERE type = 'table' AND name = ?", (table,))
-            if row is None or marker in row["sql"]:
+            if row is None or all(value.strip() in row["sql"] for value in values.split(",")):
                 continue
             await self.connection.execute("PRAGMA foreign_keys = OFF")
             await self.connection.executescript(
