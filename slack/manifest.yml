@@ -7,6 +7,9 @@ features:
     display_name: Knappy
     always_online: true
 oauth_config:
+  # Spec 22: replace the host with KNAPPY_PUBLIC_URL. The install link is <KNAPPY_PUBLIC_URL>/slack/install.
+  redirect_urls:
+    - https://knappy.example/slack/oauth_redirect
   scopes:
     bot:
       - chat:write
@@ -39,6 +42,7 @@ settings:
     bot_events:
       - message.im
       - app_mention
+      - app_uninstalled
     user_events:
       - message.channels
       - message.groups

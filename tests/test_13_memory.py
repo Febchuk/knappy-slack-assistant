@@ -38,7 +38,7 @@ async def open_repo(path: Path) -> SqliteRepository:
     repo = SqliteRepository(str(path))
     await repo.connect()
     await repo.init_schema()
-    await repo.upsert_workspace("T_TEST", "Test", "xoxb")
+    await repo.ensure_workspace("T_TEST", "Test")
     return repo
 
 
@@ -737,7 +737,7 @@ async def test_transaction_is_atomic_against_concurrent_writers(repo: SqliteRepo
 
     async def other_writer():
         await started.wait()
-        await repo.upsert_workspace("T_OTHER", "Other", "xoxb")
+        await repo.ensure_workspace("T_OTHER", "Other")
 
     results = await asyncio.gather(failing_batch(), other_writer(), return_exceptions=True)
 

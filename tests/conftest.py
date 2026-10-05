@@ -18,6 +18,6 @@ async def repo() -> SqliteRepository:
     database = SqliteRepository(":memory:")
     await database.connect()
     await database.init_schema()
-    await database.upsert_workspace("T_TEST", "Test Workspace", "xoxb-test")
+    await database.ensure_workspace("T_TEST", "Test Workspace")
     yield database
     await database.close()

@@ -12,7 +12,7 @@ from knappy.hitl.gateway import ApprovalGateway
 from knappy.runtime import KnappyRuntime
 from knappy.slack.actions import register_actions
 from knappy.slack.events import EventDeduplicator, on_app_mention, on_message
-from fakes import FakeApp, FakeSlack, HeuristicModel
+from fakes import FakeApp, FakeSlack, HeuristicModel, only
 
 
 class Recorder:
@@ -34,7 +34,7 @@ def _body(action_id: str, value: str, user: str = "U1") -> dict:
 async def test_action_handlers_update_slack(repo: SqliteRepository) -> None:
     runtime = KnappyRuntime(repo, workspace_id="T_TEST", model=HeuristicModel(), executor=Recorder())
     app = FakeApp()
-    register_actions(app, runtime)
+    register_actions(app, only(runtime))
     draft_id = await repo.create_draft(
         workspace_id="T_TEST",
         user_id="U1",
@@ -215,8 +215,8 @@ async def test_socket_mode_serve(monkeypatch: pytest.MonkeyPatch, tmp_path) -> N
     monkeypatch.setattr(main_module, "KnappyRuntime", capture)
     ticking: list = []
 
-    async def memory_loop(engine):
-        ticking.append(engine)
+    async def memory_loop(fleet):
+        ticking.extend(runtime.memory_engine for runtime in fleet.all())
 
     monkeypatch.setattr(main_module, "_memory_loop", memory_loop)
     await _serve()

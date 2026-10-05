@@ -32,6 +32,7 @@ ADDED_COLUMNS = {
     "contacts": (("last_alerted_at", "DATETIME"),),
     "user_profile": (("brief_on", "TEXT"), ("nudges_on", "TEXT"), ("nudges_sent", "INTEGER NOT NULL DEFAULT 0")),
     "memory_events": (("metadata", "TEXT"),),
+    "workspaces": (("bot_user_id", "TEXT"), ("installer_user_id", "TEXT"), ("user_token", "TEXT")),
 }
 
 # Tables whose CHECK constraint grew after they shipped: (table, every value the current CHECK names, its DDL, its
@@ -166,14 +167,48 @@ class SqliteRepository:
         rows = await cursor.fetchall()
         return {row["name"] for row in rows}
 
-    async def upsert_workspace(self, workspace_id: str, team_name: str, bot_token: str) -> None:
+    async def ensure_workspace(self, workspace_id: str, team_name: str) -> None:
+        """Create the row the workspace's data hangs off. Never touches the tokens an installation saved."""
+        await self.connection.execute(
+            "INSERT INTO workspaces (id, team_name, bot_token) VALUES (?, ?, '') ON CONFLICT(id) DO NOTHING",
+            (workspace_id, team_name),
+        )
+        await self.connection.commit()
+
+    async def save_installation(
+        self,
+        workspace_id: str,
+        team_name: str,
+        *,
+        bot_token: str,
+        bot_user_id: str | None,
+        installer_user_id: str | None,
+        user_token: str | None,
+    ) -> None:
         await self.connection.execute(
             """
-            INSERT INTO workspaces (id, team_name, bot_token)
-            VALUES (?, ?, ?)
-            ON CONFLICT(id) DO UPDATE SET team_name = excluded.team_name, bot_token = excluded.bot_token
+            INSERT INTO workspaces (id, team_name, bot_token, bot_user_id, installer_user_id, user_token)
+            VALUES (?, ?, ?, ?, ?, ?)
+            ON CONFLICT(id) DO UPDATE SET
+                team_name = excluded.team_name,
+                bot_token = excluded.bot_token,
+                bot_user_id = excluded.bot_user_id,
+                installer_user_id = excluded.installer_user_id,
+                user_token = excluded.user_token
             """,
-            (workspace_id, team_name, bot_token),
+            (workspace_id, team_name, bot_token, bot_user_id, installer_user_id, user_token),
+        )
+        await self.connection.commit()
+
+    async def get_workspace(self, workspace_id: str) -> dict[str, Any] | None:
+        return await self._one("SELECT * FROM workspaces WHERE id = ?", (workspace_id,))
+
+    async def list_workspaces(self) -> list[dict[str, Any]]:
+        return await self._all("SELECT * FROM workspaces ORDER BY installed_at", ())
+
+    async def revoke_installation(self, workspace_id: str) -> None:
+        await self.connection.execute(
+            "UPDATE workspaces SET bot_token = '', user_token = NULL WHERE id = ?", (workspace_id,)
         )
         await self.connection.commit()
 

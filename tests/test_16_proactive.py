@@ -365,7 +365,7 @@ async def test_a_proactive_message_is_the_first_turn_of_its_thread(repo: SqliteR
 
 
 async def test_done_in_a_brief_settles_only_that_item(repo: SqliteRepository) -> None:
-    from fakes import FakeApp
+    from fakes import FakeApp, only
     from knappy.slack.actions import register_actions
 
     first = await seed_commitment(repo, "send Alex the deck", due=MORNING - timedelta(hours=3))
@@ -373,7 +373,7 @@ async def test_done_in_a_brief_settles_only_that_item(repo: SqliteRepository) ->
     runtime, slack, _ = await setup(repo, MORNING)
     await runtime.heartbeat.run_tick()
     app = FakeApp()
-    register_actions(app, runtime)
+    register_actions(app, only(runtime))
 
     async def ack() -> None:
         return None

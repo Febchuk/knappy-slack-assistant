@@ -27,7 +27,7 @@ async def seeded(tmp_path):
     repo = SqliteRepository(str(tmp_path / "knappy.db"))
     await repo.connect()
     await repo.init_schema()
-    await repo.upsert_workspace("T_TEST", "Test Workspace", "xoxb-test")
+    await repo.ensure_workspace("T_TEST", "Test Workspace")
     yield repo
     await repo.close()
 

@@ -1,4 +1,7 @@
-"""The OAuth redirect target (Spec 19 §5): GET /oauth/callback, served next to the Socket Mode app."""
+"""The OAuth redirect target (Spec 19 §5): GET /oauth/callback, served next to the Socket Mode app.
+
+Spec 22: each workspace has its own hub, so `resolve` picks the hub the state was sealed for.
+"""
 
 from __future__ import annotations
 
@@ -15,6 +18,7 @@ from knappy.mcp.hub import McpHub
 logger = logging.getLogger(__name__)
 
 OnConnected = Callable[[str, str], Awaitable[None]]
+Resolve = Callable[[str], Awaitable[tuple[McpHub, OnConnected] | None]]
 
 
 def _page(status: int, message: str) -> web.Response:
@@ -22,7 +26,7 @@ def _page(status: int, message: str) -> web.Response:
     return web.Response(status=status, text=body, content_type="text/html")
 
 
-def callback_app(hub: McpHub, on_connected: OnConnected) -> web.Application:
+def add_callback(app: web.Application, resolve: Resolve) -> None:
     async def callback(request: web.Request) -> web.Response:
         state = request.query.get("state", "")
         if error := request.query.get("error"):
@@ -31,6 +35,10 @@ def callback_app(hub: McpHub, on_connected: OnConnected) -> web.Application:
         code = request.query.get("code")
         if not state or not code:
             return _page(400, "This link is missing its code or state.")
+        target = await resolve(state)
+        if target is None:
+            return _page(400, "This link is invalid or older than 10 minutes. Ask Knappy for a new one.")
+        hub, on_connected = target
         try:
             user_id, auth_group = await hub.complete(state, code)
         except InvalidState:
@@ -45,15 +53,13 @@ def callback_app(hub: McpHub, on_connected: OnConnected) -> web.Application:
             logger.exception("mcp on_connected failed")
         return _page(200, "Connected. You can close this tab and go back to Slack.")
 
-    app = web.Application()
     app.router.add_get("/oauth/callback", callback)
-    return app
 
 
-async def start_callback(hub: McpHub, on_connected: OnConnected, port: int, host: str = "0.0.0.0") -> web.AppRunner:
+async def serve(app: web.Application, port: int, host: str = "0.0.0.0") -> web.AppRunner:
     # No access log: the query string carries the authorization code.
-    runner = web.AppRunner(callback_app(hub, on_connected), access_log=None)
+    runner = web.AppRunner(app, access_log=None)
     await runner.setup()
     await web.TCPSite(runner, host, port).start()
-    logger.info("mcp callback listening port=%d", port)
+    logger.info("web listening port=%d", port)
     return runner

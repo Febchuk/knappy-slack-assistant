@@ -252,8 +252,8 @@ async def test_mcp_starts_only_when_configured(monkeypatch: pytest.MonkeyPatch, 
         async def cleanup(self) -> None:
             started.append(("cleaned", 0))
 
-    async def fake_start(hub, on_connected, port):
-        started.append((hub, port))
+    async def fake_serve(app, port):
+        started.append(({route.resource.canonical for route in app.router.routes()}, port))
         return Runner()
 
     built: list = []
@@ -266,14 +266,14 @@ async def test_mcp_starts_only_when_configured(monkeypatch: pytest.MonkeyPatch, 
     monkeypatch.setattr(AsyncSocketModeHandler, "start_async", start_async)
     monkeypatch.setattr(AsyncWebClient, "auth_test", auth_test)
     monkeypatch.setattr(main_module, "_memory_loop", idle)
-    monkeypatch.setattr(main_module, "start_callback", fake_start)
+    monkeypatch.setattr(main_module, "serve", fake_serve)
     monkeypatch.setattr(main_module, "KnappyRuntime", capture)
     await main_module._serve()
     runtime = built[0]
     if enabled:
         assert isinstance(runtime.mcp, McpHub)
         assert runtime.mcp.redirect_uri == "https://knappy.example/oauth/callback"
-        assert started == [(runtime.mcp, 9123), ("cleaned", 0)]
+        assert started == [({"/oauth/callback"}, 9123), ("cleaned", 0)]
     else:
         assert runtime.mcp is None
         assert started == []

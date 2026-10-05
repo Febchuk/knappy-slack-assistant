@@ -87,6 +87,14 @@ def _text(content: list[mcp_types.ContentBlock]) -> str:
     return "\n".join(parts)
 
 
+def state_workspace(secret_key: str, state: str, now: datetime) -> str | None:
+    """The workspace an OAuth state was sealed for (Spec 22), or None when it is forged or expired."""
+    try:
+        return open_state(derive_fernet(secret_key, "state"), state, now).workspace_id
+    except InvalidState:
+        return None
+
+
 class McpHub:
     def __init__(
         self,

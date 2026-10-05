@@ -11,12 +11,13 @@ from typing import Any
 
 import httpx
 
-from fakes import FakeApp, FakeClock, FakeSlack
+from fakes import FakeApp, FakeClock, FakeSlack, only
 from knappy.config import Settings
 from knappy.files.service import SlackDownloader
 from knappy.llm.types import Model
 from knappy.awareness.ingest import Pacing
 from knappy.main import heartbeat_tick, open_runtime
+from knappy.slack.installations import Installation
 from knappy.runtime import KnappyRuntime
 from knappy.slack.actions import register_actions
 from knappy.slack.egress import PLACEHOLDER
@@ -116,12 +117,13 @@ class Journey:
     async def start(self) -> Journey:
         downloader = SlackDownloader(self.settings.slack_bot_token, transport=httpx.MockTransport(self._file_server))
         runtime = await open_runtime(
-            self.settings, workspace_id=WORKSPACE, client=self.slack, model=self.model, clock=self.clock,
+            self.settings, installation=Installation(WORKSPACE, "Journey", self.settings.slack_bot_token or ""),
+            client=self.slack, model=self.model, clock=self.clock,
             fetcher=self.fetcher, downloader=downloader, user_client=self.user_slack, awareness_pacing=Pacing(call_gap_s=0),
         )
         self._record_tools(runtime)
         self.app = FakeApp()
-        register_actions(self.app, runtime)
+        register_actions(self.app, only(runtime))
         self.runtime = runtime
         return self
 

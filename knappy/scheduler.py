@@ -37,7 +37,7 @@ async def run_now(database: str, workspace_id: str) -> list[OwnerTick]:
     api_key = _gemini_key()
     repo = await open_repository(database)
     await repo.init_schema()
-    await repo.upsert_workspace(workspace_id, "Knappy", "local")
+    await repo.ensure_workspace(workspace_id, "Knappy")
     token = os.environ.get("SLACK_BOT_TOKEN")
     client = AsyncWebClient(token=token) if token else None
     model = GeminiClient(

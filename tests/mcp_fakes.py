@@ -23,7 +23,7 @@ from mcp.server.mcpserver import Context, MCPServer
 
 from fakes import FakeClock
 from knappy.db.repository import SqliteRepository
-from knappy.mcp.callback import start_callback
+from knappy.mcp.callback import add_callback, serve
 from knappy.mcp.hub import McpHub
 from knappy.mcp.servers import parse_servers
 
@@ -198,7 +198,12 @@ class World:
         async def on_connected(user_id: str, auth_group: str) -> None:
             self.connected.append((user_id, auth_group))
 
-        self._runners.append(await start_callback(hub, on_connected, port, host="127.0.0.1"))
+        async def resolve(state: str):
+            return hub, on_connected
+
+        app = web.Application()
+        add_callback(app, resolve)
+        self._runners.append(await serve(app, port, host="127.0.0.1"))
         return hub
 
     async def connect(self, hub: McpHub, user: str, server: str = "fake") -> httpx.Response:

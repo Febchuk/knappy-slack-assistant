@@ -2,8 +2,13 @@
 
 from __future__ import annotations
 
+from collections.abc import Awaitable, Callable
+
 from knappy.hitl.blocks import settle_item
 from knappy.runtime import KnappyRuntime
+
+# Spec 22: the runtime of the workspace a click came from (body["team"]["id"]), or None once it uninstalled.
+RuntimeFor = Callable[[dict], Awaitable[KnappyRuntime | None]]
 
 
 def _action_value(body: dict) -> str:
@@ -30,16 +35,22 @@ async def _apply(client, body: dict, result) -> None:
         await client.views_open(trigger_id=body.get("trigger_id"), view=result.modal)
 
 
-def register_actions(app, runtime: KnappyRuntime) -> None:
+def register_actions(app, runtime_for: RuntimeFor) -> None:
     @app.action("btn_approve_action")
     async def approve(ack, body, client):
         await ack()
+        runtime = await runtime_for(body)
+        if runtime is None:
+            return
         result = await runtime.gateway.approve(_action_value(body), _user_id(body))
         await _apply(client, body, result)
 
     @app.action("btn_approve_proactive_action")
     async def approve_proactive(ack, body, client):
         await ack()
+        runtime = await runtime_for(body)
+        if runtime is None:
+            return
         result = await runtime.gateway.approve(_action_value(body), _user_id(body))
         if result.replacement_blocks:
             note = result.replacement_blocks[0]["text"]["text"]
@@ -49,18 +60,27 @@ def register_actions(app, runtime: KnappyRuntime) -> None:
     @app.action("btn_cancel_action")
     async def cancel(ack, body, client):
         await ack()
+        runtime = await runtime_for(body)
+        if runtime is None:
+            return
         result = await runtime.gateway.cancel(_action_value(body), _user_id(body))
         await _apply(client, body, result)
 
     @app.action("btn_edit_draft")
     async def edit(ack, body, client):
         await ack()
+        runtime = await runtime_for(body)
+        if runtime is None:
+            return
         result = await runtime.gateway.open_edit(_action_value(body), _user_id(body))
         await _apply(client, body, result)
 
     @app.view("hitl_edit_modal")
     async def save_edit(ack, body, client):
         await ack()
+        runtime = await runtime_for(body)
+        if runtime is None:
+            return
         draft_id = body["view"]["private_metadata"]
         content = body["view"]["state"]["values"]["content"]["staged_content"]["value"]
         await runtime.gateway.save_edit(draft_id, _user_id(body), content)
@@ -68,12 +88,18 @@ def register_actions(app, runtime: KnappyRuntime) -> None:
     @app.action("btn_resolve_commitment")
     async def resolve(ack, body, client):
         await ack()
+        runtime = await runtime_for(body)
+        if runtime is None:
+            return
         await runtime.heartbeat.mark_done(_action_value(body))
         await _settle(client, body, ":white_check_mark: Marked complete.", "Marked complete")
 
     @app.action("btn_snooze_commitment")
     async def snooze(ack, body, client):
         await ack()
+        runtime = await runtime_for(body)
+        if runtime is None:
+            return
         await runtime.heartbeat.snooze(_action_value(body))
         await _settle(client, body, ":zzz: Snoozed for 24 hours.", "Snoozed")
 
@@ -81,12 +107,18 @@ def register_actions(app, runtime: KnappyRuntime) -> None:
     @app.action("btn_attention_done")
     async def attention_done(ack, body, client):
         await ack()
+        runtime = await runtime_for(body)
+        if runtime is None:
+            return
         if await runtime.attention.resolve(_user_id(body), _action_value(body), "DONE", runtime.clock()):
             await _settle(client, body, ":white_check_mark: Done.", "Done")
 
     @app.action("btn_attention_snooze")
     async def attention_snooze(ack, body, client):
         await ack()
+        runtime = await runtime_for(body)
+        if runtime is None:
+            return
         if await runtime.attention.resolve(_user_id(body), _action_value(body), "SNOOZED", runtime.clock()):
             await _settle(client, body, ":zzz: Snoozed for 24 hours.", "Snoozed")
 
@@ -94,6 +126,9 @@ def register_actions(app, runtime: KnappyRuntime) -> None:
     async def attention_reply(ack, body, client):
         """Draft reply: ask the agent, in the brief's thread, as if the user had typed it."""
         await ack()
+        runtime = await runtime_for(body)
+        if runtime is None:
+            return
         owner, item_id = _user_id(body), _action_value(body)
         if await runtime.attention.get(owner, item_id) is None:
             return

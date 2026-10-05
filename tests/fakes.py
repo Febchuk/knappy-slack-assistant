@@ -365,6 +365,15 @@ def mention(text: str, ts: str, *, user: str = "U1", channel: str = "C1") -> dic
     return {"type": "app_mention", "text": f"<@UBOT> {text}", "channel": channel, "user": user, "ts": ts}
 
 
+def only(runtime):
+    """register_actions' lookup for a test that serves one workspace."""
+
+    async def runtime_for(body):
+        return runtime
+
+    return runtime_for
+
+
 class FakeApp:
     """Bolt app double: collects the action and view handlers register_actions installs."""
 

@@ -192,7 +192,7 @@ async def test_file_04_image_reaches_the_model_and_only_its_description_is_kept(
     database = SqliteRepository(str(tmp_path / "knappy.db"))
     await database.connect()
     await database.init_schema()
-    await database.upsert_workspace("T_TEST", "Test", TOKEN)
+    await database.ensure_workspace("T_TEST", "Test")
     try:
         await runtime(database, model, server).handle_event(
             shared("what is this?", "1.0", server.share("screen.png", "image/png", PNG))
