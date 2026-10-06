@@ -1,0 +1,76 @@
+# MCP servers Knappy can act through (Spec 19 §2, Spec 21 §2). One [[server]] table per server.
+# Add one: `python -m knappy.mcp probe <url>`, paste, restart, connect from a Slack DM, then
+# `python -m knappy.mcp tools <name> --user <slack_user_id>` to finish read/write/body_field.
+# See docs/adding_an_mcp_connection.md. MCP is off unless KNAPPY_PUBLIC_URL and KNAPPY_SECRET_KEY are set.
+
+[[server]]
+name = "lorikeet"
+title = "Lorikeet"
+url = "https://mcp.lorikeetcx.ai"
+auth = "oauth_dcr"
+scopes = ["tickets:read", "tickets:write", "customers:read", "manage:read"]
+# Tools are not listed without a token. Until `tools lorikeet --user <id>` has been run, every tool without
+# readOnlyHint=true is a write and needs approval. Confirm then: read and write globs, and the reply tool's body_field.
+read = []
+write = []
+body_field = {}
+
+[[server]]
+name = "grain"
+title = "Grain"
+url = "https://api.grain.com/_/mcp"
+auth = "oauth_dcr"
+# Grain advertises no scopes and no refresh_token grant: users reconnect when the token expires.
+# Tools are not listed without a token. Confirm read and write globs with `tools grain --user <id>`.
+read = []
+write = []
+
+# Google: one OAuth web client for all three, one consent (auth_group "google"). Gmail and Calendar serve /mcp/v1;
+# /mcp answers 404. Tool lists read unauthenticated on 2026-10-04; every tool's readOnlyHint matched its behavior.
+
+[[server]]
+name = "gmail"
+title = "Gmail"
+url = "https://gmailmcp.googleapis.com/mcp/v1"
+auth = "oauth_static"
+auth_group = "google"
+client_id_env = "GOOGLE_OAUTH_CLIENT_ID"
+client_secret_env = "GOOGLE_OAUTH_CLIENT_SECRET"
+# The server has no send tool: create_draft is the only way to write mail, and gmail.compose covers it.
+scopes = ["https://www.googleapis.com/auth/gmail.readonly", "https://www.googleapis.com/auth/gmail.compose"]
+# These need gmail.modify or gmail.labels, which Knappy does not request; exposed, they would fail after approval.
+tools = { allow = ["*"], deny = [
+  "label_*", "unlabel_*", "update_message_labels", "create_label", "apply_sensitive_*",
+  "trash_*", "untrash_*", "mark_*_spam", "unmark_*_spam",
+] }
+body_field = { "create_draft" = "body" }
+
+[[server]]
+name = "calendar"
+title = "Google Calendar"
+url = "https://calendarmcp.googleapis.com/mcp/v1"
+auth = "oauth_static"
+auth_group = "google"
+client_id_env = "GOOGLE_OAUTH_CLIENT_ID"
+client_secret_env = "GOOGLE_OAUTH_CLIENT_SECRET"
+# Google's guide lists the read-only three; calendar.events replaces calendar.events.readonly so create_event works.
+scopes = [
+  "https://www.googleapis.com/auth/calendar.events",
+  "https://www.googleapis.com/auth/calendar.calendarlist.readonly",
+  "https://www.googleapis.com/auth/calendar.events.freebusy",
+]
+# No body_field: create_event and update_event are edited as JSON, so the time and attendees stay editable.
+
+[[server]]
+name = "bigquery"
+title = "BigQuery"
+url = "https://bigquery.googleapis.com/mcp"
+auth = "oauth_static"
+auth_group = "google"
+client_id_env = "GOOGLE_OAUTH_CLIENT_ID"
+client_secret_env = "GOOGLE_OAUTH_CLIENT_SECRET"
+# The only scope the server advertises. Users also need roles/mcp.toolUser, roles/bigquery.jobUser and
+# roles/bigquery.dataViewer on the project they query.
+scopes = ["https://www.googleapis.com/auth/bigquery"]
+# Knappy reads BigQuery: execute_sql_readonly answers queries. execute_sql can run DML and DDL.
+tools = { allow = ["*"], deny = ["execute_sql", "cancel_job"] }

@@ -1,0 +1,703 @@
+"""Spec 17 §3: the acceptance journeys, offline. Scripted model, fake Slack, a real SQLite file, restarts, and time.
+
+Assertions are on behavior: which tools ran with which arguments, what reached Slack, and what is in the database.
+"""
+
+from __future__ import annotations
+
+import ipaddress
+from pathlib import Path
+import json
+import logging
+import re
+from datetime import datetime, timedelta, timezone
+
+import httpx
+import pytest
+
+from fakes import FakeSlack, agent, event, member, memory_structured, observer, op, pdf_with, user_turns
+from journey import FakeFile, dm_channel, placeholder_replaced
+from knappy.agent.prompt import IDENTITY
+from knappy.llm.fake import FakeModel, GenerateRequest
+from knappy.llm.types import ModelTurn, Source, ToolCall, ToolResult, UserMessage, WebSearchResult
+from knappy.memory.types import ReconcileResult
+from knappy.web import WebFetcher
+
+def scripted(script=None, reconcile=None) -> FakeModel:
+    return FakeModel(agent(script), structured=memory_structured(reconcile))
+
+
+def prompts(model: FakeModel, text: str) -> list[str]:
+    """The system prompt of each first agent request made for the user message `text`."""
+    return [request.system for request in model.requests if request.contents[-1] == UserMessage(text)]
+
+
+def asked(model: FakeModel, text: str) -> GenerateRequest:
+    """The first agent request made for the user message `text`."""
+    for request in model.requests:
+        if request.contents[-1] == UserMessage(text):
+            return request
+    raise AssertionError(f"the model was never asked {text!r}")
+
+
+def memory_context(system: str) -> str:
+    """The part of the system prompt that grows with history: profile, open loops, workstreams, recap."""
+    return system.split(IDENTITY, 1)[1].split("\n\n", 2)[-1]
+
+
+def results(capture, name: str) -> list:
+    return [use.result for use in capture.called(name)]
+
+
+async def test_j01_talk(journey) -> None:
+    async def answer(request: GenerateRequest) -> ModelTurn:
+        return ModelTurn(text=f"answer #{len(request.contents)}")
+
+    model = FakeModel(answer)
+    j = await journey(model)
+    hey = await j.dm("U1", "hey")
+    agenda = await j.dm("U1", "what's a good way to structure a 1:1 agenda?")
+
+    for capture in (hey, agenda):
+        assert len(capture.posts) == 1, "one message per answer: the placeholder, then edited"
+        assert placeholder_replaced(capture)
+    assert agenda.reply["text"] == "answer #3", "the model's own answer reaches Slack, with the first exchange as context"
+
+
+async def test_j02_remember_survives_restart(journey) -> None:
+    model = scripted({
+        "remember i'm vegetarian": [
+            ("remember", {"text": "Vegetarian", "type": "preference", "about": "diet"}),
+            ("remember", {"text": "Hates early meetings", "type": "preference", "about": "meetings"}),
+        ],
+    })
+    j = await journey(model)
+    await j.dm("U1", "Remember I'm vegetarian and I hate early meetings.")
+    await j.restart()
+    await j.advance(days=1)
+    lunch = "pick a lunch spot near Union Square and suggest a time to meet Sam"
+    reply = await j.dm("U1", lunch, thread="new")
+
+    assert [use.args["about"] for use in j.called("remember")] == ["diet", "meetings"]
+    request = asked(model, lunch)
+    assert [getattr(item, "text", None) for item in request.contents] == [lunch], "nothing restated"
+    assert "Vegetarian" in request.system and "Hates early meetings" in request.system
+    assert placeholder_replaced(reply)
+
+
+def manager_at_stripe(payload: dict) -> dict:
+    events, ops = [], []
+    for turn in user_turns(payload):
+        if "my manager is priya" in turn["text"].lower():
+            events.append(event("learned", "Started at Stripe; manager is Priya", [turn["id"]]))
+            ops.append(op("create", events=[0], type="person", title="Priya", body="- The user's manager at Stripe",
+                          aliases=["manager", "boss"]))
+            ops.append(op("create", events=[0], type="org", title="Stripe", body="- The user's employer, since October 2026",
+                          aliases=["employer", "work"]))
+    return {"events": events, "ops": ops, "discarded": []}
+
+
+async def test_j03_learns_in_passing(journey) -> None:
+    model = scripted(reconcile=manager_at_stripe)
+    j = await journey(model)
+    await j.dm("U1", "I just started at Stripe, my manager is Priya")
+    await j.advance(minutes=30)
+    await j.restart()
+    await j.dm("U1", "who's my manager?", thread="new")
+
+    assert j.called("remember") == [], "nobody said remember"
+    people = await j.rows("SELECT id, body FROM memory_records WHERE type = 'person' AND status = 'ACTIVE'")
+    assert people == [{"id": "person:priya", "body": "- The user's manager at Stripe"}]
+    said = (await j.runtime.memory_engine.read("U1", "person:priya"))["sources"]
+    assert [source["said"] for source in said] == ["Started at Stripe; manager is Priya"]
+    assert "Priya: The user's manager at Stripe" in asked(model, "who's my manager?").system
+
+
+def employer(payload: dict) -> dict:
+    known = {record["id"] for record in payload["records"]}
+    events, ops = [], []
+    for turn in user_turns(payload):
+        text = turn["text"].lower()
+        if "i work at google" in text:
+            events.append(event("learned", "Works at Google", [turn["id"]]))
+            ops.append(op("create", events=[len(events) - 1], record_id="fact:employer", type="fact", title="Employer",
+                          body="- Works at Google", aliases=["job", "work", "company"]))
+        if "moved to stripe" in text:
+            events.append(event("changed", "Moved from Google to Stripe", [turn["id"]]))
+            ops.append(op("supersede" if "fact:employer" in known else "create", events=[len(events) - 1],
+                          record_id="fact:employer", type="fact", title="Employer", body="- Works at Stripe",
+                          aliases=["job", "work", "company"]))
+    return {"events": events, "ops": ops, "discarded": []}
+
+
+async def test_j04_correct_then_forget(journey) -> None:
+    model = scripted(
+        {
+            "where do i work": [
+                ("memory_search", {"query": "where I work"}),
+                ("search_conversations", {"query": "work Google Stripe"}),
+            ],
+            "forget where i work": ("forget", {"query_or_id": "where I work"}),
+        },
+        reconcile=employer,
+    )
+    j = await journey(model)
+    await j.dm("U1", "I work at Google")
+    await j.advance(minutes=30)
+    await j.dm("U1", "actually I moved to Stripe")
+    await j.advance(minutes=30)
+    before = await j.dm("U1", "where do I work?")
+    forgot = await j.dm("U1", "forget where I work")
+    after = await j.dm("U1", "where do I work?")
+
+    found = results(before, "memory_search")[0]
+    assert [hit["id"] for hit in found][:1] == ["fact:employer"]
+    assert "Stripe" in found[0]["snippet"] and "Google" not in json.dumps(found)
+    assert results(forgot, "forget")[0]["forgotten"] == ["Employer"]
+    assert results(after, "memory_search") == [[]]
+    said = [hit["text"] for hit in results(after, "search_conversations")[0]]
+    assert said and not {"I work at Google", "actually I moved to Stripe", "forget where I work"} & set(said)
+    last = model.requests[-2]
+    assert last.contents[-1] == UserMessage("where do I work?")
+    assert not re.search("stripe|google", f"{last.system} {last.contents}", re.I), "not even in earlier answers"
+    assert not [text for text in await j.active_memory("U1") if re.search("stripe|google", text, re.I)]
+
+
+def answering(text: str, tool: str, args: dict):
+    """Calls one tool, then answers `text` without links, as a model that forgot to cite would."""
+
+    async def respond(request: GenerateRequest) -> ModelTurn:
+        if isinstance(request.contents[-1], ToolResult):
+            return ModelTurn(text=text)
+        return ModelTurn(tool_calls=[ToolCall(id="c1", name=tool, args=args)])
+
+    return respond
+
+
+async def test_j05_research(journey) -> None:
+    release = Source(title="Python 3.14 release notes", url="https://docs.python.org/3/whatsnew/3.14.html")
+    model = FakeModel(
+        answering("Python 3.14 is the latest.", "web_search", {"query": "latest Python release"}),
+        search=WebSearchResult(answer="Python 3.14 is the latest.", sources=[release], searched_queries=["python"]),
+    )
+    j = await journey(model)
+    reply = await j.dm("U1", "what's the latest Python release and what changed?")
+
+    searched = reply.called("web_search")
+    assert searched and searched[0].args["query"]
+    assert model.searches == [("latest Python release", "any")]
+    assert searched[0].result["sources"] == [release.model_dump()]
+    assert f"<{release.url}|{release.title}>" in reply.reply["text"], "the answer cites its source as a Slack link"
+
+
+async def test_j06_read_a_link(journey) -> None:
+    url = "https://docs.python.org/3/whatsnew/3.13.html"
+    page = "<html><head><title>What's New In Python 3.13</title></head><body><article><h1>What's New In Python 3.13</h1><p>" + (
+        "Python 3.13 adds a new interactive interpreter and an experimental free-threaded build. " * 5
+    ) + "</p></article></body></html>"
+    hosts: list[str] = []
+
+    def serve(request: httpx.Request) -> httpx.Response:
+        hosts.append(request.headers["host"])
+        return httpx.Response(200, headers={"content-type": "text/html"}, content=page.encode())
+
+    async def resolve(host: str, port: int):
+        return [ipaddress.ip_address("151.101.0.223")]
+
+    model = FakeModel(answering("3.13 adds a new REPL and a free-threaded build.", "fetch_url", {"url": url}))
+    j = await journey(model, fetcher=WebFetcher(transport=httpx.MockTransport(serve), resolve=resolve))
+    reply = await j.dm("U1", f"tl;dr this <{url}>")
+
+    fetched = reply.called("fetch_url")
+    assert [use.args["url"] for use in fetched] == [url]
+    assert hosts == ["docs.python.org"]
+    assert "free-threaded" in fetched[0].result["text"], "the page was read"
+    assert f"<{url}|What's New In Python 3.13>" in reply.reply["text"]
+
+
+async def test_j07_files_in(journey) -> None:
+    async def respond(request: GenerateRequest) -> ModelTurn:
+        """Looks the file up, reads the matching part, then answers: two tool rounds."""
+        asked_ = next(item.text for item in reversed(request.contents) if isinstance(item, UserMessage))
+        done = [item for item in request.contents if isinstance(item, ToolResult)]
+        if not asked_.startswith("what did that PDF say"):
+            return ModelTurn(text="summary")
+        if not done:
+            return ModelTurn(tool_calls=[ToolCall("c1", "list_files", {"query": "pricing"})])
+        if len(done) == 1:
+            found = done[0].result[0]["document_id"]
+            return ModelTurn(tool_calls=[ToolCall("c2", "read_file", {"document_id": found, "query": "pricing"})])
+        return ModelTurn(text="The Pro plan is $40 per seat.")
+
+    model = FakeModel(respond, structured=memory_structured())
+    j = await journey(model)
+    pdf = FakeFile("q3-proposal.pdf", "application/pdf", pdf_with(
+        "Q3 proposal for Acme. Scope: migrate the billing system to the new platform by September.",
+        "Pricing: the Pro plan is $40 per seat per month, billed annually, with a 10 percent discount over 100 seats.",
+        "Timeline: kickoff on July 1, pilot in August, rollout complete by the end of September.",
+    ))
+    shared = await j.dm("U1", "summarize this", files=(pdf,))
+    await j.advance(days=1)
+    later = await j.dm("U1", "what did that PDF say about pricing?", thread="new")
+
+    first = next(request for request in model.requests if request.contents[-1].text.startswith("summarize this"))
+    assert "$40 per seat" in first.contents[-1].text and "rollout complete" in first.contents[-1].text, "the PDF text is in the turn"
+    assert [request.headers["authorization"] for request in j.downloads] == ["Bearer xoxb-journey"]
+    assert placeholder_replaced(shared)
+    documents = await j.rows("SELECT id, name, text FROM documents WHERE owner_user_id = 'U1'")
+    assert [row["name"] for row in documents] == ["q3-proposal.pdf"]
+    records = await j.rows("SELECT body FROM memory_records WHERE type = 'document' AND status = 'ACTIVE'")
+    assert len(records) == 1 and f"[[doc:{documents[0]['id']}]]" in records[0]["body"]
+    assert [use.result[0]["name"] for use in later.called("list_files")] == ["q3-proposal.pdf"]
+    matches = later.called("read_file")[0].result["matches"]
+    assert any("$40 per seat" in match for match in matches), "found later from a different conversation"
+
+
+async def test_j08_files_out(journey) -> None:
+    plan = "# Q3 offsite launch plan\n- Goals\n- Owners\n- Timeline"
+    model = scripted({"write me a one-page launch plan": (
+        "create_document", {"title": "Q3 offsite launch plan", "content_markdown": plan}
+    )})
+    j = await journey(model)
+    reply = await j.dm("U1", "Write me a one-page launch plan for the Q3 offsite.")
+
+    assert len(reply.called("create_document")) == 1
+    assert [(upload["channel"], upload["content"]) for upload in j.slack.uploads] == [(dm_channel("U1"), plan)]
+    assert "btn_approve_action" not in reply.text, "a document for the user needs no approval card"
+    assert await j.rows("SELECT action_type FROM action_drafts") == []
+    stored = await j.rows("SELECT name, text FROM documents WHERE owner_user_id = 'U1'")
+    assert stored == [{"name": "q3-offsite-launch-plan.md", "text": plan}], "created documents are searchable later"
+
+
+def open_id(commitment: str):
+    def read(request: GenerateRequest) -> dict:
+        found = re.search(rf"\[(\S+)\] {re.escape(commitment)}", request.system)
+        assert found, f"{commitment!r} is not in the open commitments"
+        return {"commitment_id": found.group(1)}
+
+    return read
+
+
+async def test_j09_commitments_by_talking(journey) -> None:
+    model = scripted({
+        "i told alex": ("add_commitment", {"commitment": "send Alex the budget", "person": "Alex",
+                                           "due": "2026-10-08T17:00:00+00:00"}),
+        "i sent alex": ("complete_commitment", open_id("send Alex the budget")),
+    })
+    j = await journey(model)
+    await j.dm("U1", "I told Alex I'd send the budget by Thursday")
+    await j.dm("U1", "what do I owe people?")
+    await j.dm("U1", "I sent Alex the budget")
+    await j.dm("U1", "what do I owe people?")
+
+    added = j.called("add_commitment")
+    assert [(use.args["commitment"], use.args["person"]) for use in added] == [("send Alex the budget", "Alex")]
+    assert [use.result["status"] for use in j.called("complete_commitment")] == ["FULFILLED"]
+    owed = prompts(model, "what do I owe people?")
+    assert "send Alex the budget (for Alex), due 2026-10-08 17:00:00 UTC" in owed[0]
+    assert "Open commitments: none." in owed[-1]
+    rows = await j.rows("SELECT commitment, status FROM interactions")
+    assert rows == [{"commitment": "send Alex the budget", "status": "FULFILLED"}], "no note: ingestion"
+
+
+async def test_j10_act_only_after_approval(journey) -> None:
+    text = "Hi Alex, any update on the budget? Want to close it out this week."
+    def draft(request: GenerateRequest) -> dict:
+        mentioned = re.search(r"<@(U[A-Z0-9]+)>", request.contents[-1].text)
+        assert mentioned, "the mention reaches the model, so it knows who Alex is"
+        return {"action_type": "SEND_SLACK_DM", "recipient": "Alex", "recipient_identifier": mentioned.group(1),
+                "summary": "Follow up with Alex about the budget", "staged_content": text}
+
+    model = scripted({"follow up with": ("stage_outbound_action", draft)})
+    j = await journey(model)
+    card = await j.dm("U1", "Follow up with <@UALEX> about the budget")
+    draft_id = (await j.rows("SELECT id FROM action_drafts"))[0]["id"]
+
+    assert "btn_approve_action" in card.text and draft_id in card.text
+    assert j.slack.posts and not [post for post in j.slack.posts if post["channel"] == "UALEX"], "nothing before approval"
+    stranger = await j.click("U2", "btn_approve_action", draft_id)
+    assert stranger.to("UALEX") == [] and stranger.ephemerals, "only the owner can approve"
+
+    approved = await j.click("U1", "btn_approve_action", draft_id)
+    again = await j.click("U1", "btn_approve_action", draft_id)
+
+    assert [post["text"] for post in approved.to("UALEX")] == [text]
+    assert again.posts == []
+    assert [post["text"] for post in j.slack.posts if post["channel"] == "UALEX"] == [text], "exactly one DM to Alex"
+    draft = (await j.rows("SELECT status, executed_at FROM action_drafts"))[0]
+    assert draft["status"] == "APPROVED" and draft["executed_at"]
+
+
+async def test_j11_morning_brief(journey) -> None:
+    model = scripted(reconcile=lambda payload: ReconcileResult())
+    j = await journey(model, at=datetime(2026, 10, 6, 10, 0, tzinfo=timezone.utc), slack=FakeSlack(tz="America/New_York"))
+    await j.dm("U1", "hi")
+    contact = await j.repo.upsert_contact("T_JOURNEY", "Alex", slack_user_id="UALEX", owner_user_id="U1")
+    await j.repo.insert_interaction(
+        workspace_id="T_JOURNEY", contact_id=contact, source_type="DIRECT_DM", channel_id=dm_channel("U1"),
+        raw_text="send Alex the deck", summary="send Alex the deck", commitment="send Alex the deck",
+        due_date="2026-10-07 14:00:00", owner_user_id="U1",
+    )
+    # 08:00 in New York on Oct 7 is 12:00 UTC; the commitment is due two hours later.
+    overnight = await j.advance(hours=25, minutes=30)
+    brief = await j.advance(minutes=30)
+
+    assert overnight.posts == [], "nothing before 08:00 New York, though it was due within 12 hours from 02:00 UTC"
+    assert [post["channel"] for post in brief.posts] == [dm_channel("U1")], "one morning brief"
+    [draft] = await j.rows("SELECT id, payload FROM action_drafts")
+    staged = json.loads(draft["payload"])
+    assert staged["recipient_identifier"] == "UALEX"
+    await j.click("U1", "btn_approve_proactive_action", draft["id"])
+    sent = [post["text"] for post in j.slack.posts if post["channel"] == "UALEX"]
+    assert sent == [staged["staged_content"]] and "Alex" in sent[0]
+    assert "you promised" not in sent[0].lower() and sent[0] not in brief.posts[0]["text"], "a message to Alex, not the reminder"
+
+    thread_ts = brief.post_ts[0]
+    await j.dm("U1", "actually tell him I need until Monday", thread=thread_ts)
+    prompt = model.requests[-1]
+    assert isinstance(prompt.contents[0], ModelTurn) and "send Alex the deck" in prompt.contents[0].text, "the brief is the previous turn"
+
+
+async def test_j12_owners_are_isolated(journey) -> None:
+    model = scripted({
+        "remember my manager is sam": ("remember", {"text": "My manager is Sam", "about": "manager"}),
+        "remember my manager is priya": ("remember", {"text": "My manager is Priya", "about": "manager"}),
+        "who's my manager": ("memory_search", {"query": "manager"}),
+    })
+    j = await journey(model)
+    await j.dm("U1", "remember my manager is Sam")
+    await j.dm("U2", "remember my manager is Priya")
+    statements: list[str] = []
+    await j.repo.connection.set_trace_callback(statements.append)
+    first = await j.dm("U1", "who's my manager?")
+    u1_statements, statements[:] = list(statements), []
+    second = await j.dm("U2", "who's my manager?")
+    await j.repo.connection.set_trace_callback(None)
+
+    assert [hit["snippet"] for hit in results(first, "memory_search")[0]] == ["My manager is Sam"]
+    assert [hit["snippet"] for hit in results(second, "memory_search")[0]] == ["My manager is Priya"]
+    systems = prompts(model, "who's my manager?")
+    assert "Sam" in systems[0] and "Priya" not in systems[0]
+    assert "Priya" in systems[1] and "Sam" not in systems[1]
+    assert u1_statements and statements
+    assert not [sql for sql in u1_statements if "'U2'" in sql], "U1's turn never queried with U2's id"
+    assert not [sql for sql in statements if "'U1'" in sql], "U2's turn never queried with U1's id"
+
+
+async def test_j13_failure_is_visible(journey, caplog: pytest.LogCaptureFixture) -> None:
+    async def down(*args, **kwargs):
+        raise RuntimeError("model unavailable")
+
+    model = FakeModel(down, structured=down)
+    j = await journey(model)
+    caplog.set_level(logging.INFO, logger="knappy")
+    replies = [await j.dm("U1", "hey"), await j.dm("U1", "are you there?")]
+    background = await j.advance(minutes=30)
+
+    for reply in replies:
+        assert len(reply.posts) == 1 and placeholder_replaced(reply)
+        ref = re.search(r"Reference: `([0-9a-f]{8})`", reply.reply["text"])
+        assert ref, reply.reply["text"]
+        assert f"handle_event failed ref={ref.group(1)}" in caplog.text
+    assert background.posts == [] and "memory reconcile failed" in caplog.text
+
+
+FACTS = [
+    ("My sister Ana lives in Porto", "person", "Ana", "- The user's sister; lives in Porto", ["sister"], "sister"),
+    ("My dentist is Dr. Okafor", "person", "Dr. Okafor", "- The user's dentist", ["dentist"], "dentist"),
+    ("I'm allergic to penicillin", "fact", "Allergy", "- Allergic to penicillin", ["allergic", "allergy"], "allergic"),
+    ("My car is a 2019 Civic", "fact", "Car", "- Drives a 2019 Honda Civic", ["car"], "car"),
+    ("I run the payments team", "fact", "Role", "- Runs the payments team", ["team", "role", "job"], "team"),
+    ("My anniversary is June 14", "fact", "Anniversary", "- Anniversary on June 14", ["anniversary"], "anniversary"),
+    ("I take my coffee black", "preference", "Coffee", "- Black coffee, no sugar", ["coffee"], "coffee"),
+    ("I prefer aisle seats", "preference", "Seating", "- Aisle seats on flights", ["seat", "flights"], "seat"),
+    ("My son Leo plays violin", "person", "Leo", "- The user's son; plays violin", ["son"], "son"),
+    ("I'm training for the Berlin marathon", "fact", "Marathon", "- Training for the Berlin marathon",
+     ["marathon", "running"], "marathon"),
+    ("My landlord is Mr. Haddad", "person", "Mr. Haddad", "- The user's landlord", ["landlord"], "landlord"),
+    ("My gym is Equinox on 14th", "fact", "Gym", "- Goes to Equinox on 14th Street", ["gym"], "gym"),
+    ("I'm learning Portuguese", "fact", "Language", "- Learning Portuguese", ["portuguese", "learning"], "portuguese"),
+    ("My budget for the kitchen is 30k", "fact", "Kitchen", "- Kitchen renovation budget 30k", ["kitchen"], "kitchen"),
+    ("My doctor is Dr. Lin", "person", "Dr. Lin", "- The user's doctor", ["doctor"], "doctor"),
+]
+SMALL_TALK = ["lol", "thanks!", "ok cool", "haha nice", "good morning", "sounds good", "brb", "how's it going?"]
+
+
+def facts_only(payload: dict) -> dict:
+    events, ops, discarded = [], [], []
+    for turn in user_turns(payload):
+        fact = next((fact for fact in FACTS if fact[0] == turn["text"]), None)
+        if fact is None:
+            events.append(event("learned", f"Said {turn['text']}", [turn["id"]], score=0.1))
+            ops.append(op("create", events=[len(events) - 1], score=0.2, type="fact", title="Chat", body=f"- {turn['text']}"))
+            continue
+        text, kind, title, body, aliases, _ = fact
+        events.append(event("learned", text, [turn["id"]], occurred_at=turn["at"]))
+        ops.append(op("create", events=[len(events) - 1], type=kind, title=title, body=body, aliases=aliases))
+    return {"events": events, "ops": ops, "discarded": discarded}
+
+
+async def test_j14_scales_with_history(journey) -> None:
+    model = scripted(
+        {f"what do you know about my {key}": ("memory_search", {"query": key}) for *_, key in FACTS},
+        reconcile=facts_only,
+    )
+    j = await journey(model)
+    turns = 0
+    for day in range(60):
+        for conversation in range(8):
+            thread = None if conversation == 0 else "new"
+            fact = FACTS[day // 4] if day % 4 == 0 and conversation == 3 else None
+            text = fact[0] if fact else SMALL_TALK[(day + conversation) % len(SMALL_TALK)]
+            await j.dm("U1", text, thread=thread)
+            turns += 1
+            j.clock.advance(minutes=2)
+        await j.advance(hours=24 - 16 / 60, step=timedelta(hours=6))
+    assert turns == 480
+
+    asked_about = [FACTS[index] for index in (0, 4, 7, 11, 14)]
+    answers = [await j.dm("U1", f"what do you know about my {key}", thread="new") for *_, key in asked_about]
+
+    for fact, answer in zip(asked_about, answers):
+        assert fact[3][2:] in json.dumps(results(answer, "memory_search")), fact[0]
+    recalled = [request.system for request in model.requests]
+    assert max(len(memory_context(system)) / 4 for system in recalled) < 6000
+    kept = await j.rows("SELECT id FROM memory_records WHERE status = 'ACTIVE' AND type NOT LIKE 'episode%'")
+    assert len(kept) == len(FACTS), "small talk created no records"
+    episodes = await j.rows("SELECT type, COUNT(*) AS n FROM memory_records WHERE type LIKE 'episode%' GROUP BY type")
+    assert {row["type"]: row["n"] for row in episodes} == {"episode_daily": len(FACTS), "episode_weekly": 8}, "nightly ran"
+    assert len(await j.rows("SELECT id FROM memory_events WHERE kind = 'learned'")) == len(FACTS)
+
+
+def diet(payload: dict) -> dict:
+    known = {record["id"] for record in payload["records"]}
+    events, ops = [], []
+    for turn in user_turns(payload):
+        text = turn["text"].lower()
+        if "i love steak" in text:
+            events.append(event("learned", "Loves steak", [turn["id"]]))
+            ops.append(op("create", events=[len(events) - 1], record_id="preference:diet", type="preference",
+                          title="Diet", body="- Loves steak", aliases=["food", "meat"]))
+        if "plan my dinners" in text:
+            events.append(event("learned", "Planning dinners for the week", [turn["id"]]))
+            ops.append(op("create", events=[len(events) - 1], record_id="workstream:dinners", type="workstream",
+                          title="This week's dinners", body="- Plan seven dinners\n- Steak on Friday",
+                          from_records=["preference:diet"]))
+        if "vegetarian now" in text:
+            events.append(event("changed", "Became vegetarian", [turn["id"]]))
+            ops.append(op("supersede", events=[len(events) - 1], record_id="preference:diet", type="preference",
+                          title="Diet", body="- Vegetarian", aliases=["food", "vegetarian"]))
+            if "workstream:dinners" in known:
+                ops.append(op("update", events=[len(events) - 1], record_id="workstream:dinners",
+                              body="- Plan seven dinners\n- All vegetarian", from_records=["preference:diet"]))
+    return {"events": events, "ops": ops, "discarded": []}
+
+
+async def test_j15_reversal_without_bleed(journey) -> None:
+    model = scripted(
+        {
+            "forget that i used to eat meat": ("forget", {"query_or_id": "steak"}),
+            "what do you know about my diet": [
+                ("memory_search", {"query": "diet"}),
+                ("memory_read", {"id": "preference:diet", "history": True}),
+            ],
+        },
+        reconcile=diet,
+    )
+    script = model._respond
+
+    async def confirm_by_restating(request: GenerateRequest) -> ModelTurn:
+        turn = await script(request)
+        if request.contents[-1] != UserMessage("forget that I used to eat meat") and turn.text and "forgotten" in turn.text:
+            return ModelTurn(text="Done. I've forgotten that you used to love steak.")
+        return turn
+
+    model._respond = confirm_by_restating
+    j = await journey(model)
+    await j.dm("U1", "I love steak")
+    await j.advance(minutes=30)
+    await j.dm("U1", "plan my dinners this week", thread="new")
+    await j.advance(minutes=30)
+    await j.dm("U1", "actually I'm vegetarian now")
+    await j.advance(minutes=30)
+    await j.restart()
+    await j.dm("U1", "suggest a dinner", thread="new")
+    suggest = asked(model, "suggest a dinner").system
+
+    assert "Vegetarian" in suggest and "steak" not in suggest.lower()
+    workstream = await j.runtime.memory_engine.read("U1", "workstream:dinners")
+    assert workstream["body"] == "- Plan seven dinners\n- All vegetarian"
+
+    await j.dm("U1", "forget that I used to eat meat")
+    known = await j.dm("U1", "what do you know about my diet?")
+
+    assert "steak" not in json.dumps([use.result for use in known.tools]).lower(), "the answer's sources"
+    assert "steak" not in known.text.lower()
+    assert "steak" not in str(asked(model, "what do you know about my diet?").contents).lower(), "nor the conversation"
+    assert not [text for text in await j.active_memory("U1") if "steak" in text.lower()]
+    assert "Vegetarian" in (await j.runtime.memory_engine.read("U1", "preference:diet"))["body"], "only the past was forgotten"
+    assert (await j.runtime.memory_engine.read("U1", "workstream:dinners"))["body"] == workstream["body"]
+    events = {row["summary"]: row["status"] for row in await j.rows("SELECT summary, status FROM memory_events")}
+    assert (events["Loves steak"], events["Planning dinners for the week"]) == ("RETRACTED", "ACTIVE")
+
+
+async def test_j16_quiet_week(journey) -> None:
+    model = scripted({
+        "remind me to send sam": ("add_commitment", {"commitment": "send Sam the photos", "person": "Sam"}),
+        "sent sam": ("complete_commitment", open_id("send Sam the photos")),
+    })
+    j = await journey(model)
+    await j.dm("U1", "haha that meeting was wild")
+    await j.dm("U1", "remind me to send Sam the photos")
+    await j.dm("U1", "sent Sam the photos")
+    await j.repo.upsert_contact("T_JOURNEY", "Priya", owner_user_id="U1",
+                                last_interaction_ts=(j.clock() - timedelta(days=1)).strftime("%Y-%m-%d %H:%M:%S"))
+    week = await j.advance(days=7)
+
+    assert (week.posts, week.updates, week.ephemerals) == ([], [], []), "zero unprompted Slack posts all week"
+
+
+async def test_j16_every_quiet_tick_is_logged_silent(journey, caplog: pytest.LogCaptureFixture) -> None:
+    j = await journey(scripted())
+    await j.dm("U1", "haha that meeting was wild")
+    caplog.set_level(logging.INFO, logger="knappy")
+    await j.advance(days=1)
+
+    ticks = [record.getMessage() for record in caplog.records if record.getMessage().startswith("heartbeat tick")]
+    assert len(ticks) == 48
+    assert all("owner=U1" in line and "outcome=silent" in line for line in ticks)
+
+
+def chase_alex(payload: dict) -> dict:
+    events, ops = [], []
+    for turn in user_turns(payload):
+        if "contract" in turn["text"].lower():
+            events.append(event("commitment_made", "Chase Alex for the contract if nothing by Thursday", [turn["id"]]))
+            ops.append(op("commitment_add", events=[0], title="Chase Alex for the contract", person="Alex",
+                          next_check_at="2026-10-08T17:00:00Z", waiting_on="Alex",
+                          on_no_progress="Draft a chase to Alex asking for the contract"))
+    return {"events": events, "ops": ops, "discarded": []}
+
+
+async def test_j17_follow_through(journey) -> None:
+    slack = FakeSlack(tz="UTC", members=[member("UALEX", "Alex Kim"), member("USAM", "Sam Lee")])
+    j = await journey(scripted(reconcile=chase_alex), slack=slack)
+    await j.dm("U1", "I asked Alex for the contract. If he hasn't sent it by Thursday, help me chase him.")
+    quiet = await j.advance(days=3)
+    assert quiet.posts == [], "nothing before Thursday"
+
+    nudge = await j.advance(hours=12)
+
+    assert [post["channel"] for post in nudge.posts] == [dm_channel("U1")], "one DM to the owner"
+    [draft] = await j.rows("SELECT id, user_id, status, payload FROM action_drafts")
+    payload = json.loads(draft["payload"])
+    assert (draft["user_id"], draft["status"]) == ("U1", "PENDING")
+    assert (payload["recipient_name"], payload["recipient_identifier"]) == ("Alex", "UALEX"), "resolved to a Slack id"
+    card = json.dumps(nudge.posts[0]["blocks"])
+    assert "btn_approve_proactive_action" in card and draft["id"] in card and payload["staged_content"] in card
+    assert "chase to Alex" in nudge.posts[0]["text"], "the user's own follow-through instruction is shown"
+    assert [post for post in j.slack.posts if post["channel"] not in ("U1", dm_channel("U1"))] == [], "nothing sent to Alex"
+
+    later = await j.advance(hours=12)
+    assert later.posts == [], "not repeated, not even in the next morning's brief"
+
+    sent = await j.click("U1", "btn_approve_proactive_action", draft["id"])
+    to_alex = [post["text"] for post in sent.to("UALEX")]
+    assert to_alex == [payload["staged_content"]], "Alex gets the chase drafted for him"
+    assert nudge.posts[0]["text"] not in to_alex[0] and "asked me to" not in to_alex[0], "not the reminder to the user"
+
+
+WORKSPACE_PEOPLE = [
+    member("U1", "Febe Chukwuma", display_name="febe"), member("U_SAM", "Sam Lee"), member("U_ALEX", "Alex Kim"),
+    member("U_PAT", "Pat Doe"), member("U_JO", "Jo Park"),
+]
+CHATTER = [
+    ("U_JO", "C_RANDOM", "anyone tried the new ramen place on 5th street"),
+    ("U_PAT", "C_RANDOM", "the coffee machine on floor three is broken again"),
+    ("U_SAM", "C_GENERAL", "reminder that the all hands recording is up on the wiki"),
+    ("U_JO", "C_DESIGN", "I pushed new icons to the shared figma file for the mobile team"),
+    ("U_ALEX", "C_RANDOM", "who wants to join the friday climbing session"),
+]
+BUSY = {
+    "review the launch deck": {"kind": "asks_user", "summary": "Sam asked the user to review the launch deck by Thursday",
+                               "who": "Sam", "due": "2026-10-08T17:00:00+00:00"},
+    "budget numbers": {"kind": "asks_user", "summary": "Pat asked the user for the Q4 budget numbers", "who": "Pat"},
+    "launch moves": {"kind": "workstream_update", "summary": "The Atlas launch moved from Oct 14 to Oct 20", "who": "Pat"},
+    "contract attached": lambda context: {
+        "kind": "commitment_moved", "summary": "Alex sent the contract", "who": "Alex", "completed": True,
+        "commitment_id": next(row["id"] for row in context["open_commitments"] if "contract" in row["commitment"].lower()),
+    },
+}
+
+
+async def chatter(j, day: int) -> None:
+    for user, channel, text in CHATTER:
+        await j.workspace(user, channel, f"{text} (day {day})")
+
+
+def card_labels(posts: list[dict], action: str | None) -> list[str]:
+    """The bold label of each card in these posts, for cards with (or, with None, without) the given button."""
+    labels = []
+    for post in posts:
+        blocks = post.get("blocks") or []
+        for index, block in enumerate(blocks[1:], 1):
+            text = (block.get("text") or {}).get("text", "")
+            if block["type"] != "section" or "Open in Slack" not in text:
+                continue
+            following = blocks[index + 1] if index + 1 < len(blocks) else {}
+            buttons = [element["action_id"] for element in following.get("elements") or []] if following.get("type") == "actions" else []
+            if (action in buttons) if action else not buttons:
+                labels.append(text.split("*")[1])
+    return labels
+
+
+async def test_j18_aware_of_a_busy_workspace(journey) -> None:
+    model = FakeModel(agent(), structured=memory_structured(chase_alex, observer(BUSY)))
+    j = await journey(model, slack=FakeSlack(tz="UTC", members=WORKSPACE_PEOPLE), owner="U1")
+    await j.dm("U1", "I asked Alex for the contract. If he hasn't sent it by Thursday, help me chase him.")
+    await chatter(j, 1)
+    await j.workspace("U_SAM", "C_DESIGN", "<@U1> could you review the launch deck before Thursday's sync?")
+    await j.workspace("U_PAT", "C_LAUNCH", "heads up team, the Atlas launch moves to Oct 20, QA needs another week")
+    await chatter(j, 1)
+    day_one = await j.advance(hours=20)
+    await chatter(j, 2)
+    await j.workspace("U_ALEX", "D_ALEX", "here you go, contract attached, let me know if anything is off")
+    await j.workspace("U_PAT", "D_PAT", "can you send me the Q4 budget numbers when you get a chance?")
+    await chatter(j, 2)
+    rest = await j.advance(days=2, hours=23)
+
+    briefs = day_one.posts + rest.posts
+    assert [post["channel"] for post in briefs] == [dm_channel("U1")] * 4, "a brief each morning, Tue to Fri; no interrupts"
+    assert set(card_labels(briefs, "btn_attention_done")) == {
+        "Sam asked the user to review the launch deck by Thursday, due Thu 17:00",
+        "Pat asked the user for the Q4 budget numbers",
+    }
+    assert card_labels(briefs, None) == ["The Atlas launch moved from Oct 14 to Oct 20"]
+    [chase] = await j.rows("SELECT status FROM interactions WHERE commitment LIKE 'Chase Alex%'")
+    assert chase["status"] == "FULFILLED", "the chase closed itself when the contract arrived"
+    assert "chase" not in json.dumps(rest.posts).lower()
+    summaries = [row["summary"] for row in await j.rows("SELECT summary FROM memory_events")]
+    assert not [line for line in summaries if any(word in line.lower() for word in ("ramen", "coffee", "climbing", "icons"))]
+    stored = Path(j.settings.database_url.removeprefix("sqlite:///")).read_bytes()
+    assert not [text for _user, _channel, text in CHATTER if text.encode() in stored], "chatter leaves no trace"
+    assert b"could you review the launch deck" not in stored
+
+
+async def test_j19_busy_workspace_quiet_week(journey, caplog: pytest.LogCaptureFixture) -> None:
+    model = FakeModel(agent(), structured=memory_structured(observe=observer({})))
+    j = await journey(model, slack=FakeSlack(tz="UTC", members=WORKSPACE_PEOPLE), owner="U1")
+    await j.dm("U1", "haha that meeting was wild")
+    caplog.set_level(logging.INFO, logger="knappy")
+    posts: list[dict] = []
+    for day in range(5):
+        for _round in range(3):
+            await chatter(j, day)
+            posts += (await j.advance(hours=1)).posts
+        posts += (await j.advance(hours=21)).posts
+
+    assert posts == [], "zero interrupts and no brief"
+    ticks = [record.getMessage() for record in caplog.records if record.getMessage().startswith("heartbeat tick")]
+    assert len(ticks) == 5 * 48 and all("outcome=silent" in line for line in ticks)
+    flushes = [record.getMessage() for record in caplog.records if record.getMessage().startswith("awareness flush")]
+    assert flushes and all("admitted=0" in line for line in flushes)
+    assert await j.rows("SELECT * FROM attention_items") == []

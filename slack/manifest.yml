@@ -1,0 +1,52 @@
+display_information:
+  name: Knappy Assistant
+  description: Ambient relationship and executive assistant for Slack.
+  background_color: "#1A1D21"
+features:
+  bot_user:
+    display_name: Knappy
+    always_online: true
+oauth_config:
+  # Spec 22: replace the host with KNAPPY_PUBLIC_URL. The install link is <KNAPPY_PUBLIC_URL>/slack/install.
+  redirect_urls:
+    - https://knappy.example/slack/oauth_redirect
+  scopes:
+    bot:
+      - chat:write
+      - im:history
+      - im:read
+      - im:write
+      - app_mentions:read
+      - channels:history
+      - files:read
+      - files:write
+      - groups:history
+      - reactions:write
+      - users:read
+      - users:read.email
+    # Spec 18 workspace awareness: read the installer's own conversations, and post replies as them after approval.
+    user:
+      - channels:history
+      - groups:history
+      - im:history
+      - mpim:history
+      - channels:read
+      - groups:read
+      - im:read
+      - mpim:read
+      - users:read
+      - chat:write
+settings:
+  socket_mode_enabled: true
+  event_subscriptions:
+    bot_events:
+      - message.im
+      - app_mention
+      - app_uninstalled
+    user_events:
+      - message.channels
+      - message.groups
+      - message.im
+      - message.mpim
+  interactivity:
+    is_enabled: true

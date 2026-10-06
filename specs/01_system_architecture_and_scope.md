@@ -1,5 +1,38 @@
 # Specification 01: System Architecture and Master Scope
 
+## 0. Product Vision (amended — supersedes the framing in §1 and §3)
+
+**Knappy is a personal assistant that lives in Slack.** You can talk to it about anything. It remembers you — your preferences, people, projects, and past conversations — across threads and restarts. It does work for you: researches, reads what you send it, drafts, tracks what you owe people, and reaches out before things slip. Reference products are Instinct and Meta Muse; Pally is the first slice, not the ceiling. See [Spec 00](./00_gap_analysis.md) for the gap between this vision and the code.
+
+### 0.1 Operating Principles
+
+1. **Answer, don't refuse.** Any reasonable request gets a real attempt. "I can't answer general questions" is a defect.
+2. **Remember by default.** Every conversation is persisted. Durable facts are reconciled into memory in the background ([Spec 13](./13_memory_system.md)).
+3. **Reads are free, boundary-crossing writes are gated.** Searching memory, the web, files, and Slack history runs without asking. Anything that reaches another person or an external account goes through the HITL gate ([Spec 05](./05_hitl_approval_gateways.md)). Writing into the user's own DM with Knappy is not boundary-crossing.
+4. **One agent, real brain, cheap edges.** A single Gemini Flash tool-calling loop is the center ([Spec 11](./11_model_layer_gemini.md), [Spec 12](./12_agent_loop_v2.md)). Deterministic code handles what code can: SQL sweeps, dedupe, approvals, and explicit commands. No swarms.
+
+### 0.2 Capability Waves
+
+| Wave | Contents | Status |
+| :--- | :--- | :--- |
+| 1 | Brain, agent loop, memory, web search and fetch, files in and out, proactive fixes | Specs 11–17 |
+| 2 | Google Workspace: Gmail and Calendar, writes through HITL | To be specified |
+| 3 | Sandboxed browser with an action monitor | To be specified |
+
+### 0.3 Revised Targets
+
+| Metric | Target |
+| :--- | :--- |
+| Visible acknowledgement (placeholder or answer) | < 1.5 s |
+| Simple answer, no tools | < 4 s |
+| Tool-using answer (memory, web) | < 15 s, with the placeholder updated while working |
+| Monthly model cost, one active user | < $10 |
+| Unapproved boundary-crossing actions | 0 |
+
+Where §1–§5 below conflict with §0, §0 wins. In particular, §1's "relationship intelligence agent" framing, §3.1 item 4's fixed tool list, and §4's latency and cost targets are superseded.
+
+---
+
 ## 1. Executive Summary & Objective
 
 **Knappy Slack Assistant** is an ambient executive assistant and relationship intelligence agent operating natively within Slack. Modeled after Pally (YC S25) and architected according to Google Cloud's Agentic AI Design Patterns, Knappy provides:
@@ -27,13 +60,15 @@ flowchart TD
     end
 
     subgraph PathA ["Path A: Sequential Pattern (ETL)"]
-        NoiseFilter["Heuristic & Regex Noise Filter"]
+        NoiseFilter["Two-Tier Ingestion Gate (Local + SystemOneGate Jev)"]
         SLMExtractor["SLM Entity & Commitment Extractor (Pydantic)"]
         LocalEmbedder["CPU Embedding Engine (bge-small-en-v1.5)"]
     end
 
-    subgraph PathB ["Path B: ReAct Pattern (Conversational Agent)"]
-        ReActLoop["ReAct Reasoning Loop (Thought-Action-Observation)"]
+    subgraph PathB ["Path B: Hybrid Routing & ReAct (Conversational Agent)"]
+        FastRouter["Fast Intent Router (Jev System 1, ~80ms)"]
+        DirectTool["Fast-Path Direct Tool Dispatch (< 200ms)"]
+        ReActLoop["ReAct Reasoning Loop (Complex / Multi-Hop)"]
         ToolRouter["Tool Call Registry"]
     end
 
@@ -45,11 +80,12 @@ flowchart TD
 
     subgraph PathD ["Path D: Proactive Monitor Pattern"]
         Scheduler["Deterministic Cron Sweeper (Zero LLM)"]
+        AlertTriage["Jev Alert Triage Gate (~80ms)"]
         ProactiveSynthesizer["Proactive Briefing Synthesizer"]
     end
 
     subgraph Storage ["Dual-Memory Persistence"]
-        RelationalDB[("Relational DB: contacts, interactions, action_drafts")]
+        RelationalDB[("Relational DB: contacts, interactions, action_drafts, briefing_items")]
         VectorStore[("Vector Store: sqlite-vec / pgvector")]
     end
 
@@ -61,7 +97,10 @@ flowchart TD
     SLMExtractor -->|Structured JSON| LocalEmbedder
     LocalEmbedder --> Storage
 
-    Router -->|User Query in DM/@bot| ReActLoop
+    Router -->|User Query in DM/@bot| FastRouter
+    FastRouter -->|High Confidence Direct Tool| DirectTool
+    DirectTool --> Storage
+    FastRouter -->|Complex Multi-Hop| ReActLoop
     ReActLoop <--> ToolRouter
     ToolRouter <--> Storage
     ToolRouter -->|Mutating Action Requested| DraftStage
@@ -74,7 +113,8 @@ flowchart TD
     ExecWorker -->|Immutable Receipt| BlockKitUI
 
     Scheduler -->|Every 30m / 8am Scan| Storage
-    Storage -->|Trigger Conditions Met| ProactiveSynthesizer
+    Storage -->|Candidate Matches| AlertTriage
+    AlertTriage -->|DISPATCH_IMMEDIATE_DM| ProactiveSynthesizer
     ProactiveSynthesizer --> BlockKitUI
 ```
 
@@ -91,11 +131,11 @@ Clear boundaries ensure predictable execution and prevent cost overruns or permi
    - Event handling for `message.im` (1-on-1 private DMs) and `app_mention` (in-channel invocations).
    - Sub-3-second acknowledgment (`200 OK` or immediate Slack ack) with asynchronous event processing.
 2. **Dual-Memory Layer**:
-   - Relational tables: `workspaces`, `contacts`, `interactions`, and `action_drafts`.
+   - Relational tables: `workspaces`, `contacts`, `interactions`, `action_drafts`, and `briefing_items`.
    - Vector store: 384-dimensional dense vectors using local CPU embeddings (`bge-small-en-v1.5` or `all-MiniLM-L6-v2`) via `fastembed` or `sqlite-vec`/`pgvector`.
    - Local SQLite support for zero-config local development, with clean migration path to PostgreSQL + `pgvector`.
 3. **Passive Ingestion Pipeline**:
-   - Zero-LLM regex pre-filter to drop bots, automated alerts, system messages, and trivial chats (< 4 tokens).
+   - Two-tier gate: Local structural filter (drops bots, subtypes, short tokens) + `SystemOneGate` (TypeSafe AI Jev with regex fallback) to reliably catch nuanced commitments and meeting notes without expensive autoregressive generation.
    - Structured JSON entity extraction using a lightweight model (`gpt-4o-mini` or equivalent SLM) enforced via Pydantic schemas.
    - Extraction targets: contact names, interaction summaries, explicit commitments, and due dates.
 4. **Conversational ReAct Agent**:
@@ -149,4 +189,4 @@ Before any milestone is signed off as complete, the following gates must be vali
 - [ ] **Gate 2 (Ingestion):** Noise filter rejects bots and short pings; SLM extracts valid JSON matching Pydantic schema; embeddings generated on CPU; stored in DB.
 - [ ] **Gate 3 (Conversational ReAct):** Querying "Who promised to send the revised budget?" accurately retrieves the interaction via vector/relational search and answers in-thread.
 - [ ] **Gate 4 (HITL Safety):** Asking "Follow up with Alex" stages a draft in `action_drafts` and emits a Block Kit card. Clicking `[Approve]` updates the block with a green checkmark and dispatches the action. Unapproved actions never execute.
-- [ ] **Gate 5 (Proactive Sweeper):** Mocking a commitment due in 2 hours triggers the deterministic scanner, invokes the SLM synthesizer, and posts a proactive DM to the user with action buttons.
+- [ ] **Gate 5 (Proactive Sweeper):** Mocking a commitment due in 2 hours triggers the deterministic scanner, passes the Jev alert triage gate, and only then invokes the SLM synthesizer and posts a proactive DM to the user with action buttons.

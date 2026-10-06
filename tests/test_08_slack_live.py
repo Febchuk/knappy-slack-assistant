@@ -1,0 +1,157 @@
+"""Specs 08 and 09: Slack replies, one-shot sends, per-user memory, and history."""
+
+from __future__ import annotations
+
+from pathlib import Path
+
+import pytest
+
+from knappy.agent.tools import ToolRegistry, current_owner
+from knappy.db.factory import repository_class
+from knappy.db.postgres import PostgresRepository, _placeholders
+from knappy.db.repository import SqliteRepository
+from knappy.db.schema import POSTGRES_SCHEMA
+from knappy.runtime import KnappyRuntime
+from knappy.slack.egress import build_say
+from knappy.slack.executor import SlackActionExecutor
+from fakes import FakeSlack, HeuristicModel, dm, member, mention
+
+
+def _runtime(repo: SqliteRepository, client: FakeSlack) -> KnappyRuntime:
+    return KnappyRuntime(
+        repo,
+        workspace_id="T_TEST",
+        model=HeuristicModel(),
+        say=build_say(client),
+        sender=build_say(client),
+        executor=SlackActionExecutor(client),
+        slack=client,
+    )
+
+
+@pytest.mark.asyncio
+async def test_egress_note_answer_card_and_single_send(repo: SqliteRepository) -> None:
+    client = FakeSlack(members=[member("UALEX", "Alex Kim")])
+    runtime = _runtime(repo, client)
+    await runtime.handle_event(
+        dm("note: Met with Alex from Acme Corp, promised to send the revised budget by Thursday.", "1.0")
+    )
+    assert len(client.posts) == 1
+    assert "thread_ts" not in client.posts[0]
+    assert "Alex" in client.shown("100.1")["text"]
+
+    answer = await runtime.handle_event(dm("What did I promise to send Alex?", "2.0"))
+    assert len(client.posts) == 2
+    assert answer.text == "Alex: send the revised budget by Thursday"
+    assert client.shown("100.2")["text"] == answer.text
+
+    staged = await runtime.handle_event(dm("Follow up with Alex", "3.0"))
+    assert staged.draft_id is not None
+    assert len(client.posts) == 3
+    shown = client.shown("100.3")
+    action_ids = [element["action_id"] for element in shown["blocks"][-1]["elements"]]
+    assert "btn_approve_action" in action_ids
+    assert "not sent" in shown["blocks"][0]["text"]["text"]
+
+    approved = await runtime.gateway.approve(staged.draft_id, "U1")
+    again = await runtime.gateway.approve(staged.draft_id, "U1")
+    sends = [post for post in client.posts if post.get("channel") == "UALEX"]
+    assert approved.executed is True
+    assert again.status == "ignored"
+    assert len(sends) == 1
+
+
+@pytest.mark.asyncio
+async def test_channel_answer_is_ephemeral(repo: SqliteRepository) -> None:
+    client = FakeSlack()
+    runtime = _runtime(repo, client)
+    await runtime.handle_event(mention("What did I promise to send Alex?", "4.0"))
+    assert client.posts == []
+    assert len(client.ephemerals) == 1
+    assert client.ephemerals[0]["user"] == "U1"
+
+
+@pytest.mark.asyncio
+async def test_second_user_alex_stays_private(repo: SqliteRepository) -> None:
+    await repo.record_interaction(
+        workspace_id="T_TEST",
+        contact_name="Alex",
+        source_type="NOTE_INGEST",
+        channel_id="D2",
+        raw_text="send the secret plan",
+        summary="send the secret plan",
+        commitment="send the secret plan",
+        owner_user_id="U2",
+    )
+    tools = ToolRegistry(repo, "T_TEST")
+    token = current_owner.set("U1")
+    try:
+        hidden = await tools.search_commitments("secret plan")
+    finally:
+        current_owner.reset(token)
+    token = current_owner.set("U2")
+    try:
+        visible = await tools.search_commitments("secret plan")
+    finally:
+        current_owner.reset(token)
+    assert hidden == []
+    assert visible
+    assert visible[0]["commitment"] == "send the secret plan"
+
+
+@pytest.mark.asyncio
+async def test_history_answers_without_ingestion(repo: SqliteRepository) -> None:
+    client = FakeSlack(messages=[{"text": "ship the budget Friday", "user": "U2", "ts": "9.0"}])
+    runtime = _runtime(repo, client)
+    before = await repo.find_contacts("T_TEST")
+    reply = await runtime.handle_event(dm("What did we say about the budget?", "5.0"))
+    after = await repo.find_contacts("T_TEST")
+    assert reply is not None
+    assert "ship the budget Friday" in reply.text
+    assert after == before
+
+
+@pytest.mark.asyncio
+async def test_unconnected_action_fails(repo: SqliteRepository) -> None:
+    client = FakeSlack()
+    runtime = _runtime(repo, client)
+    draft_id = await repo.create_draft(
+        workspace_id="T_TEST",
+        user_id="U1",
+        channel_id="D1",
+        action_type="GMAIL_DRAFT",
+        payload={
+            "recipient_name": "Alex",
+            "recipient_identifier": "alex@acme.test",
+            "staged_content": "mail",
+            "preview_summary": "mail",
+            "action_type": "GMAIL_DRAFT",
+            "metadata": {},
+        },
+    )
+    result = await runtime.gateway.approve(draft_id, "U1")
+    draft = await repo.get_draft(draft_id)
+    assert result.status == "FAILED"
+    assert draft is not None and draft["status"] == "FAILED"
+    assert client.posts == []
+
+
+def test_postgres_url_selects_postgres_repository() -> None:
+    assert repository_class("postgresql://localhost/knappy") is PostgresRepository
+    assert repository_class("sqlite:///knappy.db") is SqliteRepository
+    sql, params = _placeholders("SELECT * FROM contacts WHERE id = ? AND name = ?", ("1", "Alex"))
+    assert sql == "SELECT * FROM contacts WHERE id = $1 AND name = $2"
+    assert params == ("1", "Alex")
+    assert "owner_user_id" in POSTGRES_SCHEMA
+    assert "UNIQUE(workspace_id, owner_user_id, name)" in POSTGRES_SCHEMA
+
+
+def test_dockerfile_starts_one_worker() -> None:
+    text = Path("Dockerfile").read_text()
+    assert 'CMD ["python", "-m", "knappy.main"]' in text
+    manifest = Path("slack/manifest.yml").read_text()
+    assert "channels:history" in manifest
+    assert "groups:history" in manifest
+    assert "reactions:write" in manifest
+    assert "users:read" in manifest
+    assert "users:read.email" in manifest
