@@ -107,7 +107,7 @@ class KnappyRuntime:
                 over_budget=self._over_budget, pacing=awareness_pacing,
             )
         self.tools = ToolRegistry(
-            repo, workspace_id, history=slack, memory=self.memory_engine, searcher=model, fetcher=fetcher,
+            repo, workspace_id, history=user_client or slack, memory=self.memory_engine, searcher=model, fetcher=fetcher,
             files=self.files, recipients=self.recipients, attention=self.attention, awareness=self.awareness, clock=clock,
             mcp=mcp,
         )

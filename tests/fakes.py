@@ -294,13 +294,33 @@ class FakeSlack:
     async def auth_test(self):
         return {"ok": True, "user_id": self.user_id, "team_id": "T_TEST"}
 
-    async def conversations_history(self, *, channel, limit=20, oldest=None, cursor=None):
+    async def conversations_history(
+        self, *, channel, limit=20, oldest=None, latest=None, inclusive=False, cursor=None,
+    ):
         self.api_calls.append(f"conversations.history {channel}")
         if channel not in self.history:
             return {"messages": self.messages}
-        after = float(oldest or 0)
-        top = [m for m in self.history[channel] if float(m["ts"]) > after and m.get("thread_ts") in (None, m["ts"])]
-        return {"messages": sorted(top, key=lambda m: -float(m["ts"]))[:limit]}
+        top = []
+        for message in self.history[channel]:
+            if message.get("thread_ts") not in (None, message["ts"]):
+                continue
+            ts = float(message["ts"])
+            if oldest is not None:
+                after = float(oldest)
+                if ts < after or (not inclusive and ts == after):
+                    continue
+            elif ts <= 0:
+                continue
+            if latest is not None:
+                before = float(latest)
+                if ts > before or (not inclusive and ts == before):
+                    continue
+            top.append(message)
+        top.sort(key=lambda message: -float(message["ts"]))
+        start = int(cursor) if cursor else 0
+        page = top[start : start + limit]
+        next_cursor = str(start + limit) if start + limit < len(top) else ""
+        return {"messages": page, "response_metadata": {"next_cursor": next_cursor}}
 
     async def conversations_replies(self, *, channel, ts, oldest=None, limit=200):
         self.api_calls.append(f"conversations.replies {channel} {ts}")

@@ -30,7 +30,8 @@ PROFILE_CHAR_BUDGET = 6000  # about 1,500 tokens
 TOOL_TURN_LIMIT = 4096
 
 RECORD_COLUMNS = (
-    "id, type, title, aliases, body, links, source, contact_id, status, supersedes, valid_from, expires_at, updated_at"
+    "id, type, title, aliases, body, links, source, contact_id, status, supersedes, valid_from, expires_at, "
+    "updated_at, slack_user_id"
 )
 PROFILE_TYPES = ("person", "org", "fact", "preference", "decision")
 DERIVED_SOURCES = ("reconciler", "remember")
@@ -463,10 +464,10 @@ class MemoryStore:
             """
             INSERT INTO memory_records (
                 id, workspace_id, owner_user_id, type, title, aliases, body, links, source, contact_id,
-                status, supersedes, valid_from, expires_at, updated_at, embedding
+                status, supersedes, valid_from, expires_at, updated_at, embedding, slack_user_id
             )
             SELECT ?, workspace_id, owner_user_id, type, title, aliases, body, links, source, contact_id,
-                   ?, supersedes, valid_from, expires_at, ?, embedding
+                   ?, supersedes, valid_from, expires_at, ?, embedding, slack_user_id
             FROM memory_records WHERE workspace_id = ? AND owner_user_id = ? AND id = ?
             """,
             (version, old_status, format_ts(now), self.workspace_id, owner, record_id),
@@ -501,6 +502,16 @@ class MemoryStore:
         )
         await self.add_provenance(owner, "record", record_id, sources)
         return record_id
+
+    async def set_record_slack_id(self, owner: str, record_id: str, slack_user_id: str) -> None:
+        """Point a person record at a directory row. The id is not part of the embedding."""
+        await self._run(
+            """
+            UPDATE memory_records SET slack_user_id = ?
+            WHERE workspace_id = ? AND owner_user_id = ? AND id = ?
+            """,
+            (slack_user_id, self.workspace_id, owner, record_id),
+        )
 
     async def set_status(self, owner: str, record_ids: Iterable[str], status: str, now: datetime) -> None:
         for record_id in record_ids:

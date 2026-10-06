@@ -11,6 +11,7 @@ from contextvars import ContextVar
 from dataclasses import dataclass
 from datetime import date, datetime, time, timedelta, timezone
 from typing import TYPE_CHECKING, Any, Literal
+from urllib.parse import parse_qs, urlparse
 
 from jsonschema import SchemaError, validators
 from pydantic import AwareDatetime, BaseModel, Field
@@ -25,6 +26,7 @@ from knappy.ingestion.embed import generate_embedding
 from knappy.llm.types import Model, Recency, ToolSpec
 from knappy.mcp.hub import McpHub, McpTool, NotConnected
 from knappy.memory.types import RecordType, SavableType
+from knappy.slack.directory import matching_channel_id, matching_user_ids, normal_label
 from knappy.slack.users import RecipientResolver, UserDirectory
 from knappy.web import WebFetcher
 
@@ -52,6 +54,33 @@ current_thread: ContextVar[SlackThread | None] = ContextVar("knappy_thread", def
 _HISTORY_STOP = frozenset(
     {"what", "did", "we", "you", "say", "said", "about", "the", "slack", "channel", "message", "messages"}
 )
+# One page when the caller names no start time. With `since`, walk back this many pages of this size.
+_HISTORY_PAGE = 200
+_HISTORY_PAGES = 10
+_SLACK_MESSAGE = re.compile(r"/archives/([CGD][A-Z0-9]+)/p(\d+)$", re.IGNORECASE)
+
+
+def parse_slack_permalink(url: str) -> tuple[str, str, str | None] | None:
+    """`(channel, ts, thread_ts)` from a slack.com/archives link. thread_ts is set for a reply."""
+    parsed = urlparse(url.strip())
+    host = parsed.netloc.lower().split(":")[0]
+    if host != "slack.com" and not host.endswith(".slack.com"):
+        return None
+    match = _SLACK_MESSAGE.fullmatch(parsed.path.rstrip("/"))
+    if match is None or len(match.group(2)) <= 6:
+        return None
+    raw = match.group(2)
+    thread = parse_qs(parsed.query).get("thread_ts", [None])[0] or None
+    return match.group(1), f"{raw[:-6]}.{raw[-6:]}", thread
+
+
+def _history_tokens(query: str) -> list[str]:
+    tokens = []
+    for raw in query.lower().split():
+        token = raw.strip(".,!?:;\"'").lstrip("#@")
+        if len(token) > 2 and token not in _HISTORY_STOP:
+            tokens.append(token)
+    return tokens
 
 
 class SearchCommitmentsArgs(BaseModel):
@@ -91,8 +120,16 @@ class StageOutboundActionArgs(BaseModel):
 
 class SearchSlackHistoryArgs(BaseModel):
     query: str
-    channel_id: str | None = Field(default=None, description="Channel to search first; defaults to the current one")
+    channel_id: str | None = Field(default=None, description="Channel to search; defaults to the current one, then others the user is in")
+    since: AwareDatetime | None = Field(
+        default=None,
+        description="Only messages at or after this time, ISO 8601 with the user's UTC offset. Set it when they name a time, such as this morning.",
+    )
     limit: int = Field(default=20, ge=1, le=50)
+
+
+class ReadSlackMessageArgs(BaseModel):
+    url: str = Field(..., description="A Slack message link: https://….slack.com/archives/C…/p…")
 
 
 class AddCommitmentArgs(BaseModel):
@@ -198,7 +235,16 @@ TOOL_SPECS: dict[str, ToolSpec] = {
             "Draft a message to another person. It is only sent after the user approves the card. Never claim it was sent.",
             StageOutboundActionArgs,
         ),
-        ToolSpec("search_slack_history", "Search recent messages in Slack channels Knappy was invited to.", SearchSlackHistoryArgs),
+        ToolSpec(
+            "search_slack_history",
+            "Search messages in Slack conversations the user can see. Pass channel_id and since when they name a channel or a time.",
+            SearchSlackHistoryArgs,
+        ),
+        ToolSpec(
+            "read_slack_message",
+            "Read one Slack message from its link. Use this for a slack.com/archives URL, never fetch_url.",
+            ReadSlackMessageArgs,
+        ),
         ToolSpec("add_commitment", "Record something the user will do, or asked to be reminded about.", AddCommitmentArgs),
         ToolSpec("complete_commitment", "Mark one of the user's commitments done or cancelled.", CompleteCommitmentArgs),
         ToolSpec(
@@ -267,6 +313,7 @@ TOOL_STATUS: dict[str, str] = {
     "get_meeting_context": "reading your notes",
     "stage_outbound_action": "drafting a message",
     "search_slack_history": "searching Slack",
+    "read_slack_message": "reading that Slack message",
     "add_commitment": "saving that",
     "complete_commitment": "updating your commitments",
     "reschedule_commitment": "updating your commitments",
@@ -415,6 +462,7 @@ class ToolRegistry:
         self.recipients = recipients or RecipientResolver(repo, workspace_id, UserDirectory(history))
         self.workspace_id = workspace_id
         self.history = history
+        self.directory = UserDirectory(history)
         self.memory = memory
         self.searcher = searcher
         self.fetcher = fetcher or WebFetcher()
@@ -612,56 +660,156 @@ class ToolRegistry:
         await self.repo.reschedule_commitment(commitment_id, due)
         return {"id": commitment_id, "commitment": row["commitment"], "due_utc": format_ts(due)}
 
+    async def read_slack_message(self, url: str) -> dict[str, Any]:
+        """The message at a Slack permalink. A miss is an error naming the channel and ts, never an empty list."""
+        parsed = parse_slack_permalink(url)
+        if parsed is None:
+            return {"error": "Not a Slack message link. Pass a https://….slack.com/archives/…/p… URL.", "url": url}
+        channel, ts, thread_ts = parsed
+        client = self.history
+        if client is None:
+            return {"error": "Slack history is not available in this context.", "channel": channel, "ts": ts}
+        try:
+            if thread_ts and thread_ts != ts:
+                response = await client.conversations_replies(channel=channel, ts=thread_ts, limit=_HISTORY_PAGE)
+            else:
+                response = await client.conversations_history(
+                    channel=channel, latest=ts, oldest=ts, inclusive=True, limit=1
+                )
+        except Exception as exc:
+            logger.info("read_slack_message failed channel=%s ts=%s error=%s", channel, ts, type(exc).__name__)
+            return {"error": "Could not read that message.", "channel": channel, "ts": ts}
+        message = next((item for item in response.get("messages") or [] if item.get("ts") == ts), None)
+        if message is None:
+            return {"error": "No message at that link.", "channel": channel, "ts": ts}
+        return await self._slack_hit(channel, message, permalink=url.strip())
+
     async def search_slack_history(
         self,
         query: str,
         channel_id: str | None = None,
         limit: int = 20,
+        since: datetime | None = None,
     ) -> list[dict[str, Any]]:
         client = self.history
         if client is None:
             return []
+        owner = self._owner() or ""
+        directory_users = await self.repo.directory_users(self.workspace_id, owner) if owner else []
+        directory_channels = await self.repo.directory_channels(self.workspace_id, owner) if owner else []
+        tokens = _history_tokens(query)
+        named = next((found for token in tokens if (found := matching_channel_id(directory_channels, token))), None)
+        from_argument = matching_channel_id(directory_channels, channel_id) if channel_id else None
+        only = named or from_argument
         thread = current_thread.get()
-        first = channel_id or (thread.channel_id if thread else None)
+        first = only or channel_id or (thread.channel_id if thread else None)
         channels: list[str] = [first] if first else []
-        try:
-            listed = await client.users_conversations(
-                types="public_channel,private_channel,im",
-                exclude_archived=True,
-                limit=100,
-            )
-            for channel in listed.get("channels") or []:
-                cid = channel.get("id")
-                if cid and cid not in channels:
-                    channels.append(cid)
-        except Exception:
-            pass
-        tokens = []
-        for raw in query.lower().split():
-            token = raw.strip(".,!?:;\"'")
-            if len(token) > 2 and token not in _HISTORY_STOP:
-                tokens.append(token)
+        if only is None:
+            try:
+                listed = await client.users_conversations(
+                    types="public_channel,private_channel,im",
+                    exclude_archived=True,
+                    limit=100,
+                )
+                for channel in listed.get("channels") or []:
+                    cid = channel.get("id")
+                    if cid and cid not in channels:
+                        channels.append(cid)
+            except Exception:
+                pass
+        channel_labels = {normal_label(channel["name"]) for channel in directory_channels}
+        text_tokens = [token for token in tokens if normal_label(token) not in channel_labels]
+        author_ids = {
+            user_id
+            for token in text_tokens
+            for user_id in matching_user_ids(directory_users, token)
+        }
+        names: dict[str, str] = {}
         hits: list[dict[str, Any]] = []
         for cid in channels[:15]:
             try:
-                history = await client.conversations_history(channel=cid, limit=limit)
+                messages = await self._messages_since(client, cid, since, limit)
             except Exception:
                 continue
-            for message in history.get("messages") or []:
+            for message in messages:
+                author = await self._author_name(message.get("user"), names, directory_users)
                 text = message.get("text") or ""
-                if tokens and not any(token in text.lower() for token in tokens):
+                if text_tokens and message.get("user") not in author_ids and not any(
+                    token in f"{text} {author}".lower() for token in text_tokens
+                ):
                     continue
-                hits.append(
-                    {
-                        "channel": cid,
-                        "user": message.get("user"),
-                        "ts": message.get("ts"),
-                        "text": text,
-                    }
-                )
+                hits.append(await self._slack_hit(cid, message, author=author))
                 if len(hits) >= limit:
                     return hits
         return hits
+
+    async def _messages_since(self, client: Any, channel: str, since: datetime | None, limit: int) -> list[dict[str, Any]]:
+        """Parents back to `since` (one short page when it is omitted), plus thread replies in that window."""
+        oldest = f"{since.timestamp():.6f}" if since else None
+        parents: list[dict[str, Any]] = []
+        cursor = None
+        for _page in range(_HISTORY_PAGES if since else 1):
+            kwargs: dict[str, Any] = {"channel": channel, "limit": _HISTORY_PAGE if since else limit}
+            if oldest is not None:
+                kwargs["oldest"] = oldest
+                kwargs["inclusive"] = True
+            if cursor:
+                kwargs["cursor"] = cursor
+            response = await client.conversations_history(**kwargs)
+            parents.extend(response.get("messages") or [])
+            cursor = (response.get("response_metadata") or {}).get("next_cursor")
+            if not cursor:
+                break
+        messages = list(parents)
+        floor = since.timestamp() if since else None
+        seen = {message.get("ts") for message in parents}
+        for parent in parents:
+            if not parent.get("reply_count"):
+                continue
+            latest_reply = parent.get("latest_reply")
+            if floor is not None and latest_reply is not None and float(latest_reply) < floor:
+                continue
+            try:
+                response = await client.conversations_replies(channel=channel, ts=parent["ts"], limit=_HISTORY_PAGE)
+            except Exception:
+                continue
+            for reply in (response or {}).get("messages") or []:
+                if reply.get("ts") in seen:
+                    continue
+                if floor is not None and float(reply.get("ts") or 0) < floor:
+                    continue
+                seen.add(reply.get("ts"))
+                messages.append(reply)
+        messages.sort(key=lambda message: float(message.get("ts") or 0), reverse=True)
+        return messages
+
+    async def _author_name(self, user_id: str | None, cache: dict[str, str], directory_users: list[dict[str, Any]]) -> str:
+        if not user_id:
+            return ""
+        if user_id not in cache:
+            row = next((user for user in directory_users if user["slack_user_id"] == user_id), None)
+            if row is not None:
+                cache[user_id] = row["display_name"] or row["real_name"] or row["handle"] or user_id
+            else:
+                cache[user_id] = await self.directory.name(user_id)
+                owner = self._owner() or ""
+                if owner and cache[user_id] != user_id:
+                    await self.repo.upsert_directory_user(
+                        self.workspace_id, owner, user_id, display_name=cache[user_id], refreshed_at=format_ts(self.clock()),
+                    )
+        return cache[user_id]
+
+    async def _slack_hit(self, channel: str, message: dict[str, Any], author: str | None = None, permalink: str | None = None) -> dict[str, Any]:
+        hit = {
+            "channel": channel,
+            "user": message.get("user"),
+            "author": author if author is not None else await self.directory.name(message.get("user") or ""),
+            "ts": message.get("ts"),
+            "text": message.get("text") or "",
+        }
+        if permalink:
+            hit["permalink"] = permalink
+        return hit
 
     async def remember(self, text: str, type: str = "fact", about: str | None = None) -> dict[str, Any]:
         if self.memory is None:

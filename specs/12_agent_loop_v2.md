@@ -64,7 +64,7 @@ The registry (`knappy/agent/tools.py`) keeps its current shape: async methods wi
 | :--- | :--- | :--- |
 | `memory_search`, `memory_read`, `remember`, `forget` | [13](./13_memory_system.md) | No |
 | `search_commitments`, `query_relationship_graph`, `get_meeting_context` | 04 (existing) | No |
-| `search_slack_history` | [09](./09_slack_history_context.md) (existing) | No |
+| `search_slack_history`, `read_slack_message` | [09](./09_slack_history_context.md), amended by [23](./23_slack_message_reads.md) | No |
 | `web_search`, `fetch_url` | [14](./14_web_research.md) | No |
 | `read_file`, `create_document` | [15](./15_files_and_documents.md) | No (own DM only) |
 | `complete_commitment`, `add_commitment` | this spec | No (own data) |

@@ -19,7 +19,9 @@ from typing import Any
 
 from knappy.awareness.relevance import Conversation, RelevancePass, SlackMessage
 from knappy.awareness.store import AwarenessStore
+from knappy.db.repository import format_ts
 from knappy.memory.engine import MemoryEngine
+from knappy.slack.users import UserDirectory
 
 logger = logging.getLogger("knappy")
 
@@ -165,8 +167,10 @@ class Awareness:
         floor = (now - self.pacing.history).timestamp()
         cursors = await self.store.cursors(self.owner)
         excluded = await self.excluded()
+        await self._list_conversations()
+        await self._refresh_directory(now)
         read = 0
-        for conversation in await self._list_conversations():
+        for conversation in list(self._conversations.values()):
             if conversation.id in excluded or self._knappy_dm.get(conversation.id):
                 continue
             oldest = max(float(cursors.get(conversation.id, 0)), floor)
@@ -174,6 +178,31 @@ class Awareness:
                 read += await self.accept({**message, "channel": conversation.id})
         logger.info("awareness catch-up owner=%s conversations=%d buffered=%d", self.owner, len(self._conversations), read)
         return read
+
+    async def _refresh_directory(self, now: datetime) -> None:
+        """Cache Slack ids and names for this owner. Message text is not stored."""
+        repo = self.memory.store.repo
+        workspace = self.memory.store.workspace_id
+        refreshed = format_ts(now)
+        for conversation in self._conversations.values():
+            if conversation.direct:
+                continue
+            name = (conversation.name or "").removeprefix("#")
+            if not name:
+                continue
+            await repo.upsert_directory_channel(
+                workspace, self.owner, conversation.id, name=name, refreshed_at=refreshed
+            )
+        directory = UserDirectory(self.user_client)
+        for member in await directory._list_members():
+            profile = member.get("profile") or {}
+            await repo.upsert_directory_user(
+                workspace, self.owner, member["id"],
+                display_name=profile.get("display_name") or "",
+                real_name=profile.get("real_name") or member.get("real_name") or "",
+                handle=member.get("name") or "",
+                refreshed_at=refreshed,
+            )
 
     async def _history(self, channel: str, oldest: float) -> list[dict[str, Any]]:
         messages: list[dict[str, Any]] = []
