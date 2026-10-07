@@ -500,3 +500,18 @@ async def test_aware_urgent_item_waits_out_quiet_hours(journey) -> None:
 
     assert night.posts == []
     assert "approve the hotfix" in json.dumps(morning.posts), "in the morning brief instead"
+
+
+async def test_first_run_dm_lists_what_was_found_once(journey) -> None:
+    """Spec 23 §6: once the first catch-up is read, the installer hears what needs them, and only once."""
+    j = await journey(model(REQUESTS), slack=FakeSlack(tz="UTC", members=MEMBERS), owner=OWNER, first_run=True)
+    await j.workspace("U_SAM", "C_DESIGN", f"<@{OWNER}> can you review the deck by Thursday?")
+
+    first = await j.advance(minutes=10)
+    [welcome] = [post for post in first.posts if post["channel"] == dm_channel(OWNER)]
+    assert welcome["text"].startswith("I've read your recent Slack conversations. Here's what looks like it needs you:")
+    assert DECK in welcome["text"]
+
+    await j.restart()
+    later = await j.advance(minutes=30)
+    assert not any("I've read your recent Slack conversations" in post["text"] for post in later.posts)

@@ -70,6 +70,8 @@ Start with [00_gap_analysis.md](./00_gap_analysis.md): it explains why specs 01â
 | [20_acting_through_mcp.md](./20_acting_through_mcp.md) | Acting through MCP | ReAct + HITL | App tools per user, reads run, writes become `APP_ACTION` approval cards |
 | [21_launch_connections.md](./21_launch_connections.md) | Launch connections | Config as data + live acceptance | Lorikeet, Grain, Gmail, Calendar, BigQuery entries, `tools` lever, negative list cache, `$ref` guard, live checklist |
 | [22_multi_workspace_install.md](./22_multi_workspace_install.md) | Multi-workspace install | OAuth distribution | `/slack/install`, encrypted per-workspace tokens, one runtime per workspace, uninstall |
+| [23_slack_message_reads.md](./23_slack_message_reads.md) | On-demand Slack reads | Permalink read + windowed search | `read_slack_message`, `search_slack_history` `since`, author-name match, record the assignment |
+| [24_slack_directory.md](./24_slack_directory.md) | Slack name cache | Relational directory, not vectors | People and channel tables, search resolves names first, `person.slack_user_id` when unique |
 
 ---
 

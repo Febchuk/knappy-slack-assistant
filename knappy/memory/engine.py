@@ -17,6 +17,7 @@ from knappy.agent.prompt import MemoryContext
 from knappy.db.repository import format_ts
 from knappy.ingestion.embed import generate_embedding
 from knappy.llm.types import Model
+from knappy.slack.directory import slack_id_for_name
 from knappy.memory.store import (
     Cascade,
     LoggedTurn,
@@ -436,13 +437,15 @@ class MemoryEngine:
                     owner, record["id"], title=op.title, aliases=op.aliases, body=op.body,
                     expires_at=parse_ts(op.expires_at), now=now, sources=sources, keep_sources=True,
                 )
+                await self._link_person(owner, record["id"], op.title or record["title"])
                 return
             wanted = op.record_id if op.record_id and _RECORD_ID.match(op.record_id) and record is None else None
-            await self.store.create_record(
+            created = await self.store.create_record(
                 owner, record_id=wanted or await self.store.free_id(owner, op.type, op.title), type=op.type,
                 title=op.title, body=op.body, aliases=op.aliases, expires_at=parse_ts(op.expires_at),
                 source="reconciler", now=now, sources=sources,
             )
+            await self._link_person(owner, created, op.title or "")
         elif op.op in ("update", "supersede"):
             if not active:
                 raise OpRejected(f"unknown record id {op.record_id!r}")
@@ -450,6 +453,7 @@ class MemoryEngine:
                 owner, record["id"], title=op.title, aliases=op.aliases or None, body=op.body,
                 expires_at=parse_ts(op.expires_at), now=now, sources=sources, keep_sources=op.op == "update",
             )
+            await self._link_person(owner, record["id"], op.title or record["title"])
         elif op.op == "expire":
             if not active:
                 raise OpRejected(f"unknown record id {op.record_id!r}")
@@ -485,6 +489,15 @@ class MemoryEngine:
                     commitment["id"], next_check_at=parse_ts(op.next_check_at),
                     on_no_progress=op.on_no_progress, waiting_on=op.waiting_on,
                 )
+
+    async def _link_person(self, owner: str, record_id: str, title: str) -> None:
+        """Set slack_user_id when the directory has one match. The id is not embedded."""
+        row = await self.store.get_record(owner, record_id)
+        if row is None or row["type"] != "person" or row.get("slack_user_id") or not title:
+            return
+        slack_id = await slack_id_for_name(self.store.repo, self.store.workspace_id, owner, title)
+        if slack_id:
+            await self.store.set_record_slack_id(owner, record_id, slack_id)
 
     async def _add_commitment(self, owner: str, op: MemoryOp, turn: LoggedTurn) -> str:
         title = redact(op.title or "")

@@ -27,7 +27,7 @@ BOT_SCOPES = (
 )
 USER_SCOPES = (
     "channels:history", "groups:history", "im:history", "mpim:history", "channels:read", "groups:read", "im:read",
-    "mpim:read", "users:read", "chat:write",
+    "mpim:read", "users:read", "chat:write", "search:read",
 )
 STATE_TTL = timedelta(minutes=10)
 AUTHORIZE_URL = "https://slack.com/oauth/v2/authorize"

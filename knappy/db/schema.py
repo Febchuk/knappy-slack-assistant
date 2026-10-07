@@ -41,6 +41,26 @@ CREATE TABLE IF NOT EXISTS attention_items (
 );
 CREATE INDEX IF NOT EXISTS idx_attention_open ON attention_items (workspace_id, owner_user_id, status);
 
+CREATE TABLE IF NOT EXISTS slack_directory_users (
+    workspace_id TEXT NOT NULL,
+    owner_user_id TEXT NOT NULL,
+    slack_user_id TEXT NOT NULL,
+    display_name TEXT NOT NULL DEFAULT '',
+    real_name TEXT NOT NULL DEFAULT '',
+    handle TEXT NOT NULL DEFAULT '',
+    refreshed_at TEXT NOT NULL,
+    PRIMARY KEY (workspace_id, owner_user_id, slack_user_id)
+);
+
+CREATE TABLE IF NOT EXISTS slack_directory_channels (
+    workspace_id TEXT NOT NULL,
+    owner_user_id TEXT NOT NULL,
+    channel_id TEXT NOT NULL,
+    name TEXT NOT NULL DEFAULT '',
+    refreshed_at TEXT NOT NULL,
+    PRIMARY KEY (workspace_id, owner_user_id, channel_id)
+);
+
 CREATE TABLE IF NOT EXISTS awareness_excluded (
     workspace_id TEXT NOT NULL,
     owner_user_id TEXT NOT NULL,
@@ -214,6 +234,7 @@ CREATE TABLE IF NOT EXISTS memory_records (
     expires_at DATETIME,
     updated_at DATETIME NOT NULL,
     embedding BLOB,
+    slack_user_id TEXT,
     UNIQUE (workspace_id, owner_user_id, id)
 );
 CREATE INDEX IF NOT EXISTS idx_records_owner ON memory_records (owner_user_id, status, updated_at);
@@ -437,6 +458,7 @@ CREATE TABLE IF NOT EXISTS memory_records (
     expires_at TEXT,
     updated_at TEXT NOT NULL,
     embedding BYTEA,
+    slack_user_id TEXT,
     search TSVECTOR GENERATED ALWAYS AS (
         setweight(to_tsvector('english', title || ' ' || aliases), 'A') || setweight(to_tsvector('english', body), 'D')
     ) STORED,
@@ -457,6 +479,7 @@ CREATE TABLE IF NOT EXISTS user_profile (
 ALTER TABLE user_profile ADD COLUMN IF NOT EXISTS brief_on TEXT;
 ALTER TABLE user_profile ADD COLUMN IF NOT EXISTS nudges_on TEXT;
 ALTER TABLE user_profile ADD COLUMN IF NOT EXISTS nudges_sent INTEGER NOT NULL DEFAULT 0;
+ALTER TABLE user_profile ADD COLUMN IF NOT EXISTS first_run_at TEXT;
 
 CREATE TABLE IF NOT EXISTS conversation_recaps (
     owner_user_id TEXT NOT NULL,
@@ -495,6 +518,7 @@ CREATE TABLE IF NOT EXISTS memory_provenance (
 CREATE INDEX IF NOT EXISTS idx_prov_source ON memory_provenance (owner_user_id, source_type, source_id);
 
 ALTER TABLE memory_events ADD COLUMN IF NOT EXISTS metadata TEXT;
+ALTER TABLE memory_records ADD COLUMN IF NOT EXISTS slack_user_id TEXT;
 ALTER TABLE memory_provenance DROP CONSTRAINT IF EXISTS memory_provenance_source_type_check;
 ALTER TABLE memory_provenance ADD CONSTRAINT memory_provenance_source_type_check CHECK(source_type IN (""" + PROVENANCE_SOURCES + """));
 

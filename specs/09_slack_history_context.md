@@ -1,5 +1,7 @@
 # Specification 09: Invited Slack History
 
+> **Amended by [Spec 23](./23_slack_message_reads.md).** Reads use the user token when the runtime has one. A permalink is `read_slack_message`. `search_slack_history` accepts `since`, includes thread replies, and matches the author's display name.
+
 ## 1. Overview & Objectives
 
 Answers may use recent text from the current DM and from channels where Knappy has been invited. That text is a tool result for the fast path and the ReAct loop. It is not written into contacts unless the existing note gate already would ingest the message the user just sent.

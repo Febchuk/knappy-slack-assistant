@@ -36,6 +36,8 @@ oauth_config:
       - mpim:read
       - users:read
       - chat:write
+      # Spec 23: search.messages, which is not under the 1-a-minute history limit for apps outside the Marketplace.
+      - search:read
 settings:
   socket_mode_enabled: true
   event_subscriptions:

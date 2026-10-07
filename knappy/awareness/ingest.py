@@ -1,8 +1,9 @@
 """Reading the workspace for the owner (Spec 18 §2-§3): routing, the structural filter, buffers, and catch-up.
 
 Messages live only in memory, per conversation, until a flush hands them to the relevance pass. A conversation
-flushes after 5 minutes of quiet or at 30 messages. Every hour, and at start, each conversation the owner is in is
-read from its cursor (at most 7 days back), so a restart or a dropped connection loses nothing.
+flushes after 5 minutes of quiet or at 30 messages. At start, the owner's most recent conversations are read from
+their cursors (at most 7 days back); after that, live events carry everything (Spec 23 §5). An hourly re-read cannot
+fit Slack's 1-a-minute history limit for apps outside the Marketplace.
 """
 
 from __future__ import annotations
@@ -19,7 +20,10 @@ from typing import Any
 
 from knappy.awareness.relevance import Conversation, RelevancePass, SlackMessage
 from knappy.awareness.store import AwarenessStore
+from knappy.db.repository import format_ts
 from knappy.memory.engine import MemoryEngine
+from knappy.slack.errors import retry_after, slack_error
+from knappy.slack.users import UserDirectory
 
 logger = logging.getLogger("knappy")
 
@@ -35,9 +39,12 @@ class Pacing:
     quiet: timedelta = timedelta(minutes=5)
     batch: int = 30
     history: timedelta = timedelta(days=7)
-    catch_up_every: timedelta = timedelta(hours=1)
-    # Tier 3 methods allow about 50 calls a minute; stay under it.
+    # Spec 23 §5: one catch-up at start, DMs first, capped so it ends in about half an hour at 1 call a minute.
+    catch_up_conversations: int = 30
+    catch_up_pages: int = 1
+    # Tier 3 methods allow about 50 calls a minute; stay under it. A rate limit waits for Slack's Retry-After.
     call_gap_s: float = 1.2
+    rate_limit_retries: int = 3
 
 
 class Awareness:
@@ -54,6 +61,7 @@ class Awareness:
         clock: Callable[[], datetime],
         over_budget: Callable[[str], Awaitable[bool]],
         pacing: Pacing | None = None,
+        on_first_run: Callable[[str], Awaitable[None]] | None = None,
     ) -> None:
         self.owner = owner
         self.user_client = user_client
@@ -65,6 +73,8 @@ class Awareness:
         self.clock = clock
         self.over_budget = over_budget
         self.pacing = pacing or Pacing()
+        self.on_first_run = on_first_run
+        self._first_run_pending = False
         self._buffers: dict[str, OrderedDict[str, SlackMessage]] = {}
         self._seen: OrderedDict[tuple[str, str], str] = OrderedDict()
         self._conversations: dict[str, Conversation] = {}
@@ -121,16 +131,23 @@ class Awareness:
         return len(message.text.split()) >= 3 or f"<@{self.owner}" in message.text
 
     async def tick(self) -> None:
-        """Catch up when due, then flush every conversation that went quiet or filled up."""
+        """Catch up once, then flush every conversation that went quiet or filled up."""
         now = self.clock()
-        if self._caught_up_at is None or now - self._caught_up_at >= self.pacing.catch_up_every:
+        if self._caught_up_at is None:
             self._caught_up_at = now
             try:
                 await self.catch_up(now)
+                self._first_run_pending = self.on_first_run is not None
             except Exception:
                 logger.exception("awareness catch-up failed owner=%s", self.owner)
         for channel in list(self._buffers):
             await self._flush(channel, now)
+        if self._first_run_pending and not self._buffers:
+            self._first_run_pending = False
+            try:
+                await self.on_first_run(self.owner)  # type: ignore[misc]
+            except Exception:
+                logger.exception("first run failed owner=%s", self.owner)
 
     async def _flush(self, channel: str, now: datetime) -> None:
         buffer = self._buffers.get(channel)
@@ -165,20 +182,55 @@ class Awareness:
         floor = (now - self.pacing.history).timestamp()
         cursors = await self.store.cursors(self.owner)
         excluded = await self.excluded()
+        await self._list_conversations()
+        await self._refresh_directory(now)
         read = 0
-        for conversation in await self._list_conversations():
-            if conversation.id in excluded or self._knappy_dm.get(conversation.id):
-                continue
+        candidates = [
+            conversation for conversation in self._conversations.values()
+            if conversation.id not in excluded and not self._knappy_dm.get(conversation.id)
+        ]
+        # DMs first, then whatever was read most recently before; the rest arrive as live events.
+        candidates.sort(key=lambda conversation: (not conversation.direct, -float(cursors.get(conversation.id, 0))))
+        for conversation in candidates[: self.pacing.catch_up_conversations]:
             oldest = max(float(cursors.get(conversation.id, 0)), floor)
             for message in await self._history(conversation.id, oldest):
                 read += await self.accept({**message, "channel": conversation.id})
         logger.info("awareness catch-up owner=%s conversations=%d buffered=%d", self.owner, len(self._conversations), read)
         return read
 
+    async def _refresh_directory(self, now: datetime) -> None:
+        """Cache Slack ids and names for this owner. Message text is not stored."""
+        repo = self.memory.store.repo
+        workspace = self.memory.store.workspace_id
+        refreshed = format_ts(now)
+        for conversation in self._conversations.values():
+            if conversation.direct:
+                continue
+            name = (conversation.name or "").removeprefix("#")
+            if not name:
+                continue
+            await repo.upsert_directory_channel(
+                workspace, self.owner, conversation.id, name=name, refreshed_at=refreshed
+            )
+        directory = UserDirectory(self.user_client)
+        await repo.upsert_directory_users(
+            workspace, self.owner,
+            [
+                {
+                    "slack_user_id": member["id"],
+                    "display_name": (member.get("profile") or {}).get("display_name") or "",
+                    "real_name": (member.get("profile") or {}).get("real_name") or member.get("real_name") or "",
+                    "handle": member.get("name") or "",
+                }
+                for member in await directory._list_members()
+            ],
+            refreshed_at=refreshed,
+        )
+
     async def _history(self, channel: str, oldest: float) -> list[dict[str, Any]]:
         messages: list[dict[str, Any]] = []
         cursor = None
-        for _page in range(5):
+        for _page in range(self.pacing.catch_up_pages):
             response = await self._call(
                 self.user_client.conversations_history, channel=channel, oldest=f"{oldest:.6f}", limit=200,
                 **({"cursor": cursor} if cursor else {}),
@@ -293,11 +345,22 @@ class Awareness:
         return None
 
     async def _call(self, method: Callable[..., Awaitable[Any]], **kwargs: Any) -> Any:
-        """One Slack Web API call, paced under the tier limit. A failure is logged and reads as nothing."""
+        """One Slack Web API call, paced under the tier limit. A failure is logged and reads as nothing.
+
+        A rate limit waits as long as Slack's Retry-After asks, then tries again, a few times at most.
+        """
+        name = getattr(method, "__name__", "?")
         try:
-            return await method(**kwargs)
-        except Exception as exc:
-            logger.info("awareness slack call failed method=%s error=%s", getattr(method, "__name__", "?"), type(exc).__name__)
+            for attempt in range(self.pacing.rate_limit_retries + 1):
+                try:
+                    return await method(**kwargs)
+                except Exception as exc:
+                    wait = retry_after(exc)
+                    if wait is None or attempt == self.pacing.rate_limit_retries:
+                        logger.info("awareness slack call failed method=%s error=%s", name, slack_error(exc))
+                        return None
+                    logger.info("awareness rate limited method=%s retry_after=%.0f", name, wait)
+                    await asyncio.sleep(wait)
             return None
         finally:
             if self.pacing.call_gap_s:

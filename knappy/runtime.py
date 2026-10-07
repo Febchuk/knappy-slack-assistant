@@ -104,12 +104,13 @@ class KnappyRuntime:
             self.awareness = Awareness(
                 owner=awareness_owner, user_client=user_client, bot_client=slack, bot_user_id=bot_user_id,
                 store=self.attention, relevance=relevance, memory=self.memory_engine, clock=clock,
-                over_budget=self._over_budget, pacing=awareness_pacing,
+                over_budget=self._over_budget, pacing=awareness_pacing, on_first_run=self.first_run,
             )
         self.tools = ToolRegistry(
             repo, workspace_id, history=slack, memory=self.memory_engine, searcher=model, fetcher=fetcher,
             files=self.files, recipients=self.recipients, attention=self.attention, awareness=self.awareness, clock=clock,
-            mcp=mcp,
+            mcp=mcp, user_history=user_client if self.awareness is not None else None,
+            installer=awareness_owner if self.awareness is not None else None,
         )
         self.loop = AgentLoop(self.tools, model)
         gate = CompositeSystemOneGate(JevSystemOneAdapter(), RegexFallbackAdapter())
@@ -211,6 +212,17 @@ class KnappyRuntime:
         named = f"{', '.join(titles[:-1])} and {titles[-1]}" if len(titles) > 1 else titles[0] if titles else auth_group
         await self.direct.post(await self.direct.open(user_id), f"{named} connected.", [])
 
+    async def first_run(self, owner: str) -> None:
+        """Spec 23 §6: once the installer's first catch-up is read, one DM with what Knappy found. Sent once, ever."""
+        if self.direct is None or await self.store.first_run_sent(owner):
+            return
+        now = self.clock()
+        items = await self.attention.items(owner, now, limit=FIRST_RUN_LIMIT)
+        commitments = await self.store.open_commitments(owner, FIRST_RUN_LIMIT)
+        await self.direct.post(await self.direct.open(owner), first_run_text(items, commitments), [])
+        await self.store.mark_first_run(owner, now)
+        logger.info("first run sent owner=%s items=%d commitments=%d", owner, len(items), len(commitments))
+
     async def _permalink(self, channel: str, ts: str) -> str | None:
         if self.user_client is None:
             return None
@@ -266,6 +278,28 @@ class DirectMessages:
 class _RefusingExecutor:
     async def execute(self, draft: dict[str, Any]) -> None:
         raise RuntimeError("No executor configured")
+
+
+FIRST_RUN_LIMIT = 8
+FIRST_RUN_CLOSING = (
+    "I'll keep reading your DMs and channels, flag what needs you, and send a short brief each morning at 8. "
+    "Paste a Slack link or ask about a person or channel any time."
+)
+
+
+def first_run_text(items: list[Any], commitments: list[dict[str, Any]]) -> str:
+    """The first-run DM: what needs the installer now, or a plain note that nothing does."""
+    if not items and not commitments:
+        return f"I've read your recent Slack conversations and nothing needs you right now. {FIRST_RUN_CLOSING}"
+    lines = ["I've read your recent Slack conversations. Here's what looks like it needs you:"]
+    for item in items:
+        summary = f"<{item.permalink}|{item.summary}>" if item.permalink else item.summary
+        lines.append(f"• {summary}" + (f" ({item.who})" if item.who else ""))
+    for row in commitments:
+        due = f", due {row['due_date'][:10]}" if row.get("due_date") else ""
+        lines.append(f"• {row['commitment']}" + (f" for {row['person']}" if row.get("person") else "") + due)
+    lines.append(FIRST_RUN_CLOSING)
+    return "\n".join(lines)
 
 
 def usage_recorder(repo: SqliteRepository, workspace_id: str) -> OnUsage:
