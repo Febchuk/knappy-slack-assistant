@@ -52,6 +52,7 @@ class FakeOAuth:
     expires_in: int = 3600
     refuse_refresh: bool = False
     dcr: bool = True
+    refuse_registration: dict[str, str] | None = None
     registrations: int = 0
     refreshes: int = 0
     authorize_params: list[dict[str, str]] = field(default_factory=list)
@@ -83,6 +84,8 @@ class FakeOAuth:
         return web.json_response(meta)
 
     async def register(self, request: web.Request) -> web.Response:
+        if self.refuse_registration is not None:
+            return web.json_response(self.refuse_registration, status=400)
         self.registrations += 1
         body = await request.json()
         assert body["token_endpoint_auth_method"] == "none"

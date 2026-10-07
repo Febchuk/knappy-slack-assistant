@@ -35,6 +35,14 @@ async def test_dcr_runs_once_across_two_connects(world: World) -> None:
     assert params["scope"] == "notes:read"
 
 
+async def test_refused_registration_logs_the_servers_reason(world: World, caplog: pytest.LogCaptureFixture) -> None:
+    world.oauth.refuse_registration = {"error": "invalid_redirect_uri", "error_description": "Only localhost redirect URIs"}
+    hub = await world.hub()
+    assert await hub.connect_url("U_A", "fake") is None
+    assert "invalid_redirect_uri" in caplog.text
+    assert "Only localhost redirect URIs" in caplog.text
+
+
 async def test_forged_and_expired_state_are_rejected(world: World) -> None:
     hub = await world.hub()
     url = await hub.connect_url("U_A", "fake")
