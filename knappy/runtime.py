@@ -31,6 +31,7 @@ from knappy.ingestion.pipeline import IngestionPipeline, acknowledgement
 from knappy.llm.client import OnUsage
 from knappy.llm.types import Model, Tier, ToolResult, Usage
 from knappy.memory import MemoryConfig, MemoryEngine, MemoryStore
+from knappy.memory.store import parse_ts
 from knappy.slack.egress import Reply, SlackEgress, open_reply
 from knappy.slack.users import RecipientResolver, UserDirectory
 from knappy.web import WebFetcher
@@ -296,7 +297,9 @@ def first_run_text(items: list[Any], commitments: list[dict[str, Any]]) -> str:
         summary = f"<{item.permalink}|{item.summary}>" if item.permalink else item.summary
         lines.append(f"• {summary}" + (f" ({item.who})" if item.who else ""))
     for row in commitments:
-        due = f", due {row['due_date'][:10]}" if row.get("due_date") else ""
+        # Postgres returns due_date as a datetime, SQLite as text.
+        due_at = parse_ts(row.get("due_date"))
+        due = f", due {due_at.date().isoformat()}" if due_at else ""
         lines.append(f"• {row['commitment']}" + (f" for {row['person']}" if row.get("person") else "") + due)
     lines.append(FIRST_RUN_CLOSING)
     return "\n".join(lines)
