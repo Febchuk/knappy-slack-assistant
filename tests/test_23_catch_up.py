@@ -68,3 +68,12 @@ async def test_catch_up_gives_up_after_its_retries(repo: SqliteRepository) -> No
 
     assert await runtime.awareness.catch_up(NOW) == 0
     assert user.api_calls.count("conversations.history ratelimited") == 3
+
+
+def test_first_run_text_reads_a_due_date_from_either_database() -> None:
+    from knappy.runtime import first_run_text
+
+    as_text = first_run_text([], [{"commitment": "ship the widget", "due_date": "2026-10-09T17:00:00+00:00"}])
+    as_datetime = first_run_text([], [{"commitment": "ship the widget", "due_date": datetime(2026, 10, 9, 17, tzinfo=timezone.utc)}])
+    assert "• ship the widget, due 2026-10-09" in as_text
+    assert as_datetime == as_text, "Postgres hands back a datetime"
