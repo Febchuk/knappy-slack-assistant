@@ -78,10 +78,10 @@ class AuthStrategy(Protocol):
 The hand-rolled flow replaces the SDK's `OAuthClientProvider`, which expects the redirect to finish inside one blocking call. That does not fit a Slack DM.
 
 1. **Discovery.** Fetch the protected-resource metadata (RFC 9728) at `<origin>/.well-known/oauth-protected-resource<path>`, falling back to the root form. Take `authorization_servers[0]`. Fetch its metadata (RFC 8414) at `/.well-known/oauth-authorization-server`, falling back to `/.well-known/openid-configuration`, path-inserted forms first. Cached per process.
-2. **Client.** `oauth_dcr` registers once per `auth_group` at `registration_endpoint` as a public client (`token_endpoint_auth_method = none`), asking only for grant types the server advertises. The result is cached in `mcp_clients` and reused until the issuer or redirect URI changes.
+2. **Client.** `oauth_dcr` registers once per `auth_group` at `registration_endpoint` as a public client (`token_endpoint_auth_method = none`), asking only for grant types the server advertises. The result is cached in `mcp_clients` and reused until the issuer or redirect URI changes. A refused registration raises `DiscoveryError` carrying the status and the first 300 characters of the response body, so `mcp connect url failed` names the server's reason (`invalid_redirect_uri`, for example), and nothing is cached.
 3. **Authorization URL.** `response_type=code`, PKCE S256, scopes, `resource=<server url>` (RFC 8707) for `oauth_dcr`, and a sealed `state`.
 4. **State.** A Fernet token over `{workspace, user, auth_group, verifier, nonce}`. Fernet authenticates it, so a forged or altered state fails. It is also encrypted, so the PKCE verifier never appears in a URL. It expires 10 minutes after issue.
-5. **Exchange.** The callback opens the state, posts the code with the verifier to the token endpoint, and stores the result. Clients with a secret send it as `client_secret_post`.
+5. **Exchange.** The callback opens the state, posts the code with the verifier to the token endpoint, and stores the result. Clients with a secret send it as `client_secret_post`. A non-200 from the token endpoint, on exchange or refresh, raises `TokenError` with the same status and body excerpt.
 6. **Refresh.** Before each use, if fewer than 5 minutes remain, refresh under a per-connection lock. A rotated refresh token replaces the old one; a missing one keeps it. When the refresh fails, or there is no refresh token, the connection becomes `needs_reauth`.
 
 ---
@@ -214,6 +214,7 @@ MCP is **off** when either of the first two is unset. Knappy then builds no hub,
 | **TEST-MCP-10** | No `KNAPPY_PUBLIC_URL` or `KNAPPY_SECRET_KEY`. | No hub, no callback server. |
 | **TEST-MCP-11** | Invalid entries. | The error names the entry. |
 | **TEST-MCP-12** | `tests/test_19_mcp_probe.py`: probe against recorded Lorikeet, Grain and Gmail metadata. | `oauth_dcr`, `oauth_dcr` with a no-refresh note, `oauth_static` in group `google`. Each output loads as a valid entry. |
+| **TEST-MCP-13** | The registration endpoint answers 400 with an OAuth error body. Ask for a connect URL. | No URL. The warning log carries the error code and description. |
 
 `tests/test_19_mcp_conformance.py` is parametrized over every entry in `mcp_servers.toml`: the entry validates, its globs compile, and the env vars its mode needs are present or the test skips naming them.
 
