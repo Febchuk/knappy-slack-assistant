@@ -249,7 +249,7 @@ class OAuthAuth:
         async with httpx.AsyncClient(timeout=HTTP_TIMEOUT_S) as http:
             response = await http.post(meta.registration_endpoint, json=body)
         if response.status_code not in (200, 201):
-            raise DiscoveryError(f"client registration at {meta.issuer} failed: HTTP {response.status_code}")
+            raise DiscoveryError(f"client registration at {meta.issuer} failed: HTTP {response.status_code} {response.text[:300]}")
         registered = response.json()
         client = OAuthClient(registered["client_id"], registered.get("client_secret"))
         await self.store.save_client(self.auth_group, meta.issuer, self.redirect_uri, client, self.clock())
@@ -287,7 +287,7 @@ class OAuthAuth:
         async with httpx.AsyncClient(timeout=HTTP_TIMEOUT_S) as http:
             response = await http.post(meta.token_endpoint, data=form, headers={"Accept": "application/json"})
         if response.status_code != 200:
-            raise TokenError(f"token endpoint returned HTTP {response.status_code}")
+            raise TokenError(f"token endpoint returned HTTP {response.status_code} {response.text[:300]}")
         body = response.json()
         if not body.get("access_token"):
             raise TokenError("token response has no access_token")

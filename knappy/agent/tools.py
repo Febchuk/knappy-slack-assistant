@@ -384,6 +384,7 @@ NO_LINK = {
     "connected": "Already connected.",
     "unavailable": "Not set up on this Knappy yet: an admin must add its credentials.",
 }
+LINK_FAILED = "Getting a sign-in link failed. Tell the user connecting didn't work and an admin should check the logs."
 
 
 def app_specs(servers: dict[str, str]) -> list[ToolSpec]:
@@ -955,7 +956,7 @@ class ToolRegistry:
         status = (await self.mcp.status(owner))[server]
         url = await self.mcp.connect_url(owner, server)
         if url is None:
-            return {"app": config.title, "status": status, "connect_url": None, "note": NO_LINK.get(status, "It has no sign-in link.")}
+            return {"app": config.title, "status": status, "connect_url": None, "note": NO_LINK.get(status, LINK_FAILED)}
         return _personal({"app": config.title, "status": status, "connect_url": url})
 
     async def _app_tool(self, name: str, arguments: dict[str, Any]) -> Any:
