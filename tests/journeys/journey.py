@@ -90,10 +90,13 @@ class Journey:
         slack: FakeSlack | None = None,
         fetcher: WebFetcher | None = None,
         owner: str | None = None,
+        first_run: bool = False,
     ) -> None:
         self.model = model
         # Spec 18: with an owner, Knappy holds that person's user token and reads their conversations.
         self.owner = owner
+        # Spec 23 §6: journeys start from an install whose first-run DM already went out, unless they test it.
+        self.first_run = first_run
         self.fetcher = fetcher
         self.clock = clock
         self.slack = slack or FakeSlack(tz="UTC")
@@ -121,6 +124,8 @@ class Journey:
             client=self.slack, model=self.model, clock=self.clock,
             fetcher=self.fetcher, downloader=downloader, user_client=self.user_slack, awareness_pacing=Pacing(call_gap_s=0),
         )
+        if self.owner and not self.first_run:
+            await runtime.store.mark_first_run(self.owner, self.clock())
         self._record_tools(runtime)
         self.app = FakeApp()
         register_actions(self.app, only(runtime))

@@ -479,6 +479,7 @@ CREATE TABLE IF NOT EXISTS user_profile (
 ALTER TABLE user_profile ADD COLUMN IF NOT EXISTS brief_on TEXT;
 ALTER TABLE user_profile ADD COLUMN IF NOT EXISTS nudges_on TEXT;
 ALTER TABLE user_profile ADD COLUMN IF NOT EXISTS nudges_sent INTEGER NOT NULL DEFAULT 0;
+ALTER TABLE user_profile ADD COLUMN IF NOT EXISTS first_run_at TEXT;
 
 CREATE TABLE IF NOT EXISTS conversation_recaps (
     owner_user_id TEXT NOT NULL,

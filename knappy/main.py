@@ -105,13 +105,9 @@ async def _awareness_loop(fleet: Fleet) -> None:
 
 
 def user_web_client(token: str) -> Any:
-    """The owner's own Web API client. Retries on rate limits, since catch-up reads many conversations."""
-    from slack_sdk.http_retry.builtin_async_handlers import AsyncRateLimitErrorRetryHandler
-    from slack_sdk.web.async_client import AsyncWebClient
-
-    client = AsyncWebClient(token=token)
-    client.retry_handlers.append(AsyncRateLimitErrorRetryHandler(max_retry_count=3))
-    return client
+    """The owner's own Web API client. No automatic rate-limit retry: a tool read answers at once (Spec 23 §3), and
+    awareness waits out Slack's Retry-After itself."""
+    return AsyncWebClient(token=token)
 
 
 async def _identity(client: Any) -> str | None:

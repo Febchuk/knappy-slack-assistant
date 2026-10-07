@@ -211,6 +211,19 @@ class FakeSdk:
         return outcome
 
 
+class _Response(dict):
+    headers: dict[str, str]
+
+
+class FakeSlackError(Exception):
+    """A Slack Web API error the way slack_sdk raises one: `response["error"]`, and headers for a rate limit."""
+
+    def __init__(self, error: str, retry_after: float | None = None) -> None:
+        super().__init__(error)
+        self.response = _Response(ok=False, error=error)
+        self.response.headers = {"Retry-After": str(retry_after)} if retry_after is not None else {}
+
+
 class FakeSlack:
     """Slack Web API double. Posts return a ts so placeholders can be updated."""
 
@@ -244,6 +257,17 @@ class FakeSlack:
         self.conversations: list[dict] = []
         self.history: dict[str, list[dict]] = {}
         self.api_calls: list[str] = []
+        # search.messages: each query asked, and an error code to raise instead of answering (e.g. missing_scope).
+        self.searches: list[str] = []
+        self.search_error: str | None = None
+        # Method name -> how many more calls answer `ratelimited`, with Retry-After 0 so tests do not wait.
+        self.rate_limited: dict[str, int] = {}
+
+    def _limit(self, method: str) -> None:
+        if self.rate_limited.get(method, 0) > 0:
+            self.rate_limited[method] -= 1
+            self.api_calls.append(f"{method} ratelimited")
+            raise FakeSlackError("ratelimited", retry_after=0)
 
     async def chat_postMessage(self, **kwargs):
         self.posts.append(kwargs)
@@ -297,6 +321,7 @@ class FakeSlack:
     async def conversations_history(
         self, *, channel, limit=20, oldest=None, latest=None, inclusive=False, cursor=None,
     ):
+        self._limit("conversations.history")
         self.api_calls.append(f"conversations.history {channel}")
         if channel not in self.history:
             return {"messages": self.messages}
@@ -323,6 +348,7 @@ class FakeSlack:
         return {"messages": page, "response_metadata": {"next_cursor": next_cursor}}
 
     async def conversations_replies(self, *, channel, ts, oldest=None, limit=200):
+        self._limit("conversations.replies")
         self.api_calls.append(f"conversations.replies {channel} {ts}")
         thread = [m for m in self.history.get(channel, []) if m.get("thread_ts") == ts or m["ts"] == ts]
         return {"messages": sorted(thread, key=lambda m: float(m["ts"]))}
@@ -333,6 +359,42 @@ class FakeSlack:
         if channel not in self.visible and known is None:
             raise RuntimeError("channel_not_found")
         return {"ok": True, "channel": known or {"id": channel, "is_im": channel.startswith("D")}}
+
+    async def search_messages(self, *, query, count=20, sort="score", sort_dir="desc"):
+        """Slack search over every conversation in `history`: in:, from:, after: (exclusive day, UTC), and AND-ed words."""
+        self.searches.append(query)
+        if self.search_error:
+            raise FakeSlackError(self.search_error)
+        names = {c.get("name"): c["id"] for c in self.conversations if c.get("name")}
+        channel = author = None
+        floor = None
+        words = []
+        for term in query.split():
+            if term.startswith("in:"):
+                ref = term[3:]
+                channel = ref[2:-1] if ref.startswith("<#") else names.get(ref.lstrip("#"), ref.lstrip("#"))
+            elif term.startswith("from:<@"):
+                author = term[7:-1]
+            elif term.startswith("after:"):
+                day = datetime.fromisoformat(term[6:]).replace(tzinfo=timezone.utc)
+                floor = (day + timedelta(days=1)).timestamp()
+            else:
+                words.append(term.lower())
+        matches = []
+        for cid, messages in self.history.items():
+            if channel and cid != channel:
+                continue
+            for message in messages:
+                if author and message.get("user") != author:
+                    continue
+                if floor is not None and float(message["ts"]) < floor:
+                    continue
+                if not all(word in (message.get("text") or "").lower() for word in words):
+                    continue
+                permalink = f"https://slack.test/archives/{cid}/p{message['ts'].replace('.', '')}"
+                matches.append({**message, "channel": {"id": cid}, "permalink": permalink})
+        matches.sort(key=lambda m: float(m["ts"]), reverse=True)
+        return {"ok": True, "messages": {"matches": matches[:count]}}
 
     async def users_conversations(self, **kwargs):
         self.api_calls.append("users.conversations")

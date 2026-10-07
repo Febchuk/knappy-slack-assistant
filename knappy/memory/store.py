@@ -928,6 +928,20 @@ class MemoryStore:
                 (zone, self.workspace_id, owner, zone),
             )
 
+    async def first_run_sent(self, owner: str) -> bool:
+        row = await self._one(
+            "SELECT first_run_at FROM user_profile WHERE workspace_id = ? AND owner_user_id = ?", (self.workspace_id, owner)
+        )
+        return bool(row and row.get("first_run_at"))
+
+    async def mark_first_run(self, owner: str, now: datetime) -> None:
+        async with self.repo.transaction():
+            await self._ensure_profile(owner)
+            await self._run(
+                "UPDATE user_profile SET first_run_at = ? WHERE workspace_id = ? AND owner_user_id = ?",
+                (format_ts(now), self.workspace_id, owner),
+            )
+
     async def set_nightly_on(self, owner: str, day: str | None) -> None:
         await self._ensure_profile(owner)
         await self._run(

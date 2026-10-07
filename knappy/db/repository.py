@@ -30,7 +30,9 @@ ADDED_COLUMNS = {
         ("next_check_at", "DATETIME"), ("on_no_progress", "TEXT"), ("waiting_on", "TEXT"), ("snoozed_until", "DATETIME"),
     ),
     "contacts": (("last_alerted_at", "DATETIME"),),
-    "user_profile": (("brief_on", "TEXT"), ("nudges_on", "TEXT"), ("nudges_sent", "INTEGER NOT NULL DEFAULT 0")),
+    "user_profile": (
+        ("brief_on", "TEXT"), ("nudges_on", "TEXT"), ("nudges_sent", "INTEGER NOT NULL DEFAULT 0"), ("first_run_at", "TEXT"),
+    ),
     "memory_events": (("metadata", "TEXT"),),
     "memory_records": (("slack_user_id", "TEXT"),),
     "workspaces": (("bot_user_id", "TEXT"), ("installer_user_id", "TEXT"), ("user_token", "TEXT")),
@@ -302,19 +304,33 @@ class SqliteRepository:
         handle: str = "",
         refreshed_at: str,
     ) -> None:
-        await self.connection.execute(
-            """
-            INSERT INTO slack_directory_users (
-                workspace_id, owner_user_id, slack_user_id, display_name, real_name, handle, refreshed_at
-            ) VALUES (?, ?, ?, ?, ?, ?, ?)
-            ON CONFLICT(workspace_id, owner_user_id, slack_user_id) DO UPDATE SET
-                display_name = excluded.display_name,
-                real_name = excluded.real_name,
-                handle = excluded.handle,
-                refreshed_at = excluded.refreshed_at
-            """,
-            (workspace_id, owner_user_id, slack_user_id, display_name, real_name, handle, refreshed_at),
+        await self.upsert_directory_users(
+            workspace_id, owner_user_id,
+            [{"slack_user_id": slack_user_id, "display_name": display_name, "real_name": real_name, "handle": handle}],
+            refreshed_at=refreshed_at,
         )
+
+    async def upsert_directory_users(
+        self, workspace_id: str, owner_user_id: str, users: list[dict[str, str]], *, refreshed_at: str
+    ) -> None:
+        """The whole member list in one commit; a large workspace has thousands of members."""
+        for user in users:
+            await self.connection.execute(
+                """
+                INSERT INTO slack_directory_users (
+                    workspace_id, owner_user_id, slack_user_id, display_name, real_name, handle, refreshed_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?)
+                ON CONFLICT(workspace_id, owner_user_id, slack_user_id) DO UPDATE SET
+                    display_name = excluded.display_name,
+                    real_name = excluded.real_name,
+                    handle = excluded.handle,
+                    refreshed_at = excluded.refreshed_at
+                """,
+                (
+                    workspace_id, owner_user_id, user["slack_user_id"], user.get("display_name") or "",
+                    user.get("real_name") or "", user.get("handle") or "", refreshed_at,
+                ),
+            )
         await self.connection.commit()
 
     async def upsert_directory_channel(
